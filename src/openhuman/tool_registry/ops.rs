@@ -44,6 +44,11 @@ pub fn get_tool(tool_id: &str) -> Result<RpcOutcome<ToolRegistryEntry>, String> 
 }
 
 /// Build sorted registry entries from the current MCP and controller metadata.
+///
+/// This includes:
+/// 1. MCP stdio server tools (existing `mcp_server` surface)
+/// 2. Controller-backed tools (existing `tools` namespace)
+/// 3. Connected MCP client server tools (new `mcp_clients` domain)
 pub fn registry_entries() -> Vec<ToolRegistryEntry> {
     let mut entries = BTreeMap::new();
 
@@ -55,6 +60,53 @@ pub fn registry_entries() -> Vec<ToolRegistryEntry> {
     for schema in crate::openhuman::tools::all_tools_controller_schemas() {
         let entry = controller_tool_entry(&schema);
         insert_registry_entry(&mut entries, entry, "controller");
+    }
+
+    // Enumerate tools from all currently-connected MCP client servers.
+    // `block_in_place` requires the multi-threaded tokio runtime; fall back
+    // silently to an empty list in single-threaded contexts (e.g. unit tests).
+    let client_tools = {
+        use crate::openhuman::mcp_clients::connections;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // Only use block_in_place when we are on the multi-threaded
+                // runtime (kind = MultiThread). The current-thread runtime
+                // (kind = CurrentThread) panics on block_in_place.
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(connections::all_connected_tools())
+                    })
+                } else {
+                    Vec::new()
+                }
+            }
+            Err(_) => Vec::new(),
+        }
+    };
+
+    for (server_id, _qualified_name_placeholder, tool) in client_tools {
+        let tool_id = format!("mcp-client::{server_id}::{}", tool.name);
+        let entry = ToolRegistryEntry {
+            tool_id: tool_id.clone(),
+            name: tool.name.clone(),
+            title: title_from_function(&tool.name),
+            description: tool.description.unwrap_or_default(),
+            version: REGISTRY_ENTRY_VERSION.to_string(),
+            transport: ToolRegistryTransport::McpStdio,
+            route: json!({
+                "protocol": "mcp-client",
+                "rpc_method": "openhuman.mcp_clients_tool_call",
+                "server_id": server_id,
+                "tool_name": tool.name,
+            }),
+            input_schema: tool.input_schema,
+            output_schema: mcp_output_schema(),
+            allowed_agents: vec!["*".to_string()],
+            tags: tags_for_tool_id(&tool_id, "mcp_client"),
+            enabled: true,
+            health: ToolRegistryHealth::Available,
+        };
+        insert_registry_entry(&mut entries, entry, "mcp_client");
     }
 
     entries.into_values().collect()
