@@ -10,7 +10,7 @@ The desktop host for OpenHuman: Tauri v2 + WebView, IPC commands, window managem
 ## Responsibilities
 
 1. **Web UI**. Load the Vite build from `app/dist` (or dev server on port 1420).
-2. **IPC**. Expose a small, explicit set of Tauri commands (see [Commands](#commands)).
+2. **IPC**. Expose a small, explicit set of Tauri commands (see [Commands](#tauri-ipc-commands-app-src-tauri)).
 3. **Core lifecycle**. Start the in-process core server and proxy JSON-RPC via `core_rpc_relay`.
 4. **AI prompts on disk**. Resolve bundled `src/openhuman/agent/prompts` from resources / dev cwd for `ai_get_config` / `write_ai_config_file`.
 5. **Window + tray**. Desktop window behavior and system tray (see `lib.rs`).
