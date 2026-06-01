@@ -93,6 +93,18 @@ describe('MemoryChunkLetterhead', () => {
     expect(screen.getByText('steve@example.com')).toBeInTheDocument();
   });
 
+
+  it('uses the owner when the parsed recipient is blank', () => {
+    const chunk: Chunk = {
+      ...BASE_CHUNK,
+      source_id: 'gmail:steve@example.com|   ',
+      owner: 'fallback@example.com',
+    };
+    render(<MemoryChunkLetterhead chunk={chunk} />);
+
+    expect(screen.getByText('fallback@example.com')).toBeInTheDocument();
+  });
+
   it('falls back to the chunk owner when the source_id has no recipient half', () => {
     const chunk: Chunk = {
       ...BASE_CHUNK,
