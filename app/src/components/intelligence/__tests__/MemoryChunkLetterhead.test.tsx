@@ -24,6 +24,30 @@ describe('MemoryChunkLetterhead', () => {
   });
 
   it('renders the from/to/date frontmatter from a personalized email source', () => {
+    class LocalTimeDate extends Date {
+      getFullYear() {
+        return 2026;
+      }
+
+      getMonth() {
+        return 4;
+      }
+
+      getDate() {
+        return 4;
+      }
+
+      getHours() {
+        return 14;
+      }
+
+      getMinutes() {
+        return 30;
+      }
+    }
+
+    vi.stubGlobal('Date', LocalTimeDate);
+
     const chunk: Chunk = { ...BASE_CHUNK, tags: ['person/Steven-Enamakel'] };
     render(<MemoryChunkLetterhead chunk={chunk} />);
 
@@ -34,8 +58,7 @@ describe('MemoryChunkLetterhead', () => {
     // The raw address is rendered as secondary text.
     expect(screen.getByText('steve@example.com')).toBeInTheDocument();
     expect(screen.getByText('sanil@vezures.xyz')).toBeInTheDocument();
-    // Date formatted as YYYY·MM·DD · HH:MM in the viewer's local timezone.
-    expect(screen.getByText(/2026·05·04 · \d{2}:\d{2}/)).toBeInTheDocument();
+    expect(screen.getByText('2026·05·04 · 14:30')).toBeInTheDocument();
   });
 
   it('formats the date using local time instead of UTC components', () => {
