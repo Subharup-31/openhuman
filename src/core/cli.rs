@@ -14,6 +14,10 @@ use crate::core::jsonrpc::{default_state, invoke_method, parse_json_params};
 use crate::core::logging::CliLogDefault;
 use crate::core::{ControllerSchema, TypeSchema};
 
+/// Debug/e2e agent paths can build deep async poll stacks while assembling
+/// prompts, provider requests, and sub-agent tool loops.
+const CLI_RUNTIME_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 /// The ASCII banner displayed when the CLI starts.
 const CLI_BANNER: &str = r#"
 
@@ -278,9 +282,7 @@ fn run_server_command(args: &[String]) -> Result<()> {
     crate::core::logging::init_for_cli_run(verbose, log_scope);
 
     // Initialize the Tokio multi-threaded runtime.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let rt = build_cli_runtime()?;
     rt.block_on(async {
         crate::core::jsonrpc::run_server(host.as_deref(), port, socketio_enabled).await
     })?;
@@ -328,9 +330,7 @@ fn run_call_command(args: &[String]) -> Result<()> {
     let method = method.ok_or_else(|| anyhow::anyhow!("--method is required"))?;
     let params = parse_json_params(&params).map_err(anyhow::Error::msg)?;
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let rt = build_cli_runtime()?;
     let value = rt
         .block_on(async { invoke_method(default_state(), &method, params).await })
         .map_err(anyhow::Error::msg)?;
@@ -406,15 +406,21 @@ fn run_namespace_command(
     let method = all::rpc_method_from_parts(namespace, function)
         .ok_or_else(|| anyhow::anyhow!("unregistered controller '{namespace}.{function}'"))?;
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let rt = build_cli_runtime()?;
     let value = rt
         .block_on(async { invoke_method(default_state(), &method, Value::Object(params)).await })
         .map_err(anyhow::Error::msg)?;
 
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
+}
+
+fn build_cli_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(CLI_RUNTIME_THREAD_STACK_SIZE)
+        .enable_all()
+        .build()
+        .map_err(Into::into)
 }
 
 /// Parses command-line arguments into a JSON map based on a function's schema.
