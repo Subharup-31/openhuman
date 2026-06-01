@@ -133,18 +133,20 @@ fn resolve_connected_toolkits(
     slug: &str,
     live_connected: Option<&[String]>,
 ) -> (bool, Vec<String>) {
+    let mut allowed: Vec<String> = snapshot.iter().map(|(slug, _)| slug.clone()).collect();
     if snapshot.iter().any(|(known_slug, _)| known_slug == slug) {
-        let allowed = snapshot.iter().map(|(slug, _)| slug.clone()).collect();
         return (true, allowed);
     }
     if let Some(live) = live_connected {
         let known = live.iter().any(|s| s == slug);
-        return (known, live.to_vec());
+        for live_slug in live {
+            if !allowed.iter().any(|known_slug| known_slug == live_slug) {
+                allowed.push(live_slug.clone());
+            }
+        }
+        return (known, allowed);
     }
-    (
-        false,
-        snapshot.iter().map(|(slug, _)| slug.clone()).collect(),
-    )
+    (false, allowed)
 }
 
 #[async_trait]
@@ -470,5 +472,11 @@ mod tests {
             resolve_connected_toolkits(&snapshot, "slack", Some(live_no_match.as_slice()));
         assert!(!known_none);
         assert_eq!(allowed_none, live_no_match);
+
+        let empty_live = Vec::new();
+        let (known_empty, allowed_empty) =
+            resolve_connected_toolkits(&snapshot, "slack", Some(empty_live.as_slice()));
+        assert!(!known_empty);
+        assert_eq!(allowed_empty, vec!["gmail".to_string()]);
     }
 }
