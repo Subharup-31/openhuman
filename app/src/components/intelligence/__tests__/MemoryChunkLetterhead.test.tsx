@@ -20,35 +20,18 @@ const BASE_CHUNK: Chunk = {
 
 describe('MemoryChunkLetterhead', () => {
   afterEach(() => {
-    vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   it('renders the from/to/date frontmatter from a personalized email source', () => {
-    class LocalTimeDate extends Date {
-      getFullYear() {
-        return 2026;
-      }
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-04T14:30:00'));
 
-      getMonth() {
-        return 4;
-      }
-
-      getDate() {
-        return 4;
-      }
-
-      getHours() {
-        return 14;
-      }
-
-      getMinutes() {
-        return 30;
-      }
-    }
-
-    vi.stubGlobal('Date', LocalTimeDate);
-
-    const chunk: Chunk = { ...BASE_CHUNK, tags: ['person/Steven-Enamakel'] };
+    const chunk: Chunk = {
+      ...BASE_CHUNK,
+      timestamp_ms: Date.now(),
+      tags: ['person/Steven-Enamakel'],
+    };
     render(<MemoryChunkLetterhead chunk={chunk} />);
 
     expect(screen.getByText('from')).toBeInTheDocument();
@@ -62,34 +45,14 @@ describe('MemoryChunkLetterhead', () => {
   });
 
   it('formats the date using local time instead of UTC components', () => {
-    class LocalTimeDate extends Date {
-      getFullYear() {
-        return 2026;
-      }
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-04T14:44:00'));
 
-      getMonth() {
-        return 4;
-      }
-
-      getDate() {
-        return 4;
-      }
-
-      getHours() {
-        return 14;
-      }
-
-      getMinutes() {
-        return 44;
-      }
-    }
-
-    vi.stubGlobal('Date', LocalTimeDate);
-    render(<MemoryChunkLetterhead chunk={BASE_CHUNK} />);
+    const chunk: Chunk = { ...BASE_CHUNK, timestamp_ms: Date.now() };
+    render(<MemoryChunkLetterhead chunk={chunk} />);
 
     expect(screen.getByText('2026·05·04 · 14:44')).toBeInTheDocument();
   });
-
 
   it('trims whitespace around source sender and recipient values', () => {
     const chunk: Chunk = {
@@ -101,7 +64,6 @@ describe('MemoryChunkLetterhead', () => {
     expect(screen.getByText('steve@example.com')).toBeInTheDocument();
     expect(screen.getByText('sanil@vezures.xyz')).toBeInTheDocument();
   });
-
 
   it('normalizes underscore-separated person tags for display', () => {
     const chunk: Chunk = { ...BASE_CHUNK, tags: ['person/Steven_Enamakel'] };
@@ -115,7 +77,6 @@ describe('MemoryChunkLetterhead', () => {
     // Without a person tag, fromName === the raw email.
     expect(screen.getByText('steve@example.com')).toBeInTheDocument();
   });
-
 
   it('uses the owner when the parsed recipient is blank', () => {
     const chunk: Chunk = {

@@ -24,7 +24,9 @@ function parseSourceParts(chunk: Chunk): LetterheadParts {
   const isEmailish = /@/.test(afterColon);
   // Try to recover a personalized name from the chunk's tags (first person/* tag)
   const personTag = chunk.tags.find(t => t.startsWith('person/'));
-  const personName = personTag ? personTag.slice('person/'.length).replace(/[-_]+/g, ' ').trim() : null;
+  const personName = personTag
+    ? personTag.slice('person/'.length).replace(/[-_]+/g, ' ').trim()
+    : null;
 
   if (isEmailish && personName) {
     return { fromName: personName, fromAddress: afterColon, toAddress: recipient };
