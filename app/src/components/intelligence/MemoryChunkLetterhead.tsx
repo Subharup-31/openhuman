@@ -12,17 +12,19 @@ interface LetterheadParts {
 }
 
 function parseSourceParts(chunk: Chunk): LetterheadParts {
-  const left = chunk.source_id.split('|');
-  const senderRaw = left[0];
-  const recipient = left[1] ?? chunk.owner;
-  const afterColon = senderRaw.includes(':') ? senderRaw.split(':').slice(1).join(':') : senderRaw;
+  const [senderRaw = '', recipientRaw] = chunk.source_id.split('|');
+  const recipient = recipientRaw?.trim() || chunk.owner;
+  const normalizedSender = senderRaw.trim();
+  const afterColon = normalizedSender.includes(':')
+    ? normalizedSender.split(':').slice(1).join(':').trim()
+    : normalizedSender;
 
   // Heuristic for known prefixes: prefer the human-readable display when we have one,
   // else fall back to the raw email/handle.
   const isEmailish = /@/.test(afterColon);
   // Try to recover a personalized name from the chunk's tags (first person/* tag)
   const personTag = chunk.tags.find(t => t.startsWith('person/'));
-  const personName = personTag ? personTag.slice('person/'.length).replace(/-/g, ' ') : null;
+  const personName = personTag ? personTag.slice('person/'.length).replace(/[-_]+/g, ' ').trim() : null;
 
   if (isEmailish && personName) {
     return { fromName: personName, fromAddress: afterColon, toAddress: recipient };

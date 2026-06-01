@@ -67,6 +67,18 @@ describe('MemoryChunkLetterhead', () => {
     expect(screen.getByText('2026·05·04 · 14:44')).toBeInTheDocument();
   });
 
+
+  it('trims whitespace around source sender and recipient values', () => {
+    const chunk: Chunk = {
+      ...BASE_CHUNK,
+      source_id: ' gmail:steve@example.com | sanil@vezures.xyz ',
+    };
+    render(<MemoryChunkLetterhead chunk={chunk} />);
+
+    expect(screen.getByText('steve@example.com')).toBeInTheDocument();
+    expect(screen.getByText('sanil@vezures.xyz')).toBeInTheDocument();
+  });
+
   it('falls back to the raw email when no person/* tag is present', () => {
     render(<MemoryChunkLetterhead chunk={BASE_CHUNK} />);
     // Without a person tag, fromName === the raw email.
