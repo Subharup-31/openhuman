@@ -79,6 +79,14 @@ describe('MemoryChunkLetterhead', () => {
     expect(screen.getByText('sanil@vezures.xyz')).toBeInTheDocument();
   });
 
+
+  it('normalizes underscore-separated person tags for display', () => {
+    const chunk: Chunk = { ...BASE_CHUNK, tags: ['person/Steven_Enamakel'] };
+    render(<MemoryChunkLetterhead chunk={chunk} />);
+
+    expect(screen.getByText('Steven Enamakel')).toBeInTheDocument();
+  });
+
   it('falls back to the raw email when no person/* tag is present', () => {
     render(<MemoryChunkLetterhead chunk={BASE_CHUNK} />);
     // Without a person tag, fromName === the raw email.
