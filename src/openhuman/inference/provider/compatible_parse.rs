@@ -245,10 +245,12 @@ pub(crate) fn build_responses_prompt(
             continue;
         }
 
+        let normalized_role = normalize_responses_role(&message.role);
+
         input.push(ResponsesInput {
-            role: normalize_responses_role(&message.role).to_string(),
+            role: normalized_role.to_string(),
             content: vec![ResponsesContentPart {
-                kind: if message.role == "assistant" {
+                kind: if normalized_role == "assistant" {
                     "output_text".to_string()
                 } else {
                     "input_text".to_string()

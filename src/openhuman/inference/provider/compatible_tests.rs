@@ -863,11 +863,27 @@ fn build_responses_prompt_preserves_multi_turn_history() {
     assert_eq!(input[1].content[0].kind, "output_text");
     assert_eq!(input[1].content[0].text, "ack 1");
     assert_eq!(input[2].role, "assistant");
-    assert_eq!(input[2].content[0].kind, "input_text");
+    assert_eq!(input[2].content[0].kind, "output_text");
     assert_eq!(input[2].content[0].text, "{\"result\":\"ok\"}");
     assert_eq!(input[3].role, "user");
     assert_eq!(input[3].content[0].kind, "input_text");
     assert_eq!(input[3].content[0].text, "step 2");
+}
+
+#[test]
+fn build_responses_prompt_never_sends_assistant_input_text() {
+    let messages = vec![
+        ChatMessage::assistant("ack"),
+        ChatMessage::tool("{\"result\":\"ok\"}"),
+    ];
+
+    let (_, input) = build_responses_prompt(&messages);
+
+    for item in input {
+        if item.role == "assistant" {
+            assert_ne!(item.content[0].kind, "input_text");
+        }
+    }
 }
 
 #[tokio::test]
