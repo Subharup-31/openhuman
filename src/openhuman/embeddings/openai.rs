@@ -14,6 +14,13 @@ pub struct OpenAiEmbedding {
     api_key: String,
     model: String,
     dims: usize,
+    /// When true, send `"dimensions": dims` in the request body. OpenAI's
+    /// `text-embedding-3-*` models honour this (Matryoshka — e.g. 3-large can
+    /// return 1024 instead of its native 3072). Off by default so providers
+    /// that don't accept the field — Voyage (uses `output_dimension`), Cohere,
+    /// LocalAI/Ollama — keep working unchanged. Set via
+    /// [`Self::with_send_dimensions`] for the OpenAI / custom-OpenAI paths.
+    send_dimensions: bool,
 }
 
 impl OpenAiEmbedding {
@@ -24,7 +31,18 @@ impl OpenAiEmbedding {
             api_key: api_key.to_string(),
             model: model.to_string(),
             dims,
+            send_dimensions: false,
         }
+    }
+
+    /// Opt into sending the OpenAI `dimensions` request parameter so a
+    /// reducible model (`text-embedding-3-large` / `-3-small`) returns exactly
+    /// `dims` floats instead of its native size. Only call this for genuine
+    /// OpenAI / OpenAI-compatible endpoints that implement the parameter —
+    /// see [`Self::send_dimensions`]. Returns `self` for builder chaining.
+    pub fn with_send_dimensions(mut self, send: bool) -> Self {
+        self.send_dimensions = send;
+        self
     }
 
     /// Returns the configured base URL.
@@ -103,6 +121,28 @@ impl EmbeddingProvider for OpenAiEmbedding {
             return Ok(Vec::new());
         }
 
+        // Pre-flight: empty / whitespace-only entries are guaranteed 400s from
+        // the upstream (OpenAI: `"input must be a non-empty string"`; OpenHuman
+        // cloud backend: `"input must be a non-empty string or array of
+        // non-empty strings"`). Bailing here keeps the round-trip and quota
+        // out of the picture and — crucially — bypasses the `report_error_or_
+        // expected` Sentry route below, so a caller passing an empty summary
+        // stops manifesting as a server fault (#13021).
+        if let Some(idx) = texts.iter().position(|t| t.trim().is_empty()) {
+            tracing::warn!(
+                target: "openai::embed",
+                "[openai] refusing embed: input[{idx}] is empty/whitespace \
+                 (count={}, model={}). Caller must filter empty strings.",
+                texts.len(),
+                self.model,
+            );
+            anyhow::bail!(
+                "openai embed: refusing empty/whitespace input at index {idx} of {} (model={})",
+                texts.len(),
+                self.model,
+            );
+        }
+
         let url = self.embeddings_url();
 
         tracing::debug!(
@@ -111,10 +151,17 @@ impl EmbeddingProvider for OpenAiEmbedding {
             self.model, texts.len(), url
         );
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
             "input": texts,
         });
+        // Request a specific output size on OpenAI 3-* models (Matryoshka) so
+        // the vector matches `dims` (e.g. 3-large → 1024 for the memory tree's
+        // fixed EMBEDDING_DIM). Gated by `send_dimensions` because Voyage /
+        // Cohere / LocalAI don't accept this exact field.
+        if self.send_dimensions && self.dims > 0 {
+            body["dimensions"] = serde_json::json!(self.dims);
+        }
 
         // Retry loop: handles 429 Too Many Requests and 503 Service Unavailable
         // with Retry-After–aware exponential backoff.
@@ -182,7 +229,21 @@ impl EmbeddingProvider for OpenAiEmbedding {
                     target: "openai::embed",
                     "[openai] embed error: status={status}, body={text}"
                 );
-                let message = format!("Embedding API error ({status}): {text}");
+                let mut message = format!("Embedding API error ({status}): {text}");
+                // A 404/405 means the base URL responded but exposes no
+                // embeddings route — the user pointed the Custom
+                // (OpenAI-compatible) provider at a chat-only endpoint (e.g.
+                // DeepSeek). Append an actionable remediation while PRESERVING
+                // the `Embedding API error (404…)` prefix that
+                // `observability::is_embedding_endpoint_absent` keys on, so the
+                // event is still demoted from Sentry. Host-agnostic text (no
+                // URL/credential echo). TAURI-RUST-5JR.
+                if matches!(status.as_u16(), 404 | 405) {
+                    message.push_str(
+                        " — this endpoint has no embeddings API; pick an \
+                         embeddings-capable provider in Settings → Memory",
+                    );
+                }
                 // Use `report_error_or_expected` so transient upstream HTTP
                 // failures (e.g. 429 Too Many Requests after retry cap) log a
                 // warning breadcrumb instead of firing a Sentry error event.

@@ -56,11 +56,17 @@ describe('Insights dashboard smoke', () => {
     await stopMockServer();
   });
 
-  it('mounts the /intelligence route and renders the Memory tab', async () => {
-    stepLog('navigating to /intelligence');
-    await navigateViaHash('/intelligence');
+  it('mounts the intelligence dashboard and renders the Memory tab', async () => {
+    // The old top-level /intelligence page was folded into Brain as the
+    // "intelligence" tab, which renders the <Intelligence/> dashboard. That
+    // dashboard's own sub-tab is selected via ?itab=, so deep-link straight to
+    // the Memory sub-tab (itab=memory) — clicking the Brain "Memory" sidebar
+    // group instead would switch Brain away from the intelligence tab.
+    // See app/src/pages/Brain.tsx and app/src/pages/Intelligence.tsx.
+    stepLog('navigating to /brain?tab=intelligence&itab=memory');
+    await navigateViaHash('/brain?tab=intelligence&itab=memory');
 
-    // Tabs / page chrome — Memory is the canonical first view.
+    // The Intelligence dashboard's Memory sub-tab renders the memory workspace.
     await waitForText('Memory', 15_000);
     expect(await textExists('Memory')).toBe(true);
   });

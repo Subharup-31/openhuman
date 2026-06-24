@@ -109,7 +109,7 @@ async function waitForSocketConnected(page: Page): Promise<void> {
 async function sendMessage(page: Page, prompt: string): Promise<void> {
   await waitForSocketConnected(page);
   await dismissWalkthroughIfPresent(page);
-  await page.getByPlaceholder('Type a message...').fill(prompt);
+  await page.getByPlaceholder('How can I help you today?').fill(prompt);
   await dismissWalkthroughIfPresent(page);
   await expect(page.getByTestId('send-message-button')).toBeEnabled();
   await page.getByTestId('send-message-button').click();
@@ -129,12 +129,12 @@ test.describe('Chat Harness - Cancel', () => {
 
     await page.getByRole('button', { name: 'Cancel' }).click();
 
-    await page.waitForTimeout(3_500);
+    await expect(page.getByRole('button', { name: 'Cancel' })).toHaveCount(0, { timeout: 10_000 });
     for (const piece of LATE_PIECES) {
-      await expect(page.getByText(piece, { exact: false })).toHaveCount(0);
+      await expect(page.getByText(piece, { exact: false })).toHaveCount(0, { timeout: 5_000 });
     }
 
-    const composer = page.getByPlaceholder('Type a message...');
+    const composer = page.getByPlaceholder('How can I help you today?');
     await expect(composer).toBeEnabled();
     await composer.fill('post-cancel probe message');
     await expect(page.getByTestId('send-message-button')).toBeEnabled();

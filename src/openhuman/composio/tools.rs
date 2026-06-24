@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::openhuman::agent::harness::current_sandbox_mode;
+use crate::openhuman::agent::harness::current_task_recency_window;
 use crate::openhuman::agent::harness::definition::SandboxMode;
 use crate::openhuman::config::rpc as config_rpc;
 use crate::openhuman::config::Config;
@@ -376,9 +377,9 @@ impl Tool for ComposioListToolkitsTool {
     }
     fn category(&self) -> ToolCategory {
         // Composio proxies to external SaaS (Gmail, Notion, …), so it
-        // lives in the Skill category and is picked up by sub-agents
+        // lives in the Workflow category and is picked up by sub-agents
         // with `category_filter = "skill"`.
-        ToolCategory::Skill
+        ToolCategory::Workflow
     }
     async fn execute(&self, _args: Value) -> anyhow::Result<ToolResult> {
         tracing::debug!("[composio] tool list_toolkits.execute");
@@ -470,7 +471,7 @@ impl Tool for ComposioListConnectionsTool {
         PermissionLevel::ReadOnly
     }
     fn category(&self) -> ToolCategory {
-        ToolCategory::Skill
+        ToolCategory::Workflow
     }
     async fn execute(&self, _args: Value) -> anyhow::Result<ToolResult> {
         tracing::debug!("[composio] tool list_connections.execute");
@@ -588,7 +589,7 @@ impl Tool for ComposioAuthorizeTool {
         PermissionLevel::Write
     }
     fn category(&self) -> ToolCategory {
-        ToolCategory::Skill
+        ToolCategory::Workflow
     }
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let toolkit = args
@@ -729,7 +730,7 @@ impl Tool for ComposioListToolsTool {
         PermissionLevel::ReadOnly
     }
     fn category(&self) -> ToolCategory {
-        ToolCategory::Skill
+        ToolCategory::Workflow
     }
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         self.execute_with_options(args, ToolCallOptions::default())
@@ -948,6 +949,10 @@ impl Tool for ComposioExecuteTool {
                 "arguments": {
                     "type": "object",
                     "description": "Action-specific arguments. Shape depends on the tool."
+                },
+                "connection_id": {
+                    "type": "string",
+                    "description": "Optional. Target a specific account when multiple are connected for a toolkit. Use the connection_id from '## Connected Integrations'. Omit to use the default account."
                 }
             },
             "required": ["tool"],
@@ -960,7 +965,7 @@ impl Tool for ComposioExecuteTool {
         PermissionLevel::Write
     }
     fn category(&self) -> ToolCategory {
-        ToolCategory::Skill
+        ToolCategory::Workflow
     }
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let tool = args
@@ -1074,6 +1079,20 @@ impl Tool for ComposioExecuteTool {
         let arguments =
             super::googlecalendar_args::apply_calendar_query_defaults(&tool, arguments, &iana);
 
+        // Task-recency window (morning briefing): when the calling agent
+        // installed a window, inject best-effort server-side narrowing for
+        // curated task-fetch slugs. No-op for every other slug and for
+        // normal chat / CLI / JSON-RPC (window unset → None). The
+        // authoritative enforcement is the post-filter on the response below.
+        let task_window_since = current_task_recency_window().map(|w| {
+            chrono::Utc::now()
+                - chrono::Duration::from_std(w).unwrap_or_else(|_| chrono::Duration::zero())
+        });
+        let arguments = match task_window_since {
+            Some(since) => super::task_window::apply_window_args(&tool, arguments, since),
+            None => arguments,
+        };
+
         // Resolve the client through the mode-aware factory on every
         // call so a direct-mode toggle takes effect immediately
         // (#1710). The pre-baked-client variant of this code routed all
@@ -1118,6 +1137,14 @@ impl Tool for ComposioExecuteTool {
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match res {
             Ok(resp) => {
+                // Authoritative task-recency enforcement: drop task rows older
+                // than the window. No-op unless a window is installed AND the
+                // slug is a curated task-fetch action. Runs before the
+                // markdown/JSON body decision so the agent reads filtered data.
+                let resp = match task_window_since {
+                    Some(since) => super::task_window::filter_response(&tool, resp, since),
+                    None => resp,
+                };
                 tracing::info!(
                     tool = %tool,
                     successful = resp.successful,

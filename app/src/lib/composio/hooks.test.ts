@@ -29,6 +29,9 @@ describe('useComposioIntegrations', () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
+    // The toolkit catalog is now cached in localStorage (24h TTL); clear it
+    // so each test exercises the mocked fetch instead of a prior test's cache.
+    window.localStorage.clear();
     sessionToken = 'jwt-abc';
     mockOpenhumanComposioGetMode.mockResolvedValue({
       result: { mode: 'backend', api_key_set: true },
@@ -50,7 +53,77 @@ describe('useComposioIntegrations', () => {
 
     expect(result.current.toolkits).toEqual(['gmail', 'github', 'notion']);
     expect(result.current.connectionByToolkit.size).toBe(0);
+    expect(result.current.connectionsByToolkit.size).toBe(0);
     expect(result.current.error).toBe('backend connection listing failed');
+  });
+
+  it('exposes the dynamic catalog keyed by canonical slug', async () => {
+    const { useComposioIntegrations } = await import('./hooks');
+
+    mockListToolkits.mockResolvedValue({
+      toolkits: ['gmail', 'googlecalendar'],
+      catalog: [
+        { slug: 'gmail', name: 'Gmail', logo: 'https://x/gmail.png', enabled: true },
+        // Alias slug must be canonicalized to googlecalendar.
+        { slug: 'google_calendar', name: 'Google Calendar', enabled: true },
+      ],
+    });
+    mockListConnections.mockResolvedValue({ connections: [] });
+
+    const { result } = renderHook(() => useComposioIntegrations(0));
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    expect(result.current.catalogByToolkit.get('gmail')?.name).toBe('Gmail');
+    expect(result.current.catalogByToolkit.get('gmail')?.logo).toBe('https://x/gmail.png');
+    expect(result.current.catalogByToolkit.get('googlecalendar')?.name).toBe('Google Calendar');
+  });
+
+  it('leaves the catalog empty when the core omits it (back-compat)', async () => {
+    const { useComposioIntegrations } = await import('./hooks');
+
+    mockListToolkits.mockResolvedValue({ toolkits: ['gmail'] });
+    mockListConnections.mockResolvedValue({ connections: [] });
+
+    const { result } = renderHook(() => useComposioIntegrations(0));
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    expect(result.current.toolkits).toEqual(['gmail']);
+    expect(result.current.catalogByToolkit.size).toBe(0);
+  });
+
+  it('groups connections by toolkit, sorts by status then createdAt', async () => {
+    const { useComposioIntegrations } = await import('./hooks');
+
+    mockListToolkits.mockResolvedValue({ toolkits: ['gmail'] });
+    mockListConnections.mockResolvedValue({
+      connections: [
+        { id: 'c1', toolkit: 'gmail', status: 'EXPIRED', createdAt: '2025-01-01' },
+        { id: 'c2', toolkit: 'gmail', status: 'ACTIVE', createdAt: '2025-06-01' },
+        { id: 'c3', toolkit: 'gmail', status: 'ACTIVE', createdAt: '2025-03-01' },
+        { id: 'c4', toolkit: 'gmail', status: 'PENDING', createdAt: '2025-02-01' },
+      ],
+    });
+
+    const { result } = renderHook(() => useComposioIntegrations(0));
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    const gmailConns = result.current.connectionsByToolkit.get('gmail');
+    expect(gmailConns).toHaveLength(4);
+    expect(gmailConns![0].id).toBe('c3');
+    expect(gmailConns![1].id).toBe('c2');
+    expect(gmailConns![2].id).toBe('c4');
+    expect(gmailConns![3].id).toBe('c1');
+
+    expect(result.current.connectionByToolkit.get('gmail')?.id).toBe('c2');
   });
 
   it('surfaces toolkit fetch errors instead of hiding the UI (composio is always enabled)', async () => {

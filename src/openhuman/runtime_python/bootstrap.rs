@@ -27,6 +27,9 @@ pub enum PythonSource {
 /// Fully-resolved Python interpreter.
 #[derive(Debug, Clone)]
 pub struct ResolvedPython {
+    /// Directory that should be prepended to `PATH` for child processes so
+    /// `python`, `python3`, `pip`, and `pip3` resolve to the same toolchain.
+    pub bin_dir: std::path::PathBuf,
     /// Absolute path to the Python executable.
     pub python_bin: std::path::PathBuf,
     /// Normalized interpreter version, e.g. `3.12.4`.
@@ -126,7 +129,11 @@ impl PythonBootstrap {
             empty_to_none(&self.config.managed_release_tag),
         )
         .await?;
-        let dist = select_distribution(&release, &self.config.minimum_version)?;
+        let dist = select_distribution(
+            &release,
+            &self.config.minimum_version,
+            &self.config.maximum_version,
+        )?;
         let install_dir = cache_root.join(dist.install_dir_name());
         let _install_lock = acquire_install_lock(&install_dir).await?;
 
@@ -187,6 +194,7 @@ fn resolve_from_system(system: SystemPython) -> ResolvedPython {
         "[runtime_python::bootstrap] reusing compatible system python"
     );
     ResolvedPython {
+        bin_dir: python_bin_dir(&system.path),
         python_bin: system.path,
         version: system.version,
         source: PythonSource::System,
@@ -207,10 +215,18 @@ fn probe_managed_install(install_dir: &Path) -> Option<ResolvedPython> {
     let version = super::resolver::probe_python_version_public(&python_bin)?;
     let version_info = super::resolver::parse_python_version(&version)?;
     Some(ResolvedPython {
+        bin_dir: python_bin_dir(&python_bin),
         python_bin,
         version: version_info.display(),
         source: PythonSource::Managed,
     })
+}
+
+fn python_bin_dir(python_bin: &Path) -> PathBuf {
+    python_bin
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn find_python_binary(install_dir: &Path) -> Option<PathBuf> {

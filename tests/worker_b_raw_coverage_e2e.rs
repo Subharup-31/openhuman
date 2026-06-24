@@ -21,6 +21,7 @@ use tempfile::{tempdir, TempDir};
 
 use openhuman_core::core::auth::{init_rpc_token, CORE_TOKEN_ENV_VAR};
 use openhuman_core::core::jsonrpc::build_core_http_router;
+use openhuman_core::openhuman::agent::turn_origin::{self, AgentTurnOrigin};
 use openhuman_core::openhuman::approval::gate::{
     ApprovalChatContext, ApprovalGate, APPROVAL_CHAT_CONTEXT,
 };
@@ -393,18 +394,19 @@ async fn inference_provider_success_paths_use_mock_models_and_chat() {
         "mock model should round-trip through provider /models: {models}"
     );
 
-    let unsupported = rpc(
+    // PR #2959 reverted the list_models 404 suppression: a 404 from /models
+    // now surfaces as a JSON-RPC error instead of a synthetic `unsupported:
+    // true` success, so the failure fires to Sentry for a root-cause fix.
+    let models_404 = rpc(
         &harness.rpc_base,
         102,
         "openhuman.inference_list_models",
         json!({ "provider_id": "mock-404" }),
     )
     .await;
-    assert_eq!(
-        payload(&unsupported, "inference_list_models 404")
-            .get("unsupported")
-            .and_then(Value::as_bool),
-        Some(true)
+    assert!(
+        error_message(&models_404, "inference_list_models 404").contains("provider returned 404"),
+        "404 list_models should surface as an error: {models_404}"
     );
 
     let reply = rpc(
@@ -494,7 +496,7 @@ async fn agent_profile_lifecycle_persists_custom_profile_and_validates_delete() 
     let upsert = rpc(
         &harness.rpc_base,
         301,
-        "openhuman.agent_profile_upsert",
+        "openhuman.profiles_upsert",
         json!({
             "profile": {
                 "id": "worker-b-custom",
@@ -515,7 +517,7 @@ async fn agent_profile_lifecycle_persists_custom_profile_and_validates_delete() 
         }),
     )
     .await;
-    let profiles = ok(&upsert, "agent_profile_upsert")
+    let profiles = ok(&upsert, "profiles_upsert")
         .get("profiles")
         .and_then(Value::as_array)
         .expect("profiles after upsert");
@@ -532,12 +534,12 @@ async fn agent_profile_lifecycle_persists_custom_profile_and_validates_delete() 
     let select = rpc(
         &harness.rpc_base,
         302,
-        "openhuman.agent_profile_select",
+        "openhuman.profiles_select",
         json!({ "profile_id": "worker-b-custom" }),
     )
     .await;
     assert_eq!(
-        ok(&select, "agent_profile_select")
+        ok(&select, "profiles_select")
             .get("activeProfileId")
             .and_then(Value::as_str),
         Some("worker-b-custom")
@@ -546,7 +548,7 @@ async fn agent_profile_lifecycle_persists_custom_profile_and_validates_delete() 
     let delete_default = rpc(
         &harness.rpc_base,
         303,
-        "openhuman.agent_profile_delete",
+        "openhuman.profiles_delete",
         json!({ "profile_id": "default" }),
     )
     .await;
@@ -558,12 +560,12 @@ async fn agent_profile_lifecycle_persists_custom_profile_and_validates_delete() 
     let delete_custom = rpc(
         &harness.rpc_base,
         304,
-        "openhuman.agent_profile_delete",
+        "openhuman.profiles_delete",
         json!({ "profile_id": "worker-b-custom" }),
     )
     .await;
     assert_eq!(
-        ok(&delete_custom, "agent_profile_delete")
+        ok(&delete_custom, "profiles_delete")
             .get("activeProfileId")
             .and_then(Value::as_str),
         Some("default"),
@@ -584,8 +586,14 @@ async fn approval_gate_rpc_decision_resumes_parked_tool_and_records_execution() 
     let gate_for_task = gate.clone();
 
     let approval_task = tokio::spawn(async move {
-        APPROVAL_CHAT_CONTEXT
-            .scope(
+        // Scope a WebChat origin alongside the chat context — the gate now
+        // requires an origin label or it fails closed on `Unknown`.
+        turn_origin::with_origin(
+            AgentTurnOrigin::WebChat {
+                thread_id: "worker-b-thread".to_string(),
+                client_id: "worker-b-client".to_string(),
+            },
+            APPROVAL_CHAT_CONTEXT.scope(
                 ApprovalChatContext {
                     thread_id: "worker-b-thread".to_string(),
                     client_id: "worker-b-client".to_string(),
@@ -599,8 +607,9 @@ async fn approval_gate_rpc_decision_resumes_parked_tool_and_records_execution() 
                         )
                         .await
                 },
-            )
-            .await
+            ),
+        )
+        .await
     });
 
     let deadline = Instant::now() + Duration::from_secs(5);

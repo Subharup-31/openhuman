@@ -232,7 +232,7 @@ mod tests {
             model_name: "test",
             agent_id: "test",
             tools: &[],
-            skills: &[],
+            workflows: &[],
             dispatcher_instructions: "",
             learned: LearnedContextData::default(),
             visible_tool_names: &visible,
@@ -246,7 +246,6 @@ mod tests {
             personality_soul_md: None,
             personality_memory_md: None,
             personality_roster: vec![],
-            workflows: &[],
         };
         let built = section.build(&ctx).unwrap();
         assert!(built.contains("never email Sarah"));

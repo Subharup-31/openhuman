@@ -22,7 +22,7 @@ Production web builds embed a **minimum supported app semver** at **build time**
 | `VITE_MINIMUM_SUPPORTED_APP_VERSION` | e.g. `0.51.0` - desktop app must be **≥** this to finish `openhuman://oauth/success`.                                 |
 | `VITE_LATEST_APP_DOWNLOAD_URL`       | Optional; defaults to `https://github.com/tinyhumansai/openhuman/releases/latest`. Opened when the gate blocks OAuth. |
 
-Configure these as **GitHub Actions variables**. They must be present on **both** the standalone **`pnpm build`** step and the **`tauri-apps/tauri-action`** step env in `.github/workflows/build-desktop.yml` (the reusable matrix invoked by `release-production.yml` / `release-staging.yml`) and `build-windows.yml` so the Vite bundle embedded in shipped installers includes the gate. Leave `VITE_MINIMUM_SUPPORTED_APP_VERSION` **unset** for local dev (gate disabled).
+Configure these as **GitHub Actions variables**. They must be present on **both** the standalone **`pnpm build`** step and the **`tauri-apps/tauri-action`** step env in `.github/workflows/build-desktop.yml` (the reusable matrix invoked by `release-production.yml` / `release-staging.yml`) so the Vite bundle embedded in shipped installers includes the gate. Leave `VITE_MINIMUM_SUPPORTED_APP_VERSION` **unset** for local dev (gate disabled).
 
 Implementation: `app/src/utils/oauthAppVersionGate.ts`, `app/src/utils/desktopDeepLinkListener.ts`.
 
@@ -49,6 +49,36 @@ Two first-class GitHub Actions workflows, one per environment. Pick by intent ra
 | [`release-production.yml`](../../.github/workflows/release-production.yml) | `main`    | `patch` / `minor` / `major` (only on `main_head`) | `v<version>`                | `release-production`    | Promoting a validated staging tag, or hotfixing from `main` HEAD.     |
 
 The matrix build / sign / Sentry-DIF / artifact-upload pipeline used by both flows lives in [`.github/workflows/build-desktop.yml`](../../.github/workflows/build-desktop.yml) as a `workflow_call` reusable workflow. The two top-level workflows above own ref resolution, version bumping, tagging, and publish/cleanup; the build itself is shared.
+
+### Android / Google Play
+
+Android releases are handled by the separate [`.github/workflows/android-compile.yml`](../../.github/workflows/android-compile.yml) workflow, which builds a release Android App Bundle (`.aab`), signs it with the Play upload key, and uploads it to Google Play when publishing is enabled. The workflow keeps the unsigned and signed AABs as Actions artifacts for audit/debugging.
+
+Manual Android uploads use the same workflow:
+
+```bash
+pnpm --dir app release:android:play -- --track internal
+pnpm --dir app release:android:play -- --ref main --track production --status draft
+```
+
+Required GitHub Actions secrets:
+
+| Secret                                | Purpose                                                                                         |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `ANDROID_UPLOAD_KEYSTORE_BASE64`      | Base64-encoded Play upload keystore (`.jks`). Use the upload key, not the Google app signing key. |
+| `ANDROID_UPLOAD_KEY_ALIAS`            | Keystore alias for the upload key.                                                              |
+| `ANDROID_UPLOAD_KEYSTORE_PASSWORD`    | Keystore password.                                                                              |
+| `ANDROID_UPLOAD_KEY_PASSWORD`         | Key password.                                                                                   |
+| `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON`    | Raw JSON for the Play Console service account with release permissions for `com.openhuman.app`. |
+
+Optional GitHub Actions variables:
+
+| Variable              | Default     | Purpose                                                               |
+| --------------------- | ----------- | --------------------------------------------------------------------- |
+| `ANDROID_PLAY_TRACK`  | `internal`  | Play track to upload to (`internal`, `alpha`, `beta`, or `production`). |
+| `ANDROID_PLAY_STATUS` | `completed` | Play release status (`completed`, `draft`, `inProgress`, `halted`).   |
+
+Google Play requires each upload to use a monotonically increasing Android `versionCode`. The release bump scripts update `app/src-tauri-mobile/tauri.conf.json`, `app/src-tauri-mobile/Cargo.toml`, and `app/src-tauri-mobile/Cargo.lock` alongside desktop files so the generated Android `tauri.properties` moves with each release.
 
 ### Cutting a staging build
 

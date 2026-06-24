@@ -56,6 +56,24 @@ fn kind_specific_fields() -> Vec<FieldSchema> {
             required: false,
         },
         FieldSchema {
+            name: "max_commits",
+            ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
+            comment: "Max commits per sync for github_repo sources.",
+            required: false,
+        },
+        FieldSchema {
+            name: "max_issues",
+            ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
+            comment: "Max issues per sync for github_repo sources.",
+            required: false,
+        },
+        FieldSchema {
+            name: "max_prs",
+            ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
+            comment: "Max pull requests per sync for github_repo sources.",
+            required: false,
+        },
+        FieldSchema {
             name: "query",
             ty: TypeSchema::Option(Box::new(TypeSchema::String)),
             comment: "Search query for twitter_query sources.",
@@ -70,13 +88,31 @@ fn kind_specific_fields() -> Vec<FieldSchema> {
         FieldSchema {
             name: "max_items",
             ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
-            comment: "Maximum items for rss_feed sources.",
+            comment: "Maximum items for rss_feed or composio sources.",
             required: false,
         },
         FieldSchema {
             name: "selector",
             ty: TypeSchema::Option(Box::new(TypeSchema::String)),
             comment: "CSS selector for web_page sources.",
+            required: false,
+        },
+        FieldSchema {
+            name: "max_tokens_per_sync",
+            ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
+            comment: "Max tokens per sync run.",
+            required: false,
+        },
+        FieldSchema {
+            name: "max_cost_per_sync_usd",
+            ty: TypeSchema::Option(Box::new(TypeSchema::F64)),
+            comment: "Max cost per sync run in USD.",
+            required: false,
+        },
+        FieldSchema {
+            name: "sync_depth_days",
+            ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
+            comment: "Only sync items from the last N days.",
             required: false,
         },
     ]
@@ -92,8 +128,13 @@ pub fn all_controller_schemas() -> Vec<ControllerSchema> {
         schemas("list_items"),
         schemas("read_item"),
         schemas("sync"),
+        schemas("reconcile"),
         schemas("status_list"),
+        schemas("supported_toolkits"),
         schemas("sync_audit_log"),
+        schemas("estimate_sync_cost"),
+        schemas("monthly_cost_summary"),
+        schemas("apply_all_in"),
     ]
 }
 
@@ -132,12 +173,32 @@ pub fn all_registered_controllers() -> Vec<RegisteredController> {
             handler: handle_sync,
         },
         RegisteredController {
+            schema: schemas("reconcile"),
+            handler: handle_reconcile,
+        },
+        RegisteredController {
             schema: schemas("status_list"),
             handler: handle_status_list,
         },
         RegisteredController {
+            schema: schemas("supported_toolkits"),
+            handler: handle_supported_toolkits,
+        },
+        RegisteredController {
             schema: schemas("sync_audit_log"),
             handler: handle_sync_audit_log,
+        },
+        RegisteredController {
+            schema: schemas("estimate_sync_cost"),
+            handler: handle_estimate_sync_cost,
+        },
+        RegisteredController {
+            schema: schemas("monthly_cost_summary"),
+            handler: handle_monthly_cost_summary,
+        },
+        RegisteredController {
+            schema: schemas("apply_all_in"),
+            handler: handle_apply_all_in,
         },
     ]
 }
@@ -180,6 +241,7 @@ pub fn schemas(function: &str) -> ControllerSchema {
                     ty: TypeSchema::Enum {
                         variants: vec![
                             "composio",
+                            "conversation",
                             "folder",
                             "github_repo",
                             "twitter_query",
@@ -338,6 +400,35 @@ pub fn schemas(function: &str) -> ControllerSchema {
                 },
             ],
         },
+        "reconcile" => ControllerSchema {
+            namespace: NAMESPACE,
+            function: "reconcile",
+            description: "Report raw-archive vs memory-tree coverage per source scope; \
+                          with execute=true, start a background incremental reconcile \
+                          (summarise + ingest) for every scope with pending files. The \
+                          same reconcile also runs automatically after each sync.",
+            inputs: vec![
+                FieldSchema {
+                    name: "source_id",
+                    ty: TypeSchema::String,
+                    comment: "Restrict to one source id; omit for all enabled sources.",
+                    required: false,
+                },
+                FieldSchema {
+                    name: "execute",
+                    ty: TypeSchema::Bool,
+                    comment: "Start background reconcile for scopes with pending files \
+                              (default false = report only).",
+                    required: false,
+                },
+            ],
+            outputs: vec![FieldSchema {
+                name: "scopes",
+                ty: TypeSchema::Array(Box::new(TypeSchema::Ref("ReconcileScopeReport"))),
+                comment: "Per-scope coverage: total raw files, covered, pending, started.",
+                required: true,
+            }],
+        },
         "status_list" => ControllerSchema {
             namespace: NAMESPACE,
             function: "status_list",
@@ -348,6 +439,19 @@ pub fn schemas(function: &str) -> ControllerSchema {
                 name: "statuses",
                 ty: TypeSchema::Array(Box::new(TypeSchema::Ref("SourceStatus"))),
                 comment: "One row per configured memory source.",
+                required: true,
+            }],
+        },
+        "supported_toolkits" => ControllerSchema {
+            namespace: NAMESPACE,
+            function: "supported_toolkits",
+            description: "Toolkit slugs that ship a native memory-sync provider. \
+                          The Add Source picker disables connections outside this set.",
+            inputs: vec![],
+            outputs: vec![FieldSchema {
+                name: "toolkits",
+                ty: TypeSchema::Array(Box::new(TypeSchema::String)),
+                comment: "Sorted, de-duplicated supported toolkit slugs.",
                 required: true,
             }],
         },
@@ -363,6 +467,124 @@ pub fn schemas(function: &str) -> ControllerSchema {
                 comment: "Audit entries, most recent first.",
                 required: true,
             }],
+        },
+        "estimate_sync_cost" => ControllerSchema {
+            namespace: NAMESPACE,
+            function: "estimate_sync_cost",
+            description:
+                "Estimate the cost of syncing a source before starting. Returns item count, \
+                 estimated tokens, and estimated cost in USD.",
+            inputs: vec![FieldSchema {
+                name: "source_id",
+                ty: TypeSchema::String,
+                comment: "Source id to estimate.",
+                required: true,
+            }],
+            outputs: vec![
+                FieldSchema {
+                    name: "source_id",
+                    ty: TypeSchema::String,
+                    comment: "Echo of source id.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "item_count",
+                    ty: TypeSchema::U64,
+                    comment: "Number of items to sync.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "estimated_tokens",
+                    ty: TypeSchema::U64,
+                    comment: "Estimated input tokens.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "estimated_cost_usd",
+                    ty: TypeSchema::F64,
+                    comment: "Estimated cost in USD.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "budget_max_cost_usd",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::F64)),
+                    comment: "Configured cost cap if set.",
+                    required: false,
+                },
+                FieldSchema {
+                    name: "budget_max_tokens",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
+                    comment: "Configured token cap if set.",
+                    required: false,
+                },
+            ],
+        },
+        "monthly_cost_summary" => ControllerSchema {
+            namespace: NAMESPACE,
+            function: "monthly_cost_summary",
+            description: "Aggregate sync costs for the current calendar month.",
+            inputs: vec![],
+            outputs: vec![
+                FieldSchema {
+                    name: "month",
+                    ty: TypeSchema::String,
+                    comment: "YYYY-MM.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "total_cost_usd",
+                    ty: TypeSchema::F64,
+                    comment: "Total spend in USD.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "total_syncs",
+                    ty: TypeSchema::U64,
+                    comment: "Number of sync runs.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "total_items",
+                    ty: TypeSchema::U64,
+                    comment: "Total items fetched.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "total_input_tokens",
+                    ty: TypeSchema::U64,
+                    comment: "Total input tokens.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "total_output_tokens",
+                    ty: TypeSchema::U64,
+                    comment: "Total output tokens.",
+                    required: true,
+                },
+            ],
+        },
+        "apply_all_in" => ControllerSchema {
+            namespace: NAMESPACE,
+            function: "apply_all_in",
+            description: "Enable ALL memory sources, clear all per-source caps, \
+                          and trigger a background sync for every source. \
+                          Returns immediately with the updated source list and \
+                          the count of sync tasks queued.",
+            inputs: vec![],
+            outputs: vec![
+                FieldSchema {
+                    name: "sources",
+                    ty: TypeSchema::Array(Box::new(TypeSchema::Ref("MemorySourceEntry"))),
+                    comment: "All memory sources after the all-in transformation.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "sync_triggered",
+                    ty: TypeSchema::U64,
+                    comment: "Number of sync tasks spawned.",
+                    required: true,
+                },
+            ],
         },
         other => panic!("unknown memory_sources schema function: {other}"),
     }
@@ -421,12 +643,38 @@ fn handle_sync(params: Map<String, Value>) -> ControllerFuture {
     })
 }
 
+fn handle_reconcile(params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let req = parse_value::<rpc::ReconcileRequest>(Value::Object(params))?;
+        to_json(rpc::reconcile_rpc(req).await?)
+    })
+}
+
 fn handle_status_list(_params: Map<String, Value>) -> ControllerFuture {
     Box::pin(async move { to_json(rpc::status_list_rpc().await?) })
 }
 
+fn handle_supported_toolkits(_params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move { to_json(rpc::supported_toolkits_rpc().await?) })
+}
+
 fn handle_sync_audit_log(_params: Map<String, Value>) -> ControllerFuture {
     Box::pin(async move { to_json(rpc::sync_audit_log_rpc().await?) })
+}
+
+fn handle_estimate_sync_cost(params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let req = parse_value::<rpc::EstimateSyncCostRequest>(Value::Object(params))?;
+        to_json(rpc::estimate_sync_cost_rpc(req).await?)
+    })
+}
+
+fn handle_monthly_cost_summary(_params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move { to_json(rpc::monthly_cost_summary_rpc().await?) })
+}
+
+fn handle_apply_all_in(_params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move { to_json(rpc::apply_all_in_rpc().await?) })
 }
 
 fn parse_value<T: DeserializeOwned>(v: Value) -> Result<T, String> {

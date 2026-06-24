@@ -4,6 +4,72 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 
+/// Hosts that serve the public Ollama website / model registry — never a local
+/// or self-hosted Ollama API server. Pointing the base URL at one makes every
+/// `/api/tags` poll hit ollama.com (HTTP 429 from its rate limiter), floods
+/// Sentry with `list_models: non-success response`, and sends pointless traffic
+/// to Ollama Inc. (TAURI-RUST-A3T).
+///
+/// Matched **exactly** (no suffix match) so a user's own self-hosted server at
+/// e.g. `ollama.mycompany.com` is unaffected.
+fn is_ollama_registry_host(host: &str) -> bool {
+    matches!(
+        host.trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+            .as_str(),
+        "ollama.com" | "www.ollama.com" | "ollama.ai" | "www.ollama.ai" | "registry.ollama.ai"
+    )
+}
+
+/// Returns `url` unless its host is a public Ollama registry host
+/// ([`is_ollama_registry_host`]), in which case it logs a warning and falls back
+/// to [`DEFAULT_OLLAMA_BASE_URL`]. This heals stale config/env values that
+/// already target ollama.com (set before validation rejected it), so the
+/// diagnostics poller stops hitting the website on the next launch.
+fn reject_registry_host_or_default(url: String) -> String {
+    let is_registry = reqwest::Url::parse(&url)
+        .ok()
+        .and_then(|u| u.host_str().map(is_ollama_registry_host))
+        .unwrap_or(false);
+    if is_registry {
+        log::warn!(
+            "[local_ai] ignoring Ollama base URL {} (public website/registry, not a local server) — falling back to {DEFAULT_OLLAMA_BASE_URL}",
+            redact_ollama_base_url(&url)
+        );
+        return DEFAULT_OLLAMA_BASE_URL.to_string();
+    }
+    url
+}
+
+/// Rewrite unspecified bind addresses (`0.0.0.0`, `[::]`) to their loopback
+/// equivalents (`127.0.0.1`, `[::1]`).  Ollama's default `OLLAMA_HOST` is
+/// `0.0.0.0:11434` — a valid *server-side* bind address but an invalid
+/// *client-side* connect target on Windows (and misleading on other OSes).
+fn normalize_unspecified_host(url: &str) -> String {
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        let replacement = match parsed.host() {
+            Some(url::Host::Ipv4(addr)) if addr.is_unspecified() => Some("localhost"),
+            Some(url::Host::Ipv6(addr)) if addr.is_unspecified() => Some("[::1]"),
+            _ => None,
+        };
+        if let Some(new_host) = replacement {
+            let scheme = parsed.scheme();
+            let port_suffix = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+            let path = parsed.path().trim_end_matches('/');
+            let result = format!("{scheme}://{new_host}{port_suffix}{path}");
+            let result = result.trim_end_matches('/').to_string();
+            log::debug!(
+                "[local_ai] normalize_unspecified_host: rewrote {} -> {}",
+                redact_ollama_base_url(url),
+                redact_ollama_base_url(&result)
+            );
+            return result;
+        }
+    }
+    url.to_string()
+}
+
 /// Returns the effective Ollama base URL.
 ///
 /// Priority (highest to lowest):
@@ -11,11 +77,16 @@ pub(crate) const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 /// 2. `OLLAMA_HOST` — Ollama's own env var; normalized to a full URL by
 ///    prepending `http://` when no scheme is present.
 /// 3. [`DEFAULT_OLLAMA_BASE_URL`] — `http://localhost:11434`.
+///
+/// Unspecified bind addresses (`0.0.0.0`, `[::]`) are rewritten to their
+/// loopback equivalents so the URL is valid as a client connect target.
 pub(crate) fn ollama_base_url() -> String {
     if let Ok(url) = std::env::var("OPENHUMAN_OLLAMA_BASE_URL") {
         let trimmed = url.trim();
         if !trimmed.is_empty() {
-            return trimmed.trim_end_matches('/').to_string();
+            return reject_registry_host_or_default(normalize_unspecified_host(
+                trimmed.trim_end_matches('/'),
+            ));
         }
     }
 
@@ -28,7 +99,7 @@ pub(crate) fn ollama_base_url() -> String {
                 format!("http://{trimmed}")
             };
             log::debug!("[local_ai] ollama_base_url: using OLLAMA_HOST -> {url}");
-            return url;
+            return reject_registry_host_or_default(normalize_unspecified_host(&url));
         }
     }
 
@@ -43,15 +114,19 @@ pub(crate) fn ollama_base_url() -> String {
 /// 2. `OPENHUMAN_OLLAMA_BASE_URL` env var
 /// 3. `OLLAMA_HOST` env var
 /// 4. [`DEFAULT_OLLAMA_BASE_URL`]
+///
+/// Unspecified bind addresses (`0.0.0.0`, `[::]`) are rewritten to their
+/// loopback equivalents so the URL is valid as a client connect target.
 pub(crate) fn ollama_base_url_from_config(config: &crate::openhuman::config::Config) -> String {
     if let Some(ref url) = config.local_ai.base_url {
         let trimmed = url.trim().trim_end_matches('/');
         if !trimmed.is_empty() {
+            let normalized = reject_registry_host_or_default(normalize_unspecified_host(trimmed));
             log::debug!(
                 "[local_ai] ollama_base_url_from_config: using config base_url -> {}",
-                redact_ollama_base_url(trimmed)
+                redact_ollama_base_url(&normalized)
             );
-            return trimmed.to_string();
+            return normalized;
         }
     }
     let resolved = ollama_base_url();
@@ -86,6 +161,18 @@ pub(crate) fn validate_ollama_url(raw: &str) -> Result<String, String> {
         return Err("URL must have a non-empty host".to_string());
     }
 
+    if parsed
+        .host_str()
+        .map(is_ollama_registry_host)
+        .unwrap_or(false)
+    {
+        return Err(
+            "ollama.com is the Ollama website, not a local server. Enter your local Ollama \
+             address (e.g. http://localhost:11434) or your own server's URL."
+                .to_string(),
+        );
+    }
+
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("URL must not contain credentials (user:pass@host)".to_string());
     }
@@ -101,6 +188,8 @@ pub(crate) fn validate_ollama_url(raw: &str) -> Result<String, String> {
     // Use the Host enum so IPv6 addresses are always re-bracketed correctly,
     // regardless of whether host_str() includes brackets in a given url-crate version.
     let host_formatted = match parsed.host() {
+        Some(url::Host::Ipv4(addr)) if addr.is_unspecified() => "localhost".to_string(),
+        Some(url::Host::Ipv6(addr)) if addr.is_unspecified() => "[::1]".to_string(),
         Some(url::Host::Ipv6(addr)) => format!("[{addr}]"),
         Some(h) => h.to_string(),
         None => String::new(),
@@ -238,6 +327,18 @@ pub(crate) struct OllamaModelTag {
     pub modified_at: Option<String>,
 }
 
+/// Resolved per-model signals from one Ollama `POST /api/show` round-trip.
+///
+/// Both fields are `None` when `/api/show` failed or omitted the data:
+/// `context_length` → an `Unknown` memory-layer eligibility verdict;
+/// `chat_capable` → "keep visible" in the chat picker (fail-open). See
+/// [`OllamaShowResponse::chat_capability`] and Sentry TAURI-RUST-4P6.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OllamaModelShow {
+    pub context_length: Option<u64>,
+    pub chat_capable: Option<bool>,
+}
+
 /// Request body for Ollama `POST /api/show`.
 #[derive(Debug, Serialize)]
 pub(crate) struct OllamaShowRequest {
@@ -257,9 +358,11 @@ pub(crate) struct OllamaShowRequest {
 pub(crate) struct OllamaShowResponse {
     #[serde(default)]
     pub model_info: serde_json::Map<String, serde_json::Value>,
-    // Present in the Ollama API response; retained to document the wire shape, not yet consumed.
+    /// Capability tags Ollama advertises for the model (e.g. `"completion"`,
+    /// `"tools"`, `"vision"`, `"embedding"`, `"insert"`). Consumed by
+    /// [`OllamaShowResponse::chat_capability`] to keep embedding-only models
+    /// out of the chat-model picker (Sentry TAURI-RUST-4P6).
     #[serde(default)]
-    #[allow(dead_code)]
     pub capabilities: Vec<String>,
 }
 
@@ -268,6 +371,43 @@ impl OllamaShowResponse {
     /// metadata, or `None` when the server did not report it.
     pub(crate) fn context_length(&self) -> Option<u64> {
         context_length_from_model_info(&self.model_info)
+    }
+
+    /// Whether this model can serve chat/completions, from its `capabilities`.
+    pub(crate) fn chat_capability(&self) -> Option<bool> {
+        ollama_chat_capability(&self.capabilities)
+    }
+}
+
+/// Classify whether an Ollama model can serve chat/completions from its
+/// `/api/show` `capabilities` list.
+///
+/// Ollama tags text-generation models with `"completion"` (and newer builds
+/// also `"chat"`); embedding models are tagged `"embedding"` only. We only
+/// declare a model **not** chat-capable when we are confident it is
+/// embedding-only — capabilities is non-empty, carries an embedding marker,
+/// and carries no completion/chat marker. Anything ambiguous returns `None`
+/// (unknown):
+///   * empty / absent capabilities (older Ollama, or an `/api/show` miss);
+///   * a tag set we don't recognise (e.g. `["insert"]` only).
+/// Callers treat `None` as "keep visible" — fail-open, never hide a model
+/// that might be usable for chat. Mirrors the non-rejecting `Unknown` arm of
+/// [`super::model_requirements::ContextEligibility`]. See Sentry TAURI-RUST-4P6.
+pub(crate) fn ollama_chat_capability(capabilities: &[String]) -> Option<bool> {
+    if capabilities.is_empty() {
+        return None;
+    }
+    let has = |needle: &str| {
+        capabilities
+            .iter()
+            .any(|c| c.trim().eq_ignore_ascii_case(needle))
+    };
+    if has("completion") || has("chat") {
+        Some(true)
+    } else if has("embedding") || has("embed") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -380,6 +520,36 @@ pub(crate) fn ns_to_tps(tokens: f32, duration_ns: u64) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_capability_classifies_embedding_completion_and_unknown() {
+        let owned = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Embedding-only model (bge-m3) → not chat-capable. TAURI-RUST-4P6.
+        assert_eq!(ollama_chat_capability(&owned(&["embedding"])), Some(false));
+        // Chat/completion models → chat-capable.
+        assert_eq!(ollama_chat_capability(&owned(&["completion"])), Some(true));
+        assert_eq!(
+            ollama_chat_capability(&owned(&["completion", "tools", "vision"])),
+            Some(true)
+        );
+        assert_eq!(ollama_chat_capability(&owned(&["chat"])), Some(true));
+        // A model exposing BOTH stays chat-capable (completion wins).
+        assert_eq!(
+            ollama_chat_capability(&owned(&["embedding", "completion"])),
+            Some(true)
+        );
+        // Unknown / fail-open: empty, or a tag set we don't recognise → None
+        // (caller keeps the model visible).
+        assert_eq!(ollama_chat_capability(&[]), None);
+        assert_eq!(ollama_chat_capability(&owned(&["insert"])), None);
+        // Case / whitespace tolerant.
+        assert_eq!(
+            ollama_chat_capability(&owned(&[" Embedding "])),
+            Some(false)
+        );
+        assert_eq!(ollama_chat_capability(&owned(&["COMPLETION"])), Some(true));
+    }
 
     #[test]
     fn pull_progress_aggregates_layered_download_events() {
@@ -683,6 +853,107 @@ mod tests {
         );
     }
 
+    // ── normalize_unspecified_host ──────────────────────────────────────
+
+    #[test]
+    fn normalize_rewrites_ipv4_unspecified() {
+        assert_eq!(
+            normalize_unspecified_host("http://0.0.0.0:11434"),
+            "http://localhost:11434"
+        );
+    }
+
+    #[test]
+    fn normalize_rewrites_ipv6_unspecified() {
+        assert_eq!(
+            normalize_unspecified_host("http://[::]:11434"),
+            "http://[::1]:11434"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_loopback() {
+        assert_eq!(
+            normalize_unspecified_host("http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434"
+        );
+        assert_eq!(
+            normalize_unspecified_host("http://[::1]:11434"),
+            "http://[::1]:11434"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_named_host() {
+        assert_eq!(
+            normalize_unspecified_host("http://localhost:11434"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            normalize_unspecified_host("http://my-ollama.lan:11434"),
+            "http://my-ollama.lan:11434"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_private_ip() {
+        assert_eq!(
+            normalize_unspecified_host("http://192.168.1.5:11434"),
+            "http://192.168.1.5:11434"
+        );
+    }
+
+    #[test]
+    fn normalize_handles_invalid_url() {
+        assert_eq!(normalize_unspecified_host("not a url"), "not a url");
+    }
+
+    // ── ollama_base_url: 0.0.0.0 normalization ─────────────────────────
+
+    #[test]
+    fn ollama_base_url_normalizes_unspecified_in_env_override() {
+        let _lock = test_lock();
+        let _g = OllamaEnvGuard::set("http://0.0.0.0:11434");
+        assert_eq!(ollama_base_url(), "http://localhost:11434");
+    }
+
+    #[test]
+    fn ollama_base_url_normalizes_unspecified_in_ollama_host() {
+        let _lock = test_lock();
+        let _g1 = OllamaEnvGuard::clear();
+        let _g2 = OllamaEnvGuard::set_var(OLLAMA_HOST_VAR, "0.0.0.0:11434");
+        assert_eq!(ollama_base_url(), "http://localhost:11434");
+    }
+
+    #[test]
+    fn ollama_base_url_normalizes_ipv6_unspecified_in_ollama_host() {
+        let _lock = test_lock();
+        let _g1 = OllamaEnvGuard::clear();
+        let _g2 = OllamaEnvGuard::set_var(OLLAMA_HOST_VAR, "http://[::]:11434");
+        assert_eq!(ollama_base_url(), "http://[::1]:11434");
+    }
+
+    // ── ollama_base_url_from_config: 0.0.0.0 normalization ──────────────
+
+    #[test]
+    fn ollama_base_url_from_config_normalizes_unspecified() {
+        let _lock = test_lock();
+        let _g = OllamaEnvGuard::clear();
+        let config = make_config_with_base_url(Some("http://0.0.0.0:11434"));
+        assert_eq!(
+            ollama_base_url_from_config(&config),
+            "http://localhost:11434"
+        );
+    }
+
+    #[test]
+    fn ollama_base_url_from_config_normalizes_ipv6_unspecified() {
+        let _lock = test_lock();
+        let _g = OllamaEnvGuard::clear();
+        let config = make_config_with_base_url(Some("http://[::]:11434"));
+        assert_eq!(ollama_base_url_from_config(&config), "http://[::1]:11434");
+    }
+
     // ── validate_ollama_url ───────────────────────────────────────────
 
     #[test]
@@ -732,6 +1003,110 @@ mod tests {
             validate_ollama_url("http://[::1]:11434"),
             Ok("http://[::1]:11434".to_string())
         );
+    }
+
+    #[test]
+    fn validate_ollama_url_rewrites_ipv4_unspecified_to_localhost() {
+        assert_eq!(
+            validate_ollama_url("http://0.0.0.0:11434"),
+            Ok("http://localhost:11434".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_ollama_url_rewrites_ipv6_unspecified_to_loopback() {
+        assert_eq!(
+            validate_ollama_url("http://[::]:11434"),
+            Ok("http://[::1]:11434".to_string())
+        );
+    }
+
+    // ── public Ollama registry-host rejection (TAURI-RUST-A3T) ─────────
+
+    #[test]
+    fn is_ollama_registry_host_matches_public_hosts_case_insensitively() {
+        for host in [
+            "ollama.com",
+            "OLLAMA.COM",
+            "www.ollama.com",
+            "ollama.ai",
+            "www.ollama.ai",
+            "registry.ollama.ai",
+            "ollama.com.", // trailing FQDN dot
+        ] {
+            assert!(is_ollama_registry_host(host), "expected reject: {host}");
+        }
+    }
+
+    #[test]
+    fn is_ollama_registry_host_allows_self_hosted_and_loopback() {
+        // No suffix match: a user's own subdomain must NOT be blocked.
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "ollama.mycompany.com",
+            "my-ollama.lan",
+            "remote-ollama.example.com",
+            "notollama.com",
+        ] {
+            assert!(!is_ollama_registry_host(host), "expected allow: {host}");
+        }
+    }
+
+    #[test]
+    fn validate_ollama_url_rejects_public_registry_hosts() {
+        // The bug: ollama.com is the website/registry, not a local server.
+        // `/api/tags` against it returns HTTP 429 and floods Sentry.
+        for url in [
+            "https://ollama.com",
+            "http://ollama.com",
+            "https://ollama.com/",
+            "https://www.ollama.com:443",
+            "https://ollama.ai",
+            "https://registry.ollama.ai",
+        ] {
+            let err = validate_ollama_url(url).unwrap_err();
+            assert!(
+                err.contains("ollama.com is the Ollama website"),
+                "expected website rejection for {url}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ollama_url_still_accepts_self_hosted_subdomain() {
+        assert_eq!(
+            validate_ollama_url("https://ollama.mycompany.com:11434"),
+            Ok("https://ollama.mycompany.com:11434".to_string())
+        );
+    }
+
+    #[test]
+    fn ollama_base_url_from_config_heals_registry_host_to_default() {
+        // Existing users who saved ollama.com before validation rejected it
+        // must stop hitting the website on the next launch.
+        let _lock = test_lock();
+        let _g = OllamaEnvGuard::clear();
+        let config = make_config_with_base_url(Some("https://ollama.com"));
+        assert_eq!(
+            ollama_base_url_from_config(&config),
+            DEFAULT_OLLAMA_BASE_URL
+        );
+    }
+
+    #[test]
+    fn ollama_base_url_heals_registry_host_from_env_override() {
+        let _lock = test_lock();
+        let _g = OllamaEnvGuard::set("https://ollama.com");
+        assert_eq!(ollama_base_url(), DEFAULT_OLLAMA_BASE_URL);
+    }
+
+    #[test]
+    fn ollama_base_url_heals_registry_host_from_ollama_host() {
+        let _lock = test_lock();
+        let _g1 = OllamaEnvGuard::clear();
+        let _g2 = OllamaEnvGuard::set_var(OLLAMA_HOST_VAR, "ollama.com");
+        assert_eq!(ollama_base_url(), DEFAULT_OLLAMA_BASE_URL);
     }
 
     // ── redact_ollama_base_url ────────────────────────────────────────

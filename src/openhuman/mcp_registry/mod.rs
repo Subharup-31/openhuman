@@ -53,13 +53,15 @@
 pub mod boot;
 pub mod bus;
 pub mod connections;
-mod ops;
+pub mod oauth;
+pub mod ops;
 mod registries;
 mod registry;
 mod schemas;
 pub mod setup;
 pub mod setup_ops;
 pub mod store;
+pub mod supervisor;
 pub mod tools;
 pub mod types;
 

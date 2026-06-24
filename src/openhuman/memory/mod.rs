@@ -25,6 +25,7 @@ pub mod query;
 pub mod read_rpc;
 pub mod remember;
 pub mod schema;
+pub mod source_scope;
 pub mod sync;
 pub mod tools;
 pub mod util;
@@ -51,7 +52,7 @@ pub use schemas::{
     all_controller_schemas as all_memory_controller_schemas,
     all_registered_controllers as all_memory_registered_controllers,
 };
-pub use traits::{Memory, MemoryCategory, MemoryEntry, NamespaceSummary, RecallOpts};
+pub use traits::{Memory, MemoryCategory, MemoryEntry, MemoryTaint, NamespaceSummary, RecallOpts};
 
 // Re-export types that external tests and consumers historically imported
 // from `memory::*`. The definitions moved to sibling crates during the

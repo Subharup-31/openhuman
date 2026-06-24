@@ -55,6 +55,60 @@ fn upsert_then_get() {
 }
 
 #[test]
+fn upsert_persists_path_scope() {
+    let (_tmp, cfg) = test_config();
+    let mut c = sample_chunk("notion:conn-1:page-abc", 0, 1_700_000_000_000);
+    c.metadata.source_kind = SourceKind::Document;
+    c.metadata.path_scope = Some("notion:conn-1".to_string());
+
+    assert_eq!(upsert_chunks(&cfg, &[c.clone()]).unwrap(), 1);
+
+    let got = get_chunk(&cfg, &c.id).unwrap().expect("chunk stored");
+    assert_eq!(got.metadata.source_id, "notion:conn-1:page-abc");
+    assert_eq!(got.metadata.path_scope.as_deref(), Some("notion:conn-1"));
+}
+
+#[test]
+fn list_chunks_source_scope_filters_before_limit() {
+    // Two disallowed-source chunks have NEWER timestamps (sorted first by DESC),
+    // and the single allowed-source chunk is older. With a naive post-limit
+    // filter and LIMIT 1 the allowed row would be starved; the before-limit gate
+    // inside list_chunks must still surface it.
+    let (_tmp, cfg) = test_config();
+    let tag = || vec!["memory_sources".to_string(), "chat".to_string()];
+    let mut bad1 = sample_chunk("slack:#secret", 0, 3_000);
+    bad1.metadata.tags = tag();
+    let mut bad2 = sample_chunk("slack:#secret", 1, 2_000);
+    bad2.metadata.tags = tag();
+    let mut good = sample_chunk("slack:#eng", 0, 1_000);
+    good.metadata.tags = tag();
+    upsert_chunks(&cfg, &[bad1, bad2, good]).unwrap();
+
+    let mut allowed = std::collections::HashSet::new();
+    allowed.insert("slack:#eng".to_string());
+    let q = ListChunksQuery {
+        limit: Some(1),
+        source_scope: Some(allowed),
+        ..Default::default()
+    };
+    let rows = list_chunks(&cfg, &q).unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the allowed-source chunk must survive the gate"
+    );
+    assert_eq!(rows[0].metadata.source_id, "slack:#eng");
+
+    // No scope → unrestricted: the newest (disallowed) chunk wins under LIMIT 1.
+    let unscoped = ListChunksQuery {
+        limit: Some(1),
+        ..Default::default()
+    };
+    let rows = list_chunks(&cfg, &unscoped).unwrap();
+    assert_eq!(rows[0].metadata.source_id, "slack:#secret");
+}
+
+#[test]
 fn upsert_is_idempotent() {
     let (_tmp, cfg) = test_config();
     let c = sample_chunk("slack:#eng", 0, 1_700_000_000_000);
@@ -297,6 +351,448 @@ fn delete_chunks_by_source_removes_chunks_side_rows_and_ingest_gate() {
     .unwrap();
 }
 
+/// Forget-path (`clear_memory=true`) e2e: deleting the last chunk of a source
+/// must cascade-delete its summary tree (tree row + summaries + sidecars +
+/// entity-index + unsealed buffer), leave a sibling source untouched, and a
+/// queued `Seal` job for the now-gone tree must settle to `Done` (not stick
+/// in pending). Mocked connection (tempdir), chunks, tree/summary/buffer, job.
+#[tokio::test]
+async fn clear_memory_delete_cascades_orphaned_source_tree_and_settles_queued_job() {
+    use crate::openhuman::memory_queue::{store as queue_store, types as queue_types};
+    use crate::openhuman::memory_store::trees::store as tree_store;
+    use crate::openhuman::memory_store::trees::types::{
+        Buffer, SummaryNode, Tree, TreeKind, TreeStatus,
+    };
+
+    let (_tmp, cfg) = test_config();
+    let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+
+    // ---- mocked chunks: gmail:acct (conn-1, disconnecting) + gmail:other (conn-2, survives) ----
+    let mk_email = |source_id: &str, seq: u32, owner: &str, ts_ms: i64| {
+        let mut c = sample_chunk(source_id, seq, ts_ms);
+        c.metadata.source_kind = SourceKind::Email;
+        c.metadata.owner = owner.to_string();
+        c
+    };
+    let a0 = mk_email("gmail:acct", 0, "gmail-sync:conn-1", 1_700_000_000_000);
+    let a1 = mk_email("gmail:acct", 1, "gmail-sync:conn-1", 1_700_000_001_000);
+    let b0 = mk_email("gmail:other", 0, "gmail-sync:conn-2", 1_700_000_002_000);
+    upsert_chunks(&cfg, &[a0.clone(), a1.clone(), b0.clone()]).unwrap();
+
+    // ---- mocked source trees (scope == source_id), each with summary + sidecars + entity-index + buffer ----
+    let mk_tree = |id: &str, scope: &str| Tree {
+        id: id.into(),
+        kind: TreeKind::Source,
+        scope: scope.into(),
+        root_id: None,
+        max_level: 1,
+        status: TreeStatus::Active,
+        created_at: ts,
+        last_sealed_at: Some(ts),
+    };
+    tree_store::insert_tree(&cfg, &mk_tree("tree-acct", "gmail:acct")).unwrap();
+    tree_store::insert_tree(&cfg, &mk_tree("tree-other", "gmail:other")).unwrap();
+
+    let mk_summary = |id: &str, tree_id: &str, children: Vec<String>| SummaryNode {
+        id: id.into(),
+        tree_id: tree_id.into(),
+        tree_kind: TreeKind::Source,
+        level: 1,
+        parent_id: None,
+        child_ids: children,
+        content: format!("summary for {tree_id}"),
+        token_count: 3,
+        entities: vec![],
+        topics: vec![],
+        time_range_start: ts,
+        time_range_end: ts,
+        score: 0.5,
+        sealed_at: ts,
+        deleted: false,
+        embedding: None,
+        doc_id: None,
+        version_ms: None,
+    };
+
+    with_connection(&cfg, |conn| {
+        let tx = conn.unchecked_transaction()?;
+
+        tree_store::insert_summary_tx(
+            &tx,
+            &mk_summary("sum-acct", "tree-acct", vec![a0.id.clone(), a1.id.clone()]),
+            None,
+            "test/model@3",
+        )?;
+        tree_store::insert_summary_tx(
+            &tx,
+            &mk_summary("sum-other", "tree-other", vec![b0.id.clone()]),
+            None,
+            "test/model@3",
+        )?;
+
+        // summary sidecars: embeddings for both summaries, reembed-skip only for sum-acct.
+        for sid in ["sum-acct", "sum-other"] {
+            tx.execute(
+                "INSERT INTO mem_tree_summary_embeddings (
+                    summary_id, model_signature, vector, dim, created_at
+                ) VALUES (?1, 'test/model@3', ?2, 3, 1700000000.0)",
+                params![sid, vec![1_u8, 2, 3]],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO mem_tree_summary_reembed_skipped (
+                summary_id, model_signature, reason, skipped_at_ms
+            ) VALUES ('sum-acct', 'test/model@3', 'terminal', 1700000000000)",
+            [],
+        )?;
+
+        // tree-keyed entity-index rows (summary nodes) for each tree.
+        for (sid, tree_id) in [("sum-acct", "tree-acct"), ("sum-other", "tree-other")] {
+            tx.execute(
+                "INSERT INTO mem_tree_entity_index (
+                    entity_id, node_id, node_kind, entity_kind, surface,
+                    score, timestamp_ms, tree_id, is_user
+                ) VALUES (?1, ?2, 'summary', 'person', 'email', 0.9, 1700000000000, ?3, 0)",
+                params![format!("entity:{sid}"), sid, tree_id],
+            )?;
+        }
+
+        // unsealed buffers (the "queue" frontier) referencing the chunk ids.
+        tree_store::upsert_buffer_tx(
+            &tx,
+            &Buffer {
+                tree_id: "tree-acct".into(),
+                level: 0,
+                item_ids: vec![a0.id.clone(), a1.id.clone()],
+                token_sum: 24,
+                oldest_at: Some(ts),
+            },
+        )?;
+        tree_store::upsert_buffer_tx(
+            &tx,
+            &Buffer {
+                tree_id: "tree-other".into(),
+                level: 0,
+                item_ids: vec![b0.id.clone()],
+                token_sum: 12,
+                oldest_at: Some(ts),
+            },
+        )?;
+
+        assert!(claim_source_ingest_tx(
+            &tx,
+            SourceKind::Email,
+            "gmail:acct",
+            1_700_000_000_000
+        )?);
+        assert!(claim_source_ingest_tx(
+            &tx,
+            SourceKind::Email,
+            "gmail:other",
+            1_700_000_000_000
+        )?);
+        tx.commit()?;
+        Ok(())
+    })
+    .unwrap();
+
+    // ---- mocked job: a Seal queued for the tree that's about to be deleted ----
+    let seal_payload = queue_types::SealPayload {
+        tree_id: "tree-acct".into(),
+        level: 0,
+        force_now_ms: None,
+    };
+    let job_id = queue_store::enqueue(&cfg, &queue_types::NewJob::seal(&seal_payload).unwrap())
+        .unwrap()
+        .expect("seal job enqueued");
+
+    // ---- act: disconnect conn-1 with clear_memory=true → delete its chunks ----
+    let deleted = delete_chunks_by_owner(&cfg, SourceKind::Email, "gmail-sync:conn-1").unwrap();
+    assert_eq!(deleted, 2);
+
+    // chunks: acct gone, other survives.
+    assert!(get_chunk(&cfg, &a0.id).unwrap().is_none());
+    assert!(get_chunk(&cfg, &a1.id).unwrap().is_none());
+    assert!(get_chunk(&cfg, &b0.id).unwrap().is_some());
+
+    // the orphaned source tree is gone; the sibling tree is untouched.
+    assert!(
+        tree_store::get_tree_by_scope(&cfg, TreeKind::Source, "gmail:acct")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        tree_store::get_tree_by_scope(&cfg, TreeKind::Source, "gmail:other")
+            .unwrap()
+            .is_some()
+    );
+
+    // exactly the tree-acct rows are cascaded away across every dependent table.
+    with_connection(&cfg, |conn| {
+        let count = |sql: &str| -> rusqlite::Result<i64> { conn.query_row(sql, [], |r| r.get(0)) };
+        assert_eq!(count("SELECT COUNT(*) FROM mem_tree_trees")?, 1);
+        assert_eq!(count("SELECT COUNT(*) FROM mem_tree_summaries")?, 1);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM mem_tree_summary_embeddings")?,
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM mem_tree_summary_reembed_skipped")?,
+            0
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM mem_tree_buffers")?, 1);
+        assert_eq!(count("SELECT COUNT(*) FROM mem_tree_entity_index")?, 1);
+        // and what survives belongs to tree-other.
+        assert_eq!(
+            count("SELECT COUNT(*) FROM mem_tree_summaries WHERE tree_id = 'tree-other'")?,
+            1
+        );
+        Ok(())
+    })
+    .unwrap();
+
+    // ---- the queued Seal job settles to Done (tree missing), not stuck pending ----
+    let claimed = queue_store::claim_next(&cfg, queue_store::DEFAULT_LOCK_DURATION_MS)
+        .unwrap()
+        .expect("seal job claimable");
+    assert_eq!(claimed.kind, queue_types::JobKind::Seal);
+    let outcome = crate::openhuman::memory_queue::handlers::handle_job(&cfg, &claimed)
+        .await
+        .expect("handle_job ok");
+    assert!(
+        matches!(outcome, queue_types::JobOutcome::Done),
+        "seal over a deleted tree must no-op to Done, got {outcome:?}"
+    );
+    queue_store::mark_done(&cfg, &claimed).unwrap();
+    assert_eq!(
+        queue_store::get_job(&cfg, &job_id).unwrap().unwrap().status,
+        queue_types::JobStatus::Done
+    );
+}
+
+/// #1: the cascade must also delete the summary's **on-disk content file**, not
+/// just the row — otherwise a `clear_memory` delete leaves the summarised text
+/// orphaned on disk.
+#[test]
+fn clear_memory_delete_removes_orphaned_summary_content_file() {
+    use crate::openhuman::memory_store::trees::store as tree_store;
+    use crate::openhuman::memory_store::trees::types::{SummaryNode, Tree, TreeKind, TreeStatus};
+
+    let (_tmp, cfg) = test_config();
+    let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+
+    let mut c = sample_chunk("gmail:acct", 0, 1_700_000_000_000);
+    c.metadata.source_kind = SourceKind::Email;
+    c.metadata.owner = "gmail-sync:conn-1".to_string();
+    upsert_chunks(&cfg, &[c.clone()]).unwrap();
+
+    tree_store::insert_tree(
+        &cfg,
+        &Tree {
+            id: "tree-acct".into(),
+            kind: TreeKind::Source,
+            scope: "gmail:acct".into(),
+            root_id: None,
+            max_level: 1,
+            status: TreeStatus::Active,
+            created_at: ts,
+            last_sealed_at: Some(ts),
+        },
+    )
+    .unwrap();
+
+    // A real on-disk summary content file under the memory tree content root.
+    let rel = "summaries/gmail_acct/L1/sum-acct.md";
+    let abs = cfg.memory_tree_content_root().join(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(&abs, "summarised email body").unwrap();
+    assert!(abs.exists());
+
+    with_connection(&cfg, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        tree_store::insert_summary_tx(
+            &tx,
+            &SummaryNode {
+                id: "sum-acct".into(),
+                tree_id: "tree-acct".into(),
+                tree_kind: TreeKind::Source,
+                level: 1,
+                parent_id: None,
+                child_ids: vec![c.id.clone()],
+                content: "preview".into(),
+                token_count: 3,
+                entities: vec![],
+                topics: vec![],
+                time_range_start: ts,
+                time_range_end: ts,
+                score: 0.5,
+                sealed_at: ts,
+                deleted: false,
+                embedding: None,
+                doc_id: None,
+                version_ms: None,
+            },
+            None,
+            "test/model@3",
+        )?;
+        tx.execute(
+            "UPDATE mem_tree_summaries SET content_path = ?1 WHERE id = 'sum-acct'",
+            params![rel],
+        )?;
+        assert!(claim_source_ingest_tx(
+            &tx,
+            SourceKind::Email,
+            "gmail:acct",
+            1_700_000_000_000
+        )?);
+        tx.commit()?;
+        Ok(())
+    })
+    .unwrap();
+
+    delete_chunks_by_owner(&cfg, SourceKind::Email, "gmail-sync:conn-1").unwrap();
+
+    assert!(
+        tree_store::get_tree_by_scope(&cfg, TreeKind::Source, "gmail:acct")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !abs.exists(),
+        "orphaned summary content file must be removed from disk"
+    );
+}
+
+/// #2: the safety property — deleting one connection's chunks must NOT delete
+/// the source tree while ANOTHER connection still owns chunks for the same
+/// account (source not yet orphaned).
+#[test]
+fn clear_memory_delete_keeps_tree_when_another_connection_still_owns_chunks() {
+    use crate::openhuman::memory_store::trees::store as tree_store;
+    use crate::openhuman::memory_store::trees::types::{Buffer, Tree, TreeKind, TreeStatus};
+
+    let (_tmp, cfg) = test_config();
+    let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+
+    // Same account `gmail:acct`, two connections (owners).
+    let mut a = sample_chunk("gmail:acct", 0, 1_700_000_000_000);
+    a.metadata.source_kind = SourceKind::Email;
+    a.metadata.owner = "gmail-sync:conn-1".to_string();
+    let mut b = sample_chunk("gmail:acct", 1, 1_700_000_001_000);
+    b.metadata.source_kind = SourceKind::Email;
+    b.metadata.owner = "gmail-sync:conn-2".to_string();
+    upsert_chunks(&cfg, &[a.clone(), b.clone()]).unwrap();
+
+    tree_store::insert_tree(
+        &cfg,
+        &Tree {
+            id: "tree-acct".into(),
+            kind: TreeKind::Source,
+            scope: "gmail:acct".into(),
+            root_id: None,
+            max_level: 1,
+            status: TreeStatus::Active,
+            created_at: ts,
+            last_sealed_at: Some(ts),
+        },
+    )
+    .unwrap();
+    with_connection(&cfg, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        tree_store::upsert_buffer_tx(
+            &tx,
+            &Buffer {
+                tree_id: "tree-acct".into(),
+                level: 0,
+                item_ids: vec![a.id.clone(), b.id.clone()],
+                token_sum: 24,
+                oldest_at: Some(ts),
+            },
+        )?;
+        assert!(claim_source_ingest_tx(
+            &tx,
+            SourceKind::Email,
+            "gmail:acct",
+            1_700_000_000_000
+        )?);
+        tx.commit()?;
+        Ok(())
+    })
+    .unwrap();
+
+    // Disconnect ONLY conn-1.
+    let deleted = delete_chunks_by_owner(&cfg, SourceKind::Email, "gmail-sync:conn-1").unwrap();
+    assert_eq!(deleted, 1);
+
+    // conn-1's chunk is gone, conn-2's remains → source still has chunks →
+    // the tree (and its buffer + ingest gate) MUST survive.
+    assert!(get_chunk(&cfg, &a.id).unwrap().is_none());
+    assert!(get_chunk(&cfg, &b.id).unwrap().is_some());
+    assert!(
+        tree_store::get_tree_by_scope(&cfg, TreeKind::Source, "gmail:acct")
+            .unwrap()
+            .is_some(),
+        "tree must survive while another connection still owns chunks"
+    );
+    assert!(is_source_ingested(&cfg, SourceKind::Email, "gmail:acct").unwrap());
+    with_connection(&cfg, |conn| {
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM mem_tree_buffers", [], |r| r.get(0))?;
+        assert_eq!(n, 1);
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// #3: queued `Extract` / `AppendBuffer` jobs that reference a chunk deleted
+/// out from under them settle to `Done` (warn-and-skip), not stuck pending.
+#[tokio::test]
+async fn queued_jobs_for_deleted_chunk_settle_to_done() {
+    use crate::openhuman::memory_queue::{store as queue_store, types as queue_types};
+
+    let (_tmp, cfg) = test_config();
+    let c = sample_chunk("slack:#eng", 0, 1_700_000_000_000);
+    upsert_chunks(&cfg, &[c.clone()]).unwrap();
+    delete_chunks_by_source(&cfg, SourceKind::Chat, "slack:#eng").unwrap();
+    assert!(get_chunk(&cfg, &c.id).unwrap().is_none());
+
+    queue_store::enqueue(
+        &cfg,
+        &queue_types::NewJob::extract_chunk(&queue_types::ExtractChunkPayload {
+            chunk_id: c.id.clone(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    queue_store::enqueue(
+        &cfg,
+        &queue_types::NewJob::append_buffer(&queue_types::AppendBufferPayload {
+            node: queue_types::NodeRef::Leaf {
+                chunk_id: c.id.clone(),
+            },
+            target: queue_types::AppendTarget::Source {
+                source_id: "slack:#eng".into(),
+            },
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        let job = queue_store::claim_next(&cfg, queue_store::DEFAULT_LOCK_DURATION_MS)
+            .unwrap()
+            .expect("job claimable");
+        let outcome = crate::openhuman::memory_queue::handlers::handle_job(&cfg, &job)
+            .await
+            .expect("handle_job ok");
+        assert!(
+            matches!(outcome, queue_types::JobOutcome::Done),
+            "{:?} over a deleted chunk must settle Done, got {outcome:?}",
+            job.kind
+        );
+        queue_store::mark_done(&cfg, &job).unwrap();
+    }
+}
+
 #[test]
 fn delete_chunks_by_owner_preserves_other_owners_for_same_source() {
     let (_tmp, cfg) = test_config();
@@ -428,10 +924,11 @@ fn empty_batch_is_noop() {
 
 #[test]
 fn schema_has_content_path_and_content_sha256_columns() {
-    // Phase MD-content: verify that with_connection applies the additive
-    // migrations for the new pointer + hash columns on a fresh DB.
+    // Verify that with_connection applies additive migrations for content
+    // pointers and source grouping scope on a fresh DB.
     let (_tmp, cfg) = test_config();
     with_connection(&cfg, |conn| {
+        let mut has_path_scope = false;
         let mut has_content_path = false;
         let mut has_content_sha256 = false;
         let mut stmt = conn.prepare("PRAGMA table_info(mem_tree_chunks)")?;
@@ -440,6 +937,9 @@ fn schema_has_content_path_and_content_sha256_columns() {
             .filter_map(|r| r.ok())
             .collect();
         for name in &names {
+            if name == "path_scope" {
+                has_path_scope = true;
+            }
             if name == "content_path" {
                 has_content_path = true;
             }
@@ -447,6 +947,10 @@ fn schema_has_content_path_and_content_sha256_columns() {
                 has_content_sha256 = true;
             }
         }
+        assert!(
+            has_path_scope,
+            "mem_tree_chunks must have path_scope column after migration; found: {names:?}"
+        );
         assert!(
             has_content_path,
             "mem_tree_chunks must have content_path column after migration; found: {names:?}"
@@ -1208,4 +1712,607 @@ fn global_topic_purge_removes_only_global_and_topic() {
         summaries.join("source-slack-eng").exists(),
         "source summary folder must survive the purge"
     );
+}
+
+// ── extraction_coverage (#002 FR-010 / US5) ──────────────────────────────
+
+#[test]
+fn extraction_coverage_empty_store_is_zero() {
+    let (_tmp, cfg) = test_config();
+    assert_eq!(extraction_coverage(&cfg).unwrap(), 0.0);
+}
+
+#[test]
+fn extraction_coverage_reflects_indexed_fraction() {
+    let (_tmp, cfg) = test_config();
+    // Two chunks; index an entity for only the first → coverage 0.5.
+    let c1 = sample_chunk("slack:#eng", 0, 1_700_000_000_000);
+    let c2 = sample_chunk("slack:#eng", 1, 1_700_000_001_000);
+    upsert_chunks(&cfg, &[c1.clone(), c2.clone()]).unwrap();
+
+    with_connection(&cfg, |conn| {
+        conn.execute(
+            "INSERT INTO mem_tree_entity_index
+                (entity_id, node_id, node_kind, entity_kind, surface, score, timestamp_ms)
+             VALUES (?1, ?2, 'leaf', 'person', 'Alice', 0.9, 1)",
+            params!["person:Alice", c1.id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let cov = extraction_coverage(&cfg).unwrap();
+    assert!((cov - 0.5).abs() < 1e-6, "expected 0.5, got {cov}");
+
+    // Index the second chunk too → full coverage.
+    with_connection(&cfg, |conn| {
+        conn.execute(
+            "INSERT INTO mem_tree_entity_index
+                (entity_id, node_id, node_kind, entity_kind, surface, score, timestamp_ms)
+             VALUES (?1, ?2, 'leaf', 'person', 'Bob', 0.9, 2)",
+            params!["person:Bob", c2.id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert!((extraction_coverage(&cfg).unwrap() - 1.0).abs() < 1e-6);
+}
+
+// ── memory_tree_delete_source RPC ────────────────────────────────────────────
+// These prove the new `delete_source_rpc` is a FULL source-level delete (not a
+// chunk-only delete): it must cascade through every dependent table, the ingest
+// gate, and the source summary tree, remove content files, and leave stale
+// summaries unable to resurface in recall — while sibling sources are untouched.
+
+/// Seed a fully-formed Document source (chunks + side rows + content files +
+/// source tree + summary + sidecars + buffer + ingest gate) for `source_id`.
+/// Returns the chunk ids created. Used by the delete_source tests below.
+#[cfg(test)]
+async fn seed_full_document_source(
+    cfg: &Config,
+    source_id: &str,
+    tree_id: &str,
+    summary_id: &str,
+    base_ts_ms: i64,
+) -> (Vec<String>, String, String) {
+    use crate::openhuman::memory_store::trees::store as tree_store;
+    use crate::openhuman::memory_store::trees::types::{
+        Buffer, SummaryNode, Tree, TreeKind, TreeStatus,
+    };
+
+    let ts = Utc.timestamp_millis_opt(base_ts_ms).unwrap();
+    let mk_doc = |seq: u32, ts_ms: i64| {
+        let mut c = sample_chunk(source_id, seq, ts_ms);
+        c.metadata.source_kind = SourceKind::Document;
+        c
+    };
+    let c0 = mk_doc(0, base_ts_ms);
+    let c1 = mk_doc(1, base_ts_ms + 1000);
+    upsert_chunks(cfg, &[c0.clone(), c1.clone()]).unwrap();
+
+    // Real on-disk chunk + summary content files under the content root.
+    let content_root = cfg.memory_tree_content_root();
+    let chunk_rel = format!("document/{tree_id}/c0.md");
+    let summary_rel = format!("summaries/{tree_id}/L1/{summary_id}.md");
+    for rel in [&chunk_rel, &summary_rel] {
+        let abs = content_root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "body").unwrap();
+    }
+
+    let mk_summary = SummaryNode {
+        id: summary_id.into(),
+        tree_id: tree_id.into(),
+        tree_kind: TreeKind::Source,
+        level: 1,
+        parent_id: None,
+        child_ids: vec![c0.id.clone(), c1.id.clone()],
+        content: format!("summary text for {source_id}"),
+        token_count: 3,
+        entities: vec![],
+        topics: vec![],
+        time_range_start: ts,
+        time_range_end: ts,
+        score: 0.5,
+        sealed_at: ts,
+        deleted: false,
+        embedding: None,
+        doc_id: None,
+        version_ms: None,
+    };
+    tree_store::insert_tree(
+        cfg,
+        &Tree {
+            id: tree_id.into(),
+            kind: TreeKind::Source,
+            scope: source_id.into(),
+            root_id: None,
+            max_level: 1,
+            status: TreeStatus::Active,
+            created_at: ts,
+            last_sealed_at: Some(ts),
+        },
+    )
+    .unwrap();
+
+    with_connection(cfg, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        for chunk in [&c0, &c1] {
+            tx.execute(
+                "INSERT INTO mem_tree_score (
+                    chunk_id, total, token_count_signal, unique_words_signal,
+                    metadata_weight, source_weight, interaction_weight,
+                    entity_density, dropped, reason, computed_at_ms
+                ) VALUES (?1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0, NULL, 1700000000000)",
+                params![chunk.id],
+            )?;
+            tx.execute(
+                "INSERT INTO mem_tree_entity_index (
+                    entity_id, node_id, node_kind, entity_kind, surface, score, timestamp_ms
+                ) VALUES (?1, ?2, 'chunk', 'person', 'doc', 0.9, 1700000000000)",
+                params![format!("entity:{}", chunk.id), chunk.id],
+            )?;
+            tx.execute(
+                "INSERT INTO mem_tree_chunk_embeddings (
+                    chunk_id, model_signature, vector, dim, created_at
+                ) VALUES (?1, 'test/model@3', ?2, 3, 1700000000.0)",
+                params![chunk.id, vec![1_u8, 2, 3]],
+            )?;
+            tx.execute(
+                "INSERT INTO mem_tree_chunk_reembed_skipped (
+                    chunk_id, model_signature, reason, skipped_at_ms
+                ) VALUES (?1, 'test/model@3', 'terminal', 1700000000000)",
+                params![chunk.id],
+            )?;
+        }
+        // point chunk c0 at its on-disk content file.
+        tx.execute(
+            "UPDATE mem_tree_chunks SET content_path = ?1 WHERE id = ?2",
+            params![chunk_rel, c0.id],
+        )?;
+
+        tree_store::insert_summary_tx(&tx, &mk_summary, None, "test/model@3")?;
+        tx.execute(
+            "UPDATE mem_tree_summaries SET content_path = ?1 WHERE id = ?2",
+            params![summary_rel, summary_id],
+        )?;
+        tx.execute(
+            "INSERT INTO mem_tree_summary_embeddings (
+                summary_id, model_signature, vector, dim, created_at
+            ) VALUES (?1, 'test/model@3', ?2, 3, 1700000000.0)",
+            params![summary_id, vec![1_u8, 2, 3]],
+        )?;
+        tx.execute(
+            "INSERT INTO mem_tree_summary_reembed_skipped (
+                summary_id, model_signature, reason, skipped_at_ms
+            ) VALUES (?1, 'test/model@3', 'terminal', 1700000000000)",
+            params![summary_id],
+        )?;
+        tx.execute(
+            "INSERT INTO mem_tree_entity_index (
+                entity_id, node_id, node_kind, entity_kind, surface,
+                score, timestamp_ms, tree_id, is_user
+            ) VALUES (?1, ?2, 'summary', 'person', 'doc', 0.9, 1700000000000, ?3, 0)",
+            params![format!("entity:{summary_id}"), summary_id, tree_id],
+        )?;
+        tree_store::upsert_buffer_tx(
+            &tx,
+            &Buffer {
+                tree_id: tree_id.into(),
+                level: 0,
+                item_ids: vec![c0.id.clone(), c1.id.clone()],
+                token_sum: 24,
+                oldest_at: Some(ts),
+            },
+        )?;
+        assert!(claim_source_ingest_tx(
+            &tx,
+            SourceKind::Document,
+            source_id,
+            base_ts_ms
+        )?);
+        tx.commit()?;
+        Ok(())
+    })
+    .unwrap();
+
+    (vec![c0.id.clone(), c1.id], chunk_rel, summary_rel)
+}
+
+#[tokio::test]
+async fn delete_source_rpc_purges_document_source_fully() {
+    use crate::openhuman::memory::read_rpc::{delete_source_rpc, list_chunks_rpc, recall_rpc};
+    use crate::openhuman::memory_store::trees::store as tree_store;
+    use crate::openhuman::memory_store::trees::types::TreeKind;
+
+    let (_tmp, cfg) = test_config();
+    let target = "telegram-note-A";
+    let sibling = "telegram-note-B";
+    let (target_ids, target_chunk_file, target_summary_file) =
+        seed_full_document_source(&cfg, target, "tree-A", "sum-A", 1_700_000_000_000).await;
+    let (sibling_ids, sibling_chunk_file, sibling_summary_file) =
+        seed_full_document_source(&cfg, sibling, "tree-B", "sum-B", 1_700_000_100_000).await;
+
+    let content_root = cfg.memory_tree_content_root();
+    // Pre-conditions: both sources fully present on disk + in DB.
+    assert!(content_root.join(&target_chunk_file).exists());
+    assert!(content_root.join(&target_summary_file).exists());
+
+    // ---- act ----
+    let out = delete_source_rpc(&cfg, target.to_string())
+        .await
+        .expect("delete_source ok")
+        .value;
+    assert!(out.deleted);
+    assert_eq!(out.chunks_removed, 2);
+
+    // JSON response shape: { deleted: bool, chunks_removed: u64 }.
+    let json = serde_json::to_value(&out).unwrap();
+    assert_eq!(json.get("deleted").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(json.get("chunks_removed").and_then(|v| v.as_u64()), Some(2));
+
+    // 1. target chunks gone; sibling chunk survives.
+    for id in &target_ids {
+        assert!(get_chunk(&cfg, id).unwrap().is_none(), "chunk {id} remains");
+    }
+    for id in &sibling_ids {
+        assert!(get_chunk(&cfg, id).unwrap().is_some(), "sibling {id} gone");
+    }
+
+    // 2–11. every dependent table for the target is empty; sibling rows remain.
+    with_connection(&cfg, |conn| {
+        let count = |sql: &str, p: &str| -> rusqlite::Result<i64> {
+            conn.query_row(sql, params![p], |r| r.get(0))
+        };
+        // chunk side rows keyed by the target chunk ids
+        for id in &target_ids {
+            assert_eq!(
+                count(
+                    "SELECT COUNT(*) FROM mem_tree_score WHERE chunk_id = ?1",
+                    id
+                )?,
+                0
+            );
+            assert_eq!(
+                count(
+                    "SELECT COUNT(*) FROM mem_tree_entity_index WHERE node_id = ?1",
+                    id
+                )?,
+                0
+            );
+            assert_eq!(
+                count(
+                    "SELECT COUNT(*) FROM mem_tree_chunk_embeddings WHERE chunk_id = ?1",
+                    id
+                )?,
+                0
+            );
+            assert_eq!(
+                count(
+                    "SELECT COUNT(*) FROM mem_tree_chunk_reembed_skipped WHERE chunk_id = ?1",
+                    id
+                )?,
+                0
+            );
+        }
+        // source tree rows (scope/tree-id == tree-A) gone
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM mem_tree_summaries WHERE tree_id = ?1",
+                "tree-A"
+            )?,
+            0
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM mem_tree_summary_embeddings WHERE summary_id = ?1",
+                "sum-A"
+            )?,
+            0
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM mem_tree_summary_reembed_skipped WHERE summary_id = ?1",
+                "sum-A"
+            )?,
+            0
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM mem_tree_entity_index WHERE tree_id = ?1",
+                "tree-A"
+            )?,
+            0
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM mem_tree_buffers WHERE tree_id = ?1",
+                "tree-A"
+            )?,
+            0
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM mem_tree_trees WHERE id = ?1",
+                "tree-A"
+            )?,
+            0
+        );
+        // sibling tree intact
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM mem_tree_summaries WHERE tree_id = ?1",
+                "tree-B"
+            )?,
+            1
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM mem_tree_trees WHERE id = ?1",
+                "tree-B"
+            )?,
+            1
+        );
+        Ok(())
+    })
+    .unwrap();
+
+    // 6. ingest dedup gate cleared for target, retained for sibling.
+    assert!(!is_source_ingested(&cfg, SourceKind::Document, target).unwrap());
+    assert!(is_source_ingested(&cfg, SourceKind::Document, sibling).unwrap());
+    assert!(
+        tree_store::get_tree_by_scope(&cfg, TreeKind::Source, target)
+            .unwrap()
+            .is_none()
+    );
+
+    // 12–13. target content files removed; sibling content files remain.
+    assert!(!content_root.join(&target_chunk_file).exists());
+    assert!(!content_root.join(&target_summary_file).exists());
+    assert!(content_root.join(&sibling_chunk_file).exists());
+    assert!(content_root.join(&sibling_summary_file).exists());
+
+    // 14. recall no longer surfaces the deleted source (no summary/chunk left to
+    // rank). Tolerant of minimal-config recall backends: if it returns, none of
+    // the hits may belong to the deleted source.
+    if let Ok(rc) = recall_rpc(&cfg, "summary text".to_string(), 10).await {
+        assert!(
+            rc.value.chunks.iter().all(|c| c.source_id != target),
+            "deleted source must not resurface in recall"
+        );
+    }
+
+    // 16. second delete is idempotent.
+    let again = delete_source_rpc(&cfg, target.to_string())
+        .await
+        .unwrap()
+        .value;
+    assert!(!again.deleted);
+    assert_eq!(again.chunks_removed, 0);
+
+    // 15. re-ingesting the same source_id works again (gate cleared) and writes chunks.
+    let mut fresh = sample_chunk(target, 0, 1_700_000_500_000);
+    fresh.metadata.source_kind = SourceKind::Document;
+    assert_eq!(upsert_chunks(&cfg, &[fresh.clone()]).unwrap(), 1);
+    let listed = list_chunks_rpc(&cfg, Default::default())
+        .await
+        .unwrap()
+        .value;
+    assert!(listed.chunks.iter().any(|c| c.source_id == target));
+    // The dedup gate was cleared by delete, so re-ingest can claim it again.
+    // Commit the claim (a rolled-back tx would prove nothing) and verify it
+    // actually persisted.
+    with_connection(&cfg, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        assert!(
+            claim_source_ingest_tx(&tx, SourceKind::Document, target, 1_700_000_500_000)?,
+            "ingest gate must be re-claimable after delete_source cleared it"
+        );
+        tx.commit()?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        is_source_ingested(&cfg, SourceKind::Document, target).unwrap(),
+        "re-claimed ingest gate must persist"
+    );
+}
+
+/// Versioned document sources store the ingest gate as `{source_id}@{version_ms}`
+/// in addition to (or instead of) the bare id. `delete_source` must clear both.
+#[tokio::test]
+async fn delete_source_rpc_clears_versioned_ingest_gates() {
+    use crate::openhuman::memory::read_rpc::delete_source_rpc;
+
+    let (_tmp, cfg) = test_config();
+    let sid = "notion:conn-1:page-xyz";
+    let versioned = format!("{sid}@1700000000000");
+
+    let mut c = sample_chunk(sid, 0, 1_700_000_000_000);
+    c.metadata.source_kind = SourceKind::Document;
+    upsert_chunks(&cfg, &[c.clone()]).unwrap();
+
+    // Seed both a bare gate and a versioned gate for the source.
+    with_connection(&cfg, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        assert!(claim_source_ingest_tx(
+            &tx,
+            SourceKind::Document,
+            sid,
+            1_700_000_000_000
+        )?);
+        tx.execute(
+            "INSERT INTO mem_tree_ingested_sources (source_kind, source_id, ingested_at_ms)
+             VALUES ('document', ?1, 1700000000000)",
+            params![versioned],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .unwrap();
+
+    let gate_count = |conn: &rusqlite::Connection| -> rusqlite::Result<i64> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM mem_tree_ingested_sources
+              WHERE source_kind = 'document' AND (source_id = ?1 OR source_id LIKE ?2)",
+            params![sid, format!("{sid}@%")],
+            |r| r.get(0),
+        )
+    };
+    with_connection(&cfg, |conn| {
+        assert_eq!(gate_count(conn)?, 2, "both gates seeded");
+        Ok(())
+    })
+    .unwrap();
+
+    let out = delete_source_rpc(&cfg, sid.to_string())
+        .await
+        .unwrap()
+        .value;
+    assert!(out.deleted);
+    assert_eq!(out.chunks_removed, 1);
+
+    assert!(!is_source_ingested(&cfg, SourceKind::Document, sid).unwrap());
+    with_connection(&cfg, |conn| {
+        assert_eq!(
+            gate_count(conn)?,
+            0,
+            "bare AND versioned ingest gates must be cleared"
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn delete_source_rpc_unknown_id_is_idempotent() {
+    use crate::openhuman::memory::read_rpc::delete_source_rpc;
+    let (_tmp, cfg) = test_config();
+    let out = delete_source_rpc(&cfg, "telegram-note-does-not-exist".to_string())
+        .await
+        .unwrap()
+        .value;
+    assert!(!out.deleted);
+    assert_eq!(out.chunks_removed, 0);
+}
+
+#[tokio::test]
+async fn delete_source_rpc_rejects_empty_source_id() {
+    use crate::openhuman::memory::read_rpc::delete_source_rpc;
+    let (_tmp, cfg) = test_config();
+    assert!(delete_source_rpc(&cfg, "   ".to_string()).await.is_err());
+}
+
+/// Legacy partial delete: chunks were already removed earlier (e.g. by the bot's
+/// old per-chunk `delete_chunk` loop), leaving an orphaned summary tree + dedup
+/// gate. `delete_source_rpc` must finish the job and remove the stale tree.
+#[tokio::test]
+async fn delete_source_rpc_cleans_legacy_partial_delete() {
+    use crate::openhuman::memory::read_rpc::{delete_chunk_rpc, delete_source_rpc};
+    use crate::openhuman::memory_store::trees::store as tree_store;
+    use crate::openhuman::memory_store::trees::types::TreeKind;
+
+    let (_tmp, cfg) = test_config();
+    let target = "telegram-event-legacy";
+    let (chunk_ids, _chunk_file, summary_file) =
+        seed_full_document_source(&cfg, target, "tree-legacy", "sum-legacy", 1_700_000_000_000)
+            .await;
+
+    // ---- simulate the OLD per-chunk delete loop: remove only the chunks ----
+    for id in &chunk_ids {
+        assert!(
+            delete_chunk_rpc(&cfg, id.clone())
+                .await
+                .unwrap()
+                .value
+                .deleted
+        );
+    }
+
+    // pre-condition: chunks gone, but the summary tree + gate are still stale.
+    for id in &chunk_ids {
+        assert!(get_chunk(&cfg, id).unwrap().is_none());
+    }
+    assert!(
+        tree_store::get_tree_by_scope(&cfg, TreeKind::Source, target)
+            .unwrap()
+            .is_some()
+    );
+    assert!(is_source_ingested(&cfg, SourceKind::Document, target).unwrap());
+    with_connection(&cfg, |conn| {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM mem_tree_summaries WHERE tree_id = 'tree-legacy'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(n, 1, "stale summary must exist before delete_source");
+        Ok(())
+    })
+    .unwrap();
+
+    // ---- act: delete_source must finish the legacy cleanup ----
+    let out = delete_source_rpc(&cfg, target.to_string())
+        .await
+        .unwrap()
+        .value;
+    // chunks were already gone, but a stale tree was cleaned → deleted=true.
+    assert!(out.deleted);
+    assert_eq!(out.chunks_removed, 0);
+
+    // ---- assert: the stale tree / summaries / sidecars / gate are now gone ----
+    assert!(
+        tree_store::get_tree_by_scope(&cfg, TreeKind::Source, target)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!is_source_ingested(&cfg, SourceKind::Document, target).unwrap());
+    with_connection(&cfg, |conn| {
+        let count = |sql: &str| -> rusqlite::Result<i64> { conn.query_row(sql, [], |r| r.get(0)) };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM mem_tree_summaries WHERE tree_id = 'tree-legacy'")?,
+            0
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM mem_tree_summary_embeddings WHERE summary_id = 'sum-legacy'"
+            )?,
+            0
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM mem_tree_buffers WHERE tree_id = 'tree-legacy'")?,
+            0
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM mem_tree_trees WHERE id = 'tree-legacy'")?,
+            0
+        );
+        Ok(())
+    })
+    .unwrap();
+    // the summary content file is removed from disk too.
+    assert!(!cfg.memory_tree_content_root().join(&summary_file).exists());
+
+    // idempotent: a second delete_source now finds nothing.
+    let again = delete_source_rpc(&cfg, target.to_string())
+        .await
+        .unwrap()
+        .value;
+    assert!(!again.deleted);
+    assert_eq!(again.chunks_removed, 0);
+}
+
+#[test]
+fn delete_source_registered_in_schema_and_controllers() {
+    use crate::openhuman::memory::schema::{all_controller_schemas, all_registered_controllers};
+    let schema = all_controller_schemas()
+        .into_iter()
+        .find(|s| s.function == "delete_source")
+        .expect("delete_source schema present");
+    assert_eq!(schema.namespace, "memory_tree"); // => openhuman.memory_tree_delete_source
+    assert!(schema.inputs.iter().any(|f| f.name == "source_id"));
+    assert!(schema.outputs.iter().any(|f| f.name == "deleted"));
+    assert!(schema.outputs.iter().any(|f| f.name == "chunks_removed"));
+    assert!(all_registered_controllers()
+        .iter()
+        .any(|c| c.schema.function == "delete_source"));
 }

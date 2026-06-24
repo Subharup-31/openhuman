@@ -63,6 +63,7 @@ fn make_def_named_tools(names: &[&str]) -> AgentDefinition {
         timeout_secs: None,
         sandbox_mode: crate::openhuman::agent::harness::definition::SandboxMode::None,
         background: false,
+        trigger_memory_agent: Default::default(),
         subagents: vec![],
         delegate_name: None,
         agent_tier: crate::openhuman::agent::harness::definition::AgentTier::Worker,
@@ -122,6 +123,22 @@ fn filter_wildcard_includes_all_minus_disallowed() {
 }
 
 #[test]
+fn filter_wildcard_honours_disallowed_prefix_entries() {
+    let parent: Vec<Box<dyn Tool>> = vec![
+        stub("alpha"),
+        stub("tinyplace_registry_register"),
+        stub("tinyplace_marketplace_buy_identity"),
+        stub("gamma"),
+    ];
+    let mut def = make_def_named_tools(&[]);
+    def.tools = ToolScope::Wildcard;
+    def.disallowed_tools = vec!["tinyplace_*".into()];
+    let idx = filter_tool_indices(&parent, &def.tools, &def.disallowed_tools, None);
+    let names: Vec<&str> = idx.iter().map(|&i| parent[i].name()).collect();
+    assert_eq!(names, vec!["alpha", "gamma"]);
+}
+
+#[test]
 fn filter_skill_filter_restricts_to_prefix() {
     let parent: Vec<Box<dyn Tool>> = vec![
         stub("notion__search"),
@@ -162,6 +179,10 @@ fn append_subagent_role_contract_adds_role_and_brevity_rules() {
     assert!(rendered.contains("## Sub-agent Role Contract"));
     assert!(rendered.contains("You are a sub-agent working for a parent OpenHuman agent"));
     assert!(rendered.contains("Keep your final response concise and synthesis-ready"));
+    assert!(rendered.contains("## Sub-agent Result Contract"));
+    assert!(rendered.contains("Evidence used"));
+    assert!(rendered.contains("Do not include facts in Answer that are not supported"));
+    assert!(rendered.contains("truncated, partial, or too large"));
 }
 
 #[test]
@@ -174,6 +195,7 @@ fn append_subagent_role_contract_is_idempotent() {
 // ── End-to-end runner tests with mock provider ────────────────────────
 
 use crate::openhuman::agent::harness::fork_context::with_parent_context;
+use crate::openhuman::agent::harness::run_queue::{QueueMode, QueuedMessage, RunQueue};
 use crate::openhuman::inference::provider::{
     ChatRequest as PChatRequest, ChatResponse, Provider, ProviderDelta, ToolCall,
 };
@@ -297,6 +319,7 @@ fn tool_response(name: &str, args: &str) -> ChatResponse {
             id: "call-1".into(),
             name: name.into(),
             arguments: args.into(),
+            extra_content: None,
         }],
         usage: None,
         reasoning_content: None,
@@ -309,15 +332,20 @@ fn make_parent(provider: Arc<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Parent
     let tool_specs: Vec<crate::openhuman::tools::ToolSpec> =
         tools.iter().map(|t| t.spec()).collect();
     ParentExecutionContext {
+        agent_definition_id: "orchestrator".into(),
+        allowed_subagent_ids: ["test".to_string(), "child".to_string(), "inner".to_string()]
+            .into_iter()
+            .collect(),
         provider,
         all_tools: Arc::new(tools),
         all_tool_specs: Arc::new(tool_specs),
+        visible_tool_names: std::collections::HashSet::new(),
         model_name: "test-model".into(),
         temperature: 0.5,
         workspace_dir: std::env::temp_dir(),
         memory: noop_memory(),
         agent_config: crate::openhuman::config::AgentConfig::default(),
-        skills: Arc::new(vec![]),
+        workflows: Arc::new(vec![]),
         memory_context: Arc::new(None),
         session_id: "test-session".into(),
         channel: "test".into(),
@@ -326,6 +354,7 @@ fn make_parent(provider: Arc<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Parent
         session_key: "0_test".into(),
         session_parent_prefix: None,
         on_progress: None,
+        run_queue: None,
     }
 }
 
@@ -468,6 +497,8 @@ async fn typed_mode_returns_text_through_runner() {
                 worker_thread_id: None,
                 initial_history: None,
                 checkpoint_dir: None,
+                worktree_action_dir: None,
+                run_queue: None,
             },
         )
         .await
@@ -479,6 +510,66 @@ async fn typed_mode_returns_text_through_runner() {
     assert_eq!(outcome.iterations, 1);
     assert_eq!(outcome.mode, SubagentMode::Typed);
     assert_eq!(outcome.task_id, "t1");
+}
+
+#[tokio::test]
+async fn run_queue_steer_lands_in_subagent_history() {
+    // End-to-end proof that flipping the subagent loop's run-queue arg from
+    // `None` to `Some(queue)` wires steering all the way through: a message
+    // pushed to the queue before the run is drained by the inner
+    // `run_turn_engine` and appears as a `[User steering message]:` user turn
+    // in the exact request sent to the provider. This is the mechanism behind
+    // the `steer_subagent` tool.
+    let provider = ScriptedProvider::new(vec![text_response("acknowledged")]);
+    let parent = make_parent(provider.clone(), vec![stub("file_read")]);
+    let def = make_def_named_tools(&[]);
+
+    let run_queue = RunQueue::new();
+    run_queue
+        .push(QueuedMessage {
+            text: "switch focus to memory safety".into(),
+            mode: QueueMode::Steer,
+            client_id: "steer_subagent".into(),
+            thread_id: "t-steer".into(),
+            queued_at_ms: 0,
+            model_override: None,
+            temperature: None,
+            profile_id: None,
+            locale: None,
+        })
+        .await;
+
+    let outcome = with_parent_context(parent, async {
+        run_subagent(
+            &def,
+            "investigate the bug",
+            SubagentRunOptions {
+                task_id: Some("t-steer".into()),
+                run_queue: Some(run_queue),
+                ..Default::default()
+            },
+        )
+        .await
+    })
+    .await
+    .expect("runner should succeed");
+
+    assert_eq!(outcome.output, "acknowledged");
+
+    let captured = provider.captured.lock();
+    let steered = captured[0]
+        .messages
+        .iter()
+        .any(|m| m.role == "user" && m.content.contains("switch focus to memory safety"));
+    assert!(
+        steered,
+        "steer message should be injected into the sub-agent's first request, got: {:?}",
+        captured[0]
+            .messages
+            .iter()
+            .map(|m| (&m.role, &m.content))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
@@ -579,6 +670,8 @@ async fn typed_mode_filters_tools_by_skill_filter() {
                 worker_thread_id: None,
                 initial_history: None,
                 checkpoint_dir: None,
+                worktree_action_dir: None,
+                run_queue: None,
             },
         )
         .await
@@ -1286,4 +1379,161 @@ fn unsigned_in_user_fails_probe() {
         !user_is_signed_in_to_composio(&config),
         "user with neither backend session nor direct key must NOT be reported as signed in"
     );
+}
+
+/// Sanity-check: a parent agent delegating to a sub-agent must complete
+/// without panicking, even on a worker thread with a tight stack — this
+/// is the same recursion shape that crashed the
+/// `chat-harness-subagent` Playwright lane in production with
+/// `thread 'tokio-rt-worker' has overflowed its stack, fatal runtime
+/// error: stack overflow`.
+///
+/// The deep ground-truth regression catcher for this is the
+/// `chat-harness-subagent.spec.ts` Playwright spec, which exercises the
+/// real orchestrator → researcher dispatch end-to-end (real provider
+/// stream, real config load, real tool registry). The scripted unit
+/// path here has much smaller per-frame state than production, so a
+/// single stack size doesn't cleanly bracket boxed-vs-unboxed — we use
+/// the loose 1 MiB worker stack as a smoke check that the dispatch
+/// path remains poll-bounded after refactors. See `subagent_runner/
+/// ops.rs` `Box::pin` callsites for the structural fix.
+#[test]
+fn nested_subagent_dispatch_runs_on_a_constrained_worker_stack() {
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct RecursiveDelegateTool {
+        inner_def: AgentDefinition,
+    }
+
+    #[async_trait]
+    impl Tool for RecursiveDelegateTool {
+        fn name(&self) -> &str {
+            "delegate_inner"
+        }
+        fn description(&self) -> &str {
+            "Dispatches a nested sub-agent — reproduces the recursive engine poll."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::Execute
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let outcome = run_subagent(&self.inner_def, "inner go", SubagentRunOptions::default())
+                .await
+                .map_err(|e| anyhow::anyhow!("nested run_subagent failed: {e}"))?;
+            Ok(ToolResult::success(outcome.output))
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_stack_size(1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build constrained-stack tokio runtime");
+
+    let outcome = runtime.block_on(async {
+        // Three scripted responses, shared by outer + inner runs
+        // (providers are Arc-cloned, so both pull from the same queue):
+        //   [0] outer round 1: call `delegate_inner`
+        //   [1] inner round 1: return final text
+        //   [2] outer round 2: return final text using the tool result
+        let provider = ScriptedProvider::new(vec![
+            tool_response("delegate_inner", "{}"),
+            text_response("inner-final"),
+            text_response("outer-final: inner-final"),
+        ]);
+
+        let inner_def = make_def_named_tools(&[]);
+        let delegate_tool: Box<dyn Tool> = Box::new(RecursiveDelegateTool { inner_def });
+        let parent = make_parent(
+            Arc::clone(&(provider.clone() as Arc<dyn Provider>)),
+            vec![delegate_tool],
+        );
+        let outer_def = make_def_named_tools(&["delegate_inner"]);
+
+        with_parent_context(parent, async {
+            run_subagent(&outer_def, "outer go", SubagentRunOptions::default()).await
+        })
+        .await
+    });
+
+    let outcome = outcome.expect(
+        "nested run_subagent must complete on a 1 MiB worker stack — \
+         a stack overflow here means the recursion boundary in \
+         `run_typed_mode` regressed (see `Box::pin` callsites around \
+         `run_inner_loop` and `run_turn_engine`).",
+    );
+    assert!(
+        outcome.output.contains("inner-final"),
+        "outer should fold the inner sub-agent's result into its final \
+         answer, got: {}",
+        outcome.output
+    );
+}
+
+// ── Repro: issue #3152 — near-miss write slug fails to resolve ──────
+//
+// The model emits `NOTION_SEARCH_NOTION` (drops the `_PAGE` suffix). The
+// real action `NOTION_SEARCH_NOTION_PAGE` is the unique superstring, yet
+// find_action's three tiers (exact / case-insensitive / normalized) all
+// miss → None → lazy registration never fires → allowlist gate blocks the
+// write. Asserts DESIRED post-fix behaviour → RED until the unique
+// prefix/superstring resolution tier lands. Must stay conservative: a
+// fabricated slug with no unique match must still resolve to None (covered
+// by `lazy_resolver_tolerates_near_miss_slugs`).
+#[test]
+fn repro_3152_near_miss_write_slug_resolves_uniquely() {
+    use crate::openhuman::context::prompt::ConnectedIntegrationTool;
+    let mk = |name: &str| ConnectedIntegrationTool {
+        name: name.into(),
+        description: "d".into(),
+        parameters: None,
+    };
+    let resolver = LazyToolkitResolver {
+        config: std::sync::Arc::new(crate::openhuman::config::Config::default()),
+        actions: vec![
+            mk("NOTION_SEARCH_NOTION_PAGE"),
+            mk("NOTION_CREATE_NOTION_PAGE"),
+            mk("NOTION_FETCH_DATA"),
+        ],
+    };
+    let resolved = resolver
+        .resolve("NOTION_SEARCH_NOTION")
+        .expect("#3152: near-miss write slug must resolve to its unique superstring");
+    assert_eq!(resolved.name(), "NOTION_SEARCH_NOTION_PAGE");
+}
+
+// ── Guard: #3152 prefix tier must stay strictly unique ──────────────
+//
+// When a truncated slug prefix-matches MORE than one catalogued action,
+// the resolver must refuse rather than guess — a mis-dispatched write
+// could create/update the wrong resource (data-integrity). Also asserts
+// the length gate: a too-short request never fans out.
+#[test]
+fn prefix_tier_refuses_ambiguous_and_short_slugs() {
+    use crate::openhuman::context::prompt::ConnectedIntegrationTool;
+    let mk = |name: &str| ConnectedIntegrationTool {
+        name: name.into(),
+        description: "d".into(),
+        parameters: None,
+    };
+    let resolver = LazyToolkitResolver {
+        config: std::sync::Arc::new(crate::openhuman::config::Config::default()),
+        actions: vec![
+            mk("NOTION_SEARCH_NOTION_PAGE"),
+            mk("NOTION_SEARCH_NOTION_DATABASE"),
+            mk("NOTION_CREATE_NOTION_PAGE"),
+        ],
+    };
+    // `NOTION_SEARCH_NOTION` is a prefix of TWO actions → ambiguous → None.
+    assert!(
+        resolver.resolve("NOTION_SEARCH_NOTION").is_none(),
+        "#3152: ambiguous prefix must not silently dispatch to a guess"
+    );
+    // Short slug below the length gate never engages the prefix tier.
+    assert!(resolver.resolve("NOTION").is_none());
 }

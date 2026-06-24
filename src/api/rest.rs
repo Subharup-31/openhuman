@@ -42,6 +42,35 @@ pub enum BackendApiError {
     },
 }
 
+/// Flatten an `authed_json` error onto the JSON-RPC `String` channel.
+///
+/// `BackendApiError::Unauthorized` is an expected backend session-lapse 401
+/// (token expired / revoked / rotated server-side), not a code bug — see the
+/// variant docs above. Callers used to flatten it with `format!("{e:#}")` /
+/// `e.to_string()`, producing `"backend rejected session token on {method}
+/// {path}"`, which matches none of the JSON-RPC session-expiry classifiers
+/// (`is_session_expired_error`, `is_session_expired_message`, the `before_send`
+/// net), so every lapsed-session 401 leaked to Sentry — TAURI-RUST-8WY
+/// (`/teams/me/usage`), TAURI-RUST-8WZ (`/payments/stripe/currentPlan`), and the
+/// rest of the authed-endpoint family (#3297).
+///
+/// Mapping `Unauthorized` onto the existing `SESSION_EXPIRED` sentinel makes the
+/// dispatcher (`core/jsonrpc.rs`) classify it as session expiry: it skips the
+/// Sentry report AND publishes `DomainEvent::SessionExpired` so the auth domain
+/// drives re-sign-in. This keys off the typed downcast — not the Display
+/// wording — so it stays correct if the `#[error(...)]` text changes, consistent
+/// with #2959's removal of brittle string-based suppression. Every other error
+/// (including `MessageNotFound`) keeps its full `{e:#}` chain so genuine
+/// failures still reach Sentry.
+pub fn flatten_authed_error(err: anyhow::Error) -> String {
+    match err.downcast_ref::<BackendApiError>() {
+        Some(BackendApiError::Unauthorized { method, path }) => {
+            format!("SESSION_EXPIRED: backend rejected session token on {method} {path}")
+        }
+        _ => format!("{err:#}"),
+    }
+}
+
 /// Extract `(provider, message_id)` from a backend channel path of the
 /// shape `…/channels/<provider>/messages/<id>`. Returns `None` for paths
 /// that do not contain this four-segment subsequence.
@@ -243,9 +272,8 @@ struct LoginTokenConsumeEnvelope {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct LoginTokenConsumeData {
-    jwt_token: String,
+    jwt: String,
 }
 
 /// Decrypted OAuth token payload for handing off tokens to a local service or skill.
@@ -394,17 +422,21 @@ impl BackendOAuthClient {
         let token = login_token.trim();
         anyhow::ensure!(!token.is_empty(), "login token is required");
 
+        // Backend serves `POST /auth/login-token/consume` with the token in a JSON
+        // body `{ token, audience? }` and returns `{ success, data: { jwt } }`
+        // (see backend `routes/auth.ts`). The legacy
+        // `telegram/login-tokens/{token}/consume` path-param route was removed, so
+        // the old call 404'd and Telegram/OAuth-token login could never complete
+        // (WIRING_GAPS_AUDIT C1/C2).
         let url = self
             .base
-            .join(&format!(
-                "telegram/login-tokens/{}/consume",
-                urlencoding::encode(token)
-            ))
+            .join("auth/login-token/consume")
             .context("build login-token consume URL")?;
 
         let resp = self
             .client
             .post(url)
+            .json(&serde_json::json!({ "token": token }))
             .send()
             .await
             .context("consume login token")?;
@@ -421,11 +453,8 @@ impl BackendOAuthClient {
             anyhow::bail!("consume login token unsuccessful: {text}");
         }
 
-        let jwt = env.data.jwt_token.trim().to_string();
-        anyhow::ensure!(
-            !jwt.is_empty(),
-            "consume login token response missing jwtToken"
-        );
+        let jwt = env.data.jwt.trim().to_string();
+        anyhow::ensure!(!jwt.is_empty(), "consume login token response missing jwt");
         Ok(jwt)
     }
 

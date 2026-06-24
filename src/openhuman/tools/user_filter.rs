@@ -28,6 +28,36 @@ const TOOL_FAMILIES: &[ToolFamily] = &[
         rust_names: &["shell"],
         default_enabled: true,
     },
+    // Dedicated app-launcher: always-allow, no shell exposure, no workspace_only concern.
+    ToolFamily {
+        id: "launch_app",
+        rust_names: &["launch_app"],
+        default_enabled: true,
+    },
+    // AXUIElement interaction: semantic UI control via macOS Accessibility API.
+    // No CGEventPost, no coordinate dependency, no CEF crash risk.
+    ToolFamily {
+        id: "ax_interact",
+        rust_names: &["ax_interact"],
+        default_enabled: true,
+    },
+    // Multi-step UI automation (one call → whole flow). Same opt-in as
+    // ax_interact; surfaced as its own catalog toggle.
+    ToolFamily {
+        id: "automate",
+        rust_names: &["automate"],
+        default_enabled: true,
+    },
+    // Computer control — mouse and keyboard. Gated by computer_control.enabled
+    // in config (tools only register when that flag is true). Each tool also
+    // overrides `external_effect` → true so the ApprovalGate fires per-action —
+    // `PermissionLevel::Dangerous` alone does NOT trigger the gate (it's only a
+    // static channel-capability filter); the gate keys off `external_effect_with_args`.
+    ToolFamily {
+        id: "computer_control",
+        rust_names: &["mouse", "keyboard"],
+        default_enabled: true,
+    },
     // detect_tools / install_tool are filterable but not surfaced in the
     // default-ON catalog, so they stay opt-in (default-OFF).
     ToolFamily {
@@ -135,8 +165,25 @@ const TOOL_FAMILIES: &[ToolFamily] = &[
         default_enabled: false,
     },
     ToolFamily {
+        id: "workflow_manage",
+        rust_names: &[
+            "create_workflow",
+            "install_workflow_from_url",
+            "uninstall_workflow",
+        ],
+        default_enabled: false,
+    },
+    // Legacy alias: pre-rename `enabled_tool_names` snapshots stored this
+    // family as `skill_manage`. Retain it (same rust_names) so users who had
+    // already opted in keep these default-OFF tools enabled after the
+    // skills→workflows rename instead of silently losing them.
+    ToolFamily {
         id: "skill_manage",
-        rust_names: &["skill_create", "skill_install_from_url", "skill_uninstall"],
+        rust_names: &[
+            "create_workflow",
+            "install_workflow_from_url",
+            "uninstall_workflow",
+        ],
         default_enabled: false,
     },
     ToolFamily {
@@ -279,10 +326,17 @@ fn family_for_rust_name(name: &str) -> Option<&'static ToolFamily> {
 /// - UI toggle IDs (legacy / partial-rollout format)
 ///
 /// Unknown entries are ignored.
+const LEGACY_ALIASES: &[(&str, &str)] = &[("skill_manage", "workflow_manage")];
+
 fn expand_enabled_tool_names(enabled_tool_names: &[String]) -> HashSet<String> {
     let mut expanded = HashSet::new();
     for entry in enabled_tool_names {
-        if let Some(fam) = TOOL_FAMILIES.iter().find(|fam| fam.id == entry) {
+        let resolved = LEGACY_ALIASES
+            .iter()
+            .find(|(old, _)| *old == entry.as_str())
+            .map(|(_, new)| *new)
+            .unwrap_or(entry.as_str());
+        if let Some(fam) = TOOL_FAMILIES.iter().find(|fam| fam.id == resolved) {
             for name in fam.rust_names {
                 expanded.insert((*name).to_string());
             }
@@ -298,6 +352,30 @@ fn expand_enabled_tool_names(enabled_tool_names: &[String]) -> HashSet<String> {
         }
     }
     expanded
+}
+
+/// True when the persisted tool-preference snapshot opts into the mutating
+/// app-control actions — i.e. the user enabled "App UI Control" (`ax_interact`)
+/// or "App Automation" (`automate`) in Settings → Features → Tools.
+///
+/// Those tools' descriptions promise clicking buttons and typing into fields,
+/// but enabling the toggle alone only made the read-only `list` action
+/// available — the mutating `press` / `set_value` actions required a separate,
+/// UI-less `computer_control.ax_interact_mutations` flag or Full autonomy
+/// (#3762). The session builder uses this to treat enabling the tool as the
+/// user-facing opt-in for those mutations, equivalent to setting that flag. The
+/// actions stay approval-gated and bound by the sensitive-app denylist.
+///
+/// Reuses [`expand_enabled_tool_names`] so it is robust to both persisted
+/// formats (UI toggle ids or Rust tool names). An empty snapshot ("not yet
+/// configured" / all-enabled) is treated as no explicit opt-in, preserving the
+/// safe default.
+pub(crate) fn enables_app_ui_control_mutations(enabled_tool_names: &[String]) -> bool {
+    if enabled_tool_names.is_empty() {
+        return false;
+    }
+    let expanded = expand_enabled_tool_names(enabled_tool_names);
+    expanded.contains("ax_interact") || expanded.contains("automate")
 }
 
 /// Given the list of enabled tools from app state, retain only tools that are
@@ -388,7 +466,10 @@ pub(crate) fn filter_tools_by_user_preference(
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_enabled_tool_names, filter_tools_by_user_preference};
+    use super::{
+        enables_app_ui_control_mutations, expand_enabled_tool_names,
+        filter_tools_by_user_preference,
+    };
     use crate::openhuman::tools::traits::{Tool, ToolResult};
     use async_trait::async_trait;
 
@@ -547,5 +628,33 @@ mod tests {
         let mut t = tools(&["cron_add", "service_start"]);
         filter_tools_by_user_preference(&mut t, &["totally_unknown".to_string()]);
         assert_eq!(names(&t).len(), 2);
+    }
+
+    // #3762: enabling the App UI Control / App Automation tool is the opt-in
+    // for the mutating click/type actions.
+    #[test]
+    fn app_ui_control_opt_in_detects_ax_interact_and_automate() {
+        assert!(enables_app_ui_control_mutations(&[
+            "ax_interact".to_string()
+        ]));
+        assert!(enables_app_ui_control_mutations(&["automate".to_string()]));
+        // Present alongside other enabled tools.
+        assert!(enables_app_ui_control_mutations(&[
+            "cron_add".to_string(),
+            "automate".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn app_ui_control_opt_in_false_when_absent_or_empty() {
+        assert!(!enables_app_ui_control_mutations(&[]));
+        assert!(!enables_app_ui_control_mutations(&[
+            "cron_add".to_string(),
+            "service_start".to_string(),
+        ]));
+        // Unknown entries never opt in.
+        assert!(!enables_app_ui_control_mutations(&[
+            "totally_unknown".to_string()
+        ]));
     }
 }

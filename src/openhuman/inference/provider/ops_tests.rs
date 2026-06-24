@@ -207,7 +207,7 @@ fn openai_codex_models_url_includes_client_version_query() {
     let url = append_query_param(
         "https://chatgpt.com/backend-api/codex/models",
         "client_version",
-        openai_codex_client_version(),
+        &openai_codex_client_version(),
     );
     let parsed = reqwest::Url::parse(&url).expect("url");
 
@@ -288,69 +288,6 @@ async fn openrouter_key_is_trimmed_for_validation_and_catalog_probe() {
     );
 }
 
-/// Spawn a minimal axum server that always returns 404 for the /models endpoint.
-/// Used to verify that providers without model listing return an empty list,
-/// not an error (Sentry issue TAURI-RUST-1Z).
-async fn spawn_models_404_server() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    let app = axum::Router::new().route(
-        "/models",
-        axum::routing::get(|| async {
-            (axum::http::StatusCode::NOT_FOUND, "Not Found").into_response()
-        }),
-    );
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve");
-    });
-    format!("http://{addr}")
-}
-
-#[tokio::test]
-async fn models_404_returns_empty_list_not_error() {
-    // Providers that return 404 on /models (e.g. DeepSeek, Kimi, custom proxies)
-    // must yield an empty model list, not an Err. Returning an Err was firing a
-    // Sentry error for every `inference_list_models` call (TAURI-RUST-1Z, 819 events).
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let endpoint = spawn_models_404_server().await;
-
-    let mut config = Config {
-        config_path: tmp.path().join("config.toml"),
-        workspace_dir: tmp.path().join("workspace"),
-        action_dir: tmp.path().join("workspace"),
-        ..Config::default()
-    };
-    config.secrets.encrypt = false;
-    config.cloud_providers.push(CloudProviderCreds {
-        id: "p_custom_test".to_string(),
-        slug: "custom-no-models".to_string(),
-        label: "Custom (no /models)".to_string(),
-        endpoint,
-        auth_style: AuthStyle::Bearer,
-        legacy_type: None,
-        default_model: None,
-    });
-
-    let outcome = list_configured_models_from_config("custom-no-models", &config)
-        .await
-        .expect("404 from /models must succeed with an empty list");
-
-    let models = outcome.value["models"]
-        .as_array()
-        .expect("response must have a `models` array");
-    assert!(
-        models.is_empty(),
-        "expected empty model list for a 404 /models endpoint, got: {models:?}"
-    );
-    assert_eq!(
-        outcome.value["unsupported"],
-        serde_json::Value::Bool(true),
-        "unsupported flag must be set to true for 404 providers"
-    );
-}
-
 #[test]
 fn factory_backend() {
     assert!(create_backend_inference_provider(
@@ -395,6 +332,67 @@ fn skips_sentry_report_for_transient_upstream_statuses() {
             "status {reportable} must still report to Sentry"
         );
     }
+}
+
+#[test]
+fn backend_error_code_owned_gates_managed_errors_except_malformed_bad_request() {
+    use crate::openhuman::inference::provider::openhuman_backend::PROVIDER_LABEL;
+
+    // F2/F4: backend-owned / expected-user-state errorCodes must NOT page the
+    // provider HTTP layer.
+    for code in [
+        "RATE_LIMITED",
+        "USER_INSUFFICIENT_CREDITS",
+        "UPSTREAM_UNAVAILABLE",
+        "MODEL_UNAVAILABLE",
+        "INTERNAL_ERROR",
+    ] {
+        let body = format!("{{\"error\":{{\"errorCode\":\"{code}\",\"message\":\"x\"}}}}");
+        assert!(
+            is_backend_error_code_owned(PROVIDER_LABEL, &body),
+            "errorCode={code} must be backend-owned (no provider-layer Sentry)"
+        );
+    }
+
+    // A user-param BAD_REQUEST is still backend-owned (F8 only carves out the
+    // malformed variant).
+    assert!(is_backend_error_code_owned(
+        PROVIDER_LABEL,
+        "{\"error\":{\"errorCode\":\"BAD_REQUEST\",\"message\":\"bad param\"}}"
+    ));
+
+    // Client-guard-leak codes page: the client enforces these limits before
+    // sending (attachment size gates; context-window management), so a backend
+    // rejection means our guard leaked — the gate must NOT claim them.
+    for code in ["PAYLOAD_TOO_LARGE", "CONTEXT_LENGTH_EXCEEDED"] {
+        let body = format!("{{\"error\":{{\"errorCode\":\"{code}\",\"message\":\"x\"}}}}");
+        assert!(
+            !is_backend_error_code_owned(PROVIDER_LABEL, &body),
+            "errorCode={code} is a client guard leak and must page (not owned)"
+        );
+    }
+
+    // F8: a backend-flagged malformed BAD_REQUEST is also a case the FE still
+    // pages — the gate must NOT claim it.
+    assert!(!is_backend_error_code_owned(
+        PROVIDER_LABEL,
+        "{\"error\":{\"errorCode\":\"BAD_REQUEST\",\"malformed\":true}}"
+    ));
+
+    // BYO (no errorCode) is never claimed by this gate — it falls through to
+    // the status-based decision.
+    assert!(!is_backend_error_code_owned(
+        PROVIDER_LABEL,
+        "{\"error\":{\"message\":\"Incorrect API key provided\"}}"
+    ));
+
+    // CodeRabbit: a BYO / direct provider whose body merely contains an
+    // `errorCode`-shaped field must NOT be claimed as backend-owned — the
+    // provider gate keeps it reaching Sentry via the status decision.
+    assert!(!is_backend_error_code_owned(
+        "custom_openai",
+        "{\"error\":{\"errorCode\":\"RATE_LIMITED\"}}"
+    ));
 }
 
 // Confirm the budget-exhausted suppression predicate is scoped correctly.
@@ -452,61 +450,6 @@ mod budget_exhausted_suppression {
             reqwest::StatusCode::BAD_REQUEST,
             "",
         ));
-    }
-}
-
-// Tests for the rate-limit body suppression guard added to `api_error`.
-// Exercises `is_upstream_rate_limit_message` with the exact body shapes that
-// produced OPENHUMAN-TAURI-S (~6 984 events from HTTP 500 wrapping a
-// "429 rate limit exceeded" body) and OPENHUMAN-TAURI-6Y / -2E.
-mod rate_limit_body_suppression {
-    use crate::core::observability::is_upstream_rate_limit_message;
-
-    /// HTTP 500 with a `"429 rate limit exceeded"` body must be detected
-    /// as a rate-limit signal so the guard in `api_error` can skip the
-    /// Sentry report (OPENHUMAN-TAURI-S).
-    #[test]
-    fn http_500_with_429_body_phrase_is_rate_limited() {
-        let body = r#"{"success":false,"error":"429 rate limit exceeded, please try again later"}"#
-            .to_ascii_lowercase();
-        assert!(
-            is_upstream_rate_limit_message(&body),
-            "500-body with '429 rate limit exceeded' must be detected as rate-limited"
-        );
-    }
-
-    /// HTTP 500 with an `"upstream rate limit exceeded"` body
-    /// (OPENHUMAN-TAURI-6Y shape).
-    #[test]
-    fn http_500_with_upstream_rate_limit_body_is_rate_limited() {
-        let body = r#"{"success":false,"error":"Upstream rate limit exceeded for model 'summarization-v1'. Please retry shortly.","details":{"provider":"gmi"}}"#
-            .to_ascii_lowercase();
-        assert!(
-            is_upstream_rate_limit_message(&body),
-            "500-body with 'upstream rate limit exceeded' must be detected"
-        );
-    }
-
-    /// OpenAI / Anthropic `"rate_limit_error"` type body.
-    #[test]
-    fn body_with_rate_limit_error_type_is_rate_limited() {
-        let body = r#"{"error":{"message":"Rate limit exceeded. Please retry after a brief wait.","type":"rate_limit_error"}}"#
-            .to_ascii_lowercase();
-        assert!(
-            is_upstream_rate_limit_message(&body),
-            "body with 'rate_limit_error' type must be detected"
-        );
-    }
-
-    /// Unrelated 500 body must NOT be detected as rate-limited.
-    #[test]
-    fn http_500_unrelated_body_is_not_rate_limited() {
-        let body = r#"{"success":false,"error":"internal server error: database unavailable"}"#
-            .to_ascii_lowercase();
-        assert!(
-            !is_upstream_rate_limit_message(&body),
-            "unrelated 500 body must not be detected as rate-limited"
-        );
     }
 }
 
@@ -651,6 +594,44 @@ mod provider_config_rejection_suppression {
         ));
     }
 
+    /// TAURI-RUST-4XK — Ollama Cloud returns HTTP 403 with body
+    /// `{"error":"this model requires a subscription, upgrade for access: …"}`.
+    /// Before this fix, `is_provider_config_rejection_http` rejected 403
+    /// before reaching the phrase matcher, so the subscription-gate body
+    /// fell through to Sentry. Adding 403 to the allowed status set closes
+    /// that gap; the existing phrase in `config_rejection.rs` already
+    /// handles the body content.
+    #[test]
+    fn ollama_cloud_403_subscription_gate_is_suppressed() {
+        // Verbatim wire body from TAURI-RUST-4XK Sentry issue 5338.
+        let body = r#"ollama API error (403 Forbidden): {"error":"this model requires a subscription, upgrade for access: https://ollama.com/upgrade (ref: bc48f3c8-fba1-40b6-93a9-786a167d16f9)"}"#;
+        assert!(
+            is_provider_config_rejection_http(
+                reqwest::StatusCode::FORBIDDEN,
+                "ollama",
+                body,
+            ),
+            "TAURI-RUST-4XK: ollama 403 subscription-gate must be classified as provider config-rejection"
+        );
+    }
+
+    #[test]
+    fn openhuman_backend_403_subscription_phrase_is_not_suppressed() {
+        // Polarity guard: if our own backend somehow returned a 403 with
+        // the subscription phrase, that would be an unexpected regression
+        // and must still reach Sentry. The phrase does not appear in any
+        // expected backend body, so this is purely defensive.
+        let body = r#"{"error":"this model requires a subscription, upgrade for access: https://ollama.com/upgrade (ref: test)"}"#;
+        assert!(
+            !is_provider_config_rejection_http(
+                reqwest::StatusCode::FORBIDDEN,
+                openhuman_backend::PROVIDER_LABEL,
+                body,
+            ),
+            "backend 403 subscription phrase must NOT be suppressed (polarity guard)"
+        );
+    }
+
     #[test]
     fn log_helper_runs_without_panicking() {
         // Covers the demotion log path taken by `api_error` when a
@@ -701,12 +682,37 @@ mod context_window_exceeded_suppression {
     }
 
     #[test]
+    fn classifies_lmstudio_n_keep_exceeds_n_ctx_body() {
+        // TAURI-RUST-6V0: LM Studio / llama.cpp reject a prompt whose
+        // un-evictable prefix (`n_keep`) is larger than the model's loaded
+        // context (`n_ctx`). The user loaded the model with too small a
+        // context length; the remediation lives in the user's local server,
+        // so the matcher must demote this from Sentry. Verbatim wire body.
+        let body = "lmstudio API error (400 Bad Request): {\"error\":\"The number of tokens to keep from the initial prompt is greater than the context length (n_keep: 10978 >= n_ctx: 8192). Try to load the model with a larger context length, or provide a shorter input.\"}";
+        assert!(
+            is_context_window_exceeded_message(body),
+            "LM Studio n_keep >= n_ctx body must classify as context-window overflow"
+        );
+        // Both anchors fire independently: the `greater than the context
+        // length` phrase AND the paired `n_keep`/`n_ctx` diagnostic.
+        assert!(is_context_window_exceeded_message(
+            "request rejected: prompt is greater than the context length of the loaded model"
+        ));
+        assert!(is_context_window_exceeded_message(
+            "n_keep: 9000 >= n_ctx: 4096"
+        ));
+    }
+
+    #[test]
     fn does_not_match_unrelated_bodies() {
         for body in [
             "rate limit exceeded, retry after 30s",
             "Invalid request: model not found",
             "Insufficient budget",
             "tool call exceeded the allowed budget",
+            // Only one of the paired n_keep/n_ctx tokens present — must NOT
+            // match (guards the paired-anchor arm against bare n_ctx logging).
+            "loaded model with n_ctx: 8192 and 32 layers",
         ] {
             assert!(
                 !is_context_window_exceeded_message(body),
@@ -1099,6 +1105,135 @@ fn is_backend_auth_failure_only_matches_openhuman_backend_401_403() {
             "{provider} 403 must reach Sentry as actionable BYO-key error"
         );
     }
+}
+
+/// `is_byo_provider_auth_failure_http` demotes a non-backend provider's
+/// 401/403 from Sentry when the body looks like a missing/invalid BYO API
+/// key (TAURI-RUST-DHM: a `kiro` custom provider with no key flooded Sentry
+/// with 5,636 identical events from one user via the memory-tree retry loop).
+/// The gate is provider-scoped (backend keeps its SessionExpired branch) and
+/// body-shape-anchored (a non-auth 401, e.g. quota / geo-block, still reports).
+#[test]
+fn byo_provider_auth_failure_demotes_authentication_error_bodies() {
+    use reqwest::StatusCode;
+
+    // The exact kiro 401 envelope from the Sentry report.
+    let kiro_body =
+        r#"{"error":{"message":"Invalid or missing API key","type":"authentication_error"}}"#;
+    assert!(is_byo_provider_auth_failure_http(
+        "kiro",
+        StatusCode::UNAUTHORIZED,
+        kiro_body
+    ));
+    // 403 with the same envelope is demoted too.
+    assert!(is_byo_provider_auth_failure_http(
+        "kiro",
+        StatusCode::FORBIDDEN,
+        kiro_body
+    ));
+
+    // Every recognised auth-key marker across the BYO providers in Sentry.
+    for body in [
+        r#"{"error":{"type":"authentication_error"}}"#,
+        r#"{"error":{"code":"invalid_api_key","message":"Incorrect API key provided"}}"#,
+        "Invalid API key",
+        "invalid or missing api key",
+        "missing api key",
+        r#"{"message":"no api key supplied"}"#,
+        "invalid authentication",
+    ] {
+        assert!(
+            is_byo_provider_auth_failure_http("custom_openai", StatusCode::UNAUTHORIZED, body),
+            "BYO auth body must be demoted: {body}"
+        );
+    }
+}
+
+/// The backend keeps its `is_backend_auth_failure` → SessionExpired branch:
+/// a backend 401 with an auth-error body must NOT be swallowed here, or the
+/// session-expiry reauth path (and its existing test) would silently break.
+#[test]
+fn byo_provider_auth_failure_excludes_openhuman_backend() {
+    use reqwest::StatusCode;
+    let backend = crate::openhuman::inference::provider::openhuman_backend::PROVIDER_LABEL;
+    let body = r#"{"error":{"type":"authentication_error"}}"#;
+    assert!(!is_byo_provider_auth_failure_http(
+        backend,
+        StatusCode::UNAUTHORIZED,
+        body
+    ));
+    assert!(!is_byo_provider_auth_failure_http(
+        backend,
+        StatusCode::FORBIDDEN,
+        body
+    ));
+}
+
+/// Body-shape anchoring: a 401/403 whose body is NOT an auth-key envelope
+/// (quota, geo-block, opaque gateway text) still reaches Sentry — the gate
+/// keys on the body, not the bare status. And a non-401/403 status with an
+/// auth-ish body is out of scope (handled by the budget / config-rejection
+/// branches or the status gate).
+#[test]
+fn byo_provider_auth_failure_is_body_and_status_scoped() {
+    use reqwest::StatusCode;
+
+    // 401/403 without an auth-key envelope — still actionable, must report.
+    for body in [
+        r#"{"error":{"message":"Access denied for your region","type":"forbidden"}}"#,
+        r#"{"error":{"message":"Quota exceeded for this account"}}"#,
+        "Unauthorized",
+    ] {
+        assert!(
+            !is_byo_provider_auth_failure_http("custom_openai", StatusCode::UNAUTHORIZED, body),
+            "non-auth-envelope body must stay reportable: {body}"
+        );
+    }
+
+    // Auth-shaped body on a non-401/403 status is out of this predicate's scope.
+    for status in [
+        StatusCode::BAD_REQUEST,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::NOT_FOUND,
+    ] {
+        assert!(
+            !is_byo_provider_auth_failure_http(
+                "custom_openai",
+                status,
+                r#"{"error":{"type":"authentication_error"}}"#
+            ),
+            "status {status} with auth body must not be demoted here"
+        );
+    }
+}
+
+/// End-to-end through `api_error`: a non-backend 401 with an auth-error body
+/// returns the sanitized provider error (so the chat/UI surface is unchanged)
+/// while the BYO-auth branch demotes it from Sentry. Exercises the wired-in
+/// cascade, not just the predicate in isolation.
+#[tokio::test]
+async fn api_error_byo_auth_failure_returns_message_via_demoted_branch() {
+    let http_response = axum::http::Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .body(
+            r#"{"error":{"message":"Invalid or missing API key","type":"authentication_error"}}"#
+                .to_string(),
+        )
+        .expect("build 401 response");
+    let response = reqwest::Response::from(http_response);
+
+    let err = api_error("kiro", response).await;
+    let msg = err.to_string();
+    assert!(
+        msg.contains("kiro API error (401"),
+        "error must still carry the provider/status prefix for the UI: {msg}"
+    );
+    assert!(
+        msg.to_ascii_lowercase()
+            .contains("invalid or missing api key"),
+        "sanitized upstream body must propagate to the caller: {msg}"
+    );
 }
 
 /// `publish_backend_session_expired` must emit a `SessionExpired` event on

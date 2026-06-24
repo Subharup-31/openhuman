@@ -42,7 +42,7 @@ pub(crate) fn create_worker_thread(
             title: title.to_string(),
             created_at: now.clone(),
             parent_thread_id: Some(parent_thread_id.to_string()),
-            labels: Some(vec!["worker".to_string()]),
+            labels: Some(vec!["tasks".to_string()]),
             personality_id: None,
         },
     )?;
@@ -76,6 +76,33 @@ pub(crate) fn create_worker_thread(
     Ok(worker_thread_id)
 }
 
+pub(crate) fn append_worker_user_message(
+    workspace_dir: PathBuf,
+    worker_thread_id: &str,
+    agent_id: &str,
+    task_id: &str,
+    prompt: &str,
+) -> Result<(), String> {
+    conversations::append_message(
+        workspace_dir,
+        worker_thread_id,
+        ConversationMessage {
+            id: format!("user:{task_id}:{}", uuid::Uuid::new_v4()),
+            content: prompt.to_string(),
+            message_type: "text".to_string(),
+            extra_metadata: json!({
+                "scope": "worker_thread",
+                "agent_id": agent_id,
+                "task_id": task_id,
+                "reused_worker": true,
+            }),
+            sender: "user".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )
+    .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,21 +121,45 @@ mod tests {
         )
         .expect("thread should be created");
 
-        // The new thread is labelled `worker` and linked to the parent — that
-        // link is what hides it from the main sidebar (Workers tab only).
+        // The new thread is labelled `tasks` and linked to the parent so it
+        // stays grouped with delegated task work in the chat sidebar.
         let threads = conversations::list_threads(dir.clone()).unwrap();
         let thread = threads
             .iter()
             .find(|t| t.id == id)
             .expect("thread persisted");
         assert_eq!(thread.parent_thread_id.as_deref(), Some("parent-thread-1"));
-        assert!(thread.labels.contains(&"worker".to_string()));
+        assert!(thread.labels.contains(&"tasks".to_string()));
 
         // It opens with the delegation prompt as the user message, so the
         // drawer can render the parent↔subagent chat from memory on reopen.
-        let messages = conversations::get_messages(dir, &id).unwrap();
+        let messages = conversations::get_messages(dir.clone(), &id).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].sender, "user");
         assert_eq!(messages[0].content, "Find Q3");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn appends_follow_up_prompt_to_existing_worker_thread() {
+        let dir = std::env::temp_dir().join(format!("wt-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = create_worker_thread(
+            dir.clone(),
+            "parent-thread-1",
+            "researcher",
+            "Initial",
+            "Initial prompt",
+        )
+        .unwrap();
+
+        append_worker_user_message(dir.clone(), &id, "researcher", "sub-2", "Follow-up prompt")
+            .unwrap();
+
+        let messages = conversations::get_messages(dir.clone(), &id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].sender, "user");
+        assert_eq!(messages[1].content, "Follow-up prompt");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

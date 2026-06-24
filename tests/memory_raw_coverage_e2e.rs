@@ -71,6 +71,9 @@ fn source_entry(kind: SourceKind, id: &str) -> MemorySourceEntry {
         max_issues: None,
         max_prs: None,
         selector: None,
+        max_tokens_per_sync: None,
+        max_cost_per_sync_usd: None,
+        sync_depth_days: None,
     }
 }
 
@@ -558,6 +561,7 @@ async fn memory_ingestion_state_and_request_models_report_edges() {
             category: "core".into(),
             session_id: Some("session-1".into()),
             document_id: Some("doc-1".into()),
+            taint: openhuman_core::openhuman::memory::MemoryTaint::Internal,
         },
         config: cfg.clone(),
     };

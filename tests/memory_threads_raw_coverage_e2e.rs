@@ -24,7 +24,6 @@ use openhuman_core::openhuman::embeddings::NoopEmbedding;
 use openhuman_core::openhuman::memory::query::{
     MemoryQueryTool, MemoryTreeDrillDownTool, MemoryTreeFetchLeavesTool,
     MemoryTreeIngestDocumentTool, MemoryTreeQuerySourceTool, MemoryTreeSearchEntitiesTool,
-    MemoryTreeWalkTool,
 };
 use openhuman_core::openhuman::memory::tools::{
     MemoryForgetTool, MemoryRecallTool, MemoryStoreTool,
@@ -229,6 +228,9 @@ fn source(kind: SourceKind, id: &str) -> MemorySourceEntry {
         max_issues: None,
         max_prs: None,
         selector: None,
+        max_tokens_per_sync: None,
+        max_cost_per_sync_usd: None,
+        sync_depth_days: None,
     }
 }
 
@@ -463,6 +465,7 @@ Kitchen is north of Garden.
                 category: "core".into(),
                 session_id: Some("session-coverage".into()),
                 document_id: Some("doc-memory-raw-ingestion".into()),
+                taint: openhuman_core::openhuman::memory::MemoryTaint::Internal,
             },
             config: MemoryIngestionConfig::default(),
         })
@@ -532,6 +535,7 @@ Kitchen is north of Garden.
                 category: "core".into(),
                 session_id: None,
                 document_id: Some("doc-memory-raw-ingestion".into()),
+                taint: openhuman_core::openhuman::memory::MemoryTaint::Internal,
             },
             &MemoryIngestionConfig {
                 extraction_mode: openhuman_core::openhuman::memory::ExtractionMode::Chunk,
@@ -1055,7 +1059,6 @@ fn memory_schema_registries_and_query_tool_metadata_cover_public_surfaces() {
         &MemoryTreeDrillDownTool,
         &MemoryTreeFetchLeavesTool,
         &MemoryTreeIngestDocumentTool,
-        &MemoryTreeWalkTool,
     ] {
         assert!(!tool.name().is_empty());
         assert!(!tool.description().is_empty());
@@ -1946,6 +1949,8 @@ fn memory_retrieval_embedding_and_rpc_model_helpers_round_trip() {
         sealed_at: now,
         deleted: false,
         embedding: None,
+        doc_id: None,
+        version_ms: None,
     };
     let tree = Tree {
         id: "tree-1".into(),
@@ -2053,6 +2058,7 @@ fn memory_retrieval_embedding_and_rpc_model_helpers_round_trip() {
         timestamp: now.to_rfc3339(),
         session_id: Some("session-1".into()),
         score: Some(0.9),
+        taint: Default::default(),
     };
     assert_eq!(entry.category.to_string(), "testing");
     let opts = RecallOpts {
@@ -3040,6 +3046,9 @@ async fn memory_sync_provider_trait_defaults_and_connection_hook_are_determinist
         config: Arc::new(config_in(&tmp)),
         toolkit: "raw_coverage".into(),
         connection_id: Some("conn-1".into()),
+        usage: Default::default(),
+        max_items: None,
+        sync_depth_days: None,
     };
     let provider = RawCoverageProvider { fail_profile: true };
     assert_eq!(provider.sync_interval_secs(), Some(15 * 60));
@@ -3170,6 +3179,7 @@ fn turn_state_mirror_persists_progress_edges_from_public_events() {
         task_id: "task-1".into(),
         call_id: "child-call".into(),
         tool_name: "memory.read".into(),
+        arguments: serde_json::Value::Null,
         iteration: 1,
     }));
     assert!(!mirror.observe(&AgentProgress::SubagentToolCallCompleted {
@@ -3179,6 +3189,7 @@ fn turn_state_mirror_persists_progress_edges_from_public_events() {
         tool_name: "memory.read".into(),
         success: true,
         output_chars: 44,
+        output: "child tool output".into(),
         elapsed_ms: 22,
         iteration: 1,
     }));
@@ -3202,6 +3213,7 @@ fn turn_state_mirror_persists_progress_edges_from_public_events() {
             acceptance_criteria: Vec::new(),
             evidence: Vec::new(),
             notes: None,
+            session_thread_id: None,
             blocker: None,
             source_metadata: None,
             order: 0,
@@ -3818,6 +3830,9 @@ async fn memory_sources_registry_rpc_and_schema_handlers_cover_crud_edges() {
         max_issues: None,
         max_prs: None,
         selector: None,
+        max_tokens_per_sync: None,
+        max_cost_per_sync_usd: None,
+        sync_depth_days: None,
     })
     .await
     .unwrap_err();
@@ -3841,6 +3856,9 @@ async fn memory_sources_registry_rpc_and_schema_handlers_cover_crud_edges() {
         max_issues: None,
         max_prs: None,
         selector: None,
+        max_tokens_per_sync: None,
+        max_cost_per_sync_usd: None,
+        sync_depth_days: None,
     })
     .await
     .expect("add folder")
@@ -3865,6 +3883,9 @@ async fn memory_sources_registry_rpc_and_schema_handlers_cover_crud_edges() {
         max_issues: None,
         max_prs: None,
         selector: None,
+        max_tokens_per_sync: None,
+        max_cost_per_sync_usd: None,
+        sync_depth_days: None,
     })
     .await
     .is_ok());
@@ -4364,7 +4385,7 @@ async fn memory_tree_retrieval_rpc_and_schema_wrappers_cover_empty_and_invalid_p
         openhuman_core::openhuman::memory_tree::retrieval::schemas::all_controller_schemas();
     let controllers =
         openhuman_core::openhuman::memory_tree::retrieval::schemas::all_registered_controllers();
-    assert_eq!(schemas.len(), 4);
+    assert_eq!(schemas.len(), 5);
     assert_eq!(schemas.len(), controllers.len());
     assert_eq!(
         openhuman_core::openhuman::memory_tree::retrieval::schemas::schemas("missing").function,
@@ -4601,14 +4622,16 @@ async fn tree_summarizer_ops_cover_validation_query_and_local_provider_guards() 
         )
         .await
         .unwrap_err();
-    assert!(provider_guard.contains("local_ai"));
+    // No local AI + cloud-summarization opt-in defaults off ⇒ the guard names the
+    // local-AI remediation in user-facing prose ("enable local AI ...").
+    assert!(provider_guard.contains("local AI"));
     let rebuild_guard =
         openhuman_core::openhuman::memory_tree::tree_runtime::ops::tree_summarizer_rebuild(
             &config, "ops_ns",
         )
         .await
         .unwrap_err();
-    assert!(rebuild_guard.contains("local_ai"));
+    assert!(rebuild_guard.contains("local AI"));
 }
 
 #[tokio::test]

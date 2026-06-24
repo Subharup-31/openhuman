@@ -1,7 +1,7 @@
 //! Shared types for Composio provider implementations.
 
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::openhuman::composio::client::{
     create_composio_client, direct_execute, ComposioClient, ComposioClientKind,
@@ -29,6 +29,35 @@ impl SyncReason {
             SyncReason::ConnectionCreated => "connection_created",
             SyncReason::Periodic => "periodic",
             SyncReason::Manual => "manual",
+        }
+    }
+}
+
+/// What kind of work an ingested task implies. GitHub's issues-and-PRs
+/// search returns both shapes, and the job differs fundamentally —
+/// *resolve* an issue vs *review* a pull request — so providers tag each
+/// task and the `task_sources` enrichment phrases the objective / agent
+/// prompt accordingly (the triage LLM then knows what to do). Providers
+/// that don't distinguish (notion, linear, clickup) leave this `Generic`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    /// No issue/PR distinction — the default for non-code providers.
+    #[default]
+    Generic,
+    /// A tracker issue: the job is to resolve / implement it.
+    Issue,
+    /// A pull request: the job is to review it (read the diff, give feedback).
+    PullRequest,
+}
+
+impl TaskKind {
+    /// Stable lowercase tag, mirrored into the card's `source_metadata`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskKind::Generic => "generic",
+            TaskKind::Issue => "issue",
+            TaskKind::PullRequest => "pull_request",
         }
     }
 }
@@ -102,6 +131,10 @@ pub struct NormalizedTask {
     pub source_id: String,
     /// Toolkit slug, e.g. `"github"`.
     pub provider: String,
+    /// Whether this task is an issue, a pull request, or undifferentiated.
+    /// Drives intent-aware objective / prompt phrasing in enrichment.
+    #[serde(default)]
+    pub kind: TaskKind,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
@@ -127,6 +160,19 @@ pub struct NormalizedTask {
     pub raw: serde_json::Value,
 }
 
+/// A selectable upstream task container (board / database / list) used to
+/// populate a picker so the user chooses from a list instead of pasting a
+/// raw id. Today this is a Notion database, later a Linear team or ClickUp
+/// list. Surfaced to the task-source UI as `{ id, title }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskContainer {
+    /// Provider-native id (e.g. a Notion database id) used as the filter id.
+    pub id: String,
+    /// Human-readable label for the picker.
+    pub title: String,
+}
+
 /// Provider-agnostic filter passed into
 /// [`super::ComposioProvider::fetch_tasks`].
 ///
@@ -136,12 +182,33 @@ pub struct NormalizedTask {
 /// `database_id`; linear/clickup read `team_id`; …) and ignores the
 /// rest. `extra` is a free-form escape hatch surfaced in the UI for
 /// advanced provider-native query fragments.
+/// How the GitHub task-source fetch reaches GitHub. Shipped desktop users
+/// connect GitHub via Composio OAuth (no `gh` on PATH, no `GITHUB_TOKEN`),
+/// while local dev / self-host setups often have the reverse. `Auto` does the
+/// right thing for both; `Composio` / `Local` force a path when the user wants.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubFetchMode {
+    /// Try the connected Composio account first; fall back to local `gh`/REST
+    /// only when Composio is unavailable. The safe default — no regression for
+    /// shipped users, still a true fallback for local/dev.
+    #[default]
+    Auto,
+    /// Force the connected Composio account (classic shipped-app behaviour).
+    Composio,
+    /// Force local `gh` CLI / REST with a `GH_TOKEN`/`GITHUB_TOKEN` env token.
+    Local,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskFetchFilter {
     /// Scope to items assigned to (or involving) the authenticated user.
     #[serde(default)]
     pub assignee_is_me: bool,
+    /// GitHub fetch path selector (Composio vs local `gh`/REST). Default `Auto`.
+    #[serde(default)]
+    pub github_fetch_mode: GithubFetchMode,
     /// GitHub `owner/name` repository scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
@@ -196,11 +263,50 @@ impl TaskFetchFilter {
 /// keeps an [`Arc<Config>`] and resolves the underlying client per call
 /// through [`ProviderContext::execute`], mirroring the agent-tool
 /// migration in [`crate::openhuman::composio::tools::ComposioExecuteTool`].
+/// Per-sync accumulator for Composio billable-action usage.
+///
+/// Lives behind a shared handle on [`ProviderContext`] so the single
+/// `execute` chokepoint can tally every action a provider fires during one
+/// sync run, regardless of which provider (gmail / slack / github / notion /
+/// linear / clickup) or how many pages it paginates.
+/// [`crate::openhuman::memory_sync::composio::run_connection_sync`] returns
+/// the final tally alongside the [`SyncOutcome`] for the sync audit log
+/// (#3111).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ComposioUsage {
+    /// Count of `execute` calls that returned a response this run.
+    pub actions_called: u32,
+    /// Sum of each response's backend-reported `cost_usd`.
+    pub cost_usd: f64,
+}
+
+/// Shared, interior-mutable handle to a [`ComposioUsage`] tally. Cloning a
+/// [`ProviderContext`] shares the same underlying counter, so the count is
+/// stable no matter how the context is passed around within a sync.
+pub type ComposioUsageHandle = Arc<Mutex<ComposioUsage>>;
+
 #[derive(Clone)]
 pub struct ProviderContext {
     pub config: Arc<Config>,
     pub toolkit: String,
     pub connection_id: Option<String>,
+    /// Accumulates Composio billable-action usage across this context's
+    /// lifetime. Defaulted at every construction site; only the sync path
+    /// (`run_connection_sync`) reads it back. Non-sync callers (agent tools,
+    /// task-source fetches) leave it at zero — harmless.
+    pub usage: ComposioUsageHandle,
+    /// Maximum items to fetch in a single sync pass.
+    ///
+    /// Set from the corresponding `MemorySourceEntry.max_items` field at
+    /// sync-dispatch time. `None` means no cap beyond the provider's own
+    /// internal upper bounds.
+    pub max_items: Option<u32>,
+    /// Maximum sync depth window in days.
+    ///
+    /// Set from `MemorySourceEntry.sync_depth_days`. When `Some(n)`, the
+    /// provider only fetches items from the last `n` days. `None` means
+    /// no additional depth restriction beyond the provider's cursor.
+    pub sync_depth_days: Option<u32>,
 }
 
 impl ProviderContext {
@@ -230,6 +336,9 @@ impl ProviderContext {
                 config,
                 toolkit: toolkit.into(),
                 connection_id,
+                usage: ComposioUsageHandle::default(),
+                max_items: None,
+                sync_depth_days: None,
             }),
             Err(e) => {
                 tracing::debug!(
@@ -282,7 +391,7 @@ impl ProviderContext {
                 anyhow::anyhow!("composio provider_context: failed to reload live config: {e}")
             })?;
         let kind = create_composio_client(&live_config)?;
-        match kind {
+        let result = match kind {
             ComposioClientKind::Backend(client) => {
                 tracing::debug!(
                     action = %action,
@@ -297,9 +406,30 @@ impl ProviderContext {
                     toolkit = %self.toolkit,
                     "[composio:provider_context] execute: direct variant"
                 );
-                direct_execute(&direct, action, arguments, &live_config.composio.entity_id).await
+                direct_execute(
+                    &direct,
+                    action,
+                    arguments,
+                    &live_config.composio.entity_id,
+                    self.connection_id.as_deref(),
+                )
+                .await
+            }
+        };
+
+        // Tally billable-action usage at the single chokepoint every provider
+        // routes through (#3111). We count any *completed* round-trip — even a
+        // provider-reported failure (`successful == false`) is a billable call
+        // — and sum the backend-reported `cost_usd`. Transport errors (the
+        // `Err` arm) never reached Composio, so they don't count. The lock is
+        // held only for the increment, never across an `.await`.
+        if let Ok(ref resp) = result {
+            if let Ok(mut usage) = self.usage.lock() {
+                usage.actions_called = usage.actions_called.saturating_add(1);
+                usage.cost_usd += resp.cost_usd;
             }
         }
+        result
     }
 
     /// Resolve a `ComposioClient` for callers that need a handle to
@@ -364,6 +494,48 @@ impl ProviderContext {
 mod tests {
     use super::*;
 
+    /// The whole #3111 tally relies on the `usage` handle being *shared*
+    /// across `ProviderContext` clones: a provider's `sync` runs against a
+    /// clone (or the same ctx passed by `&`), accumulates via `execute`, and
+    /// `run_connection_sync` reads the count back from its own handle. Pin
+    /// that the `Arc<Mutex<_>>` is genuinely shared so a clone's increments
+    /// are visible from the original — if this regressed to a per-clone
+    /// counter, the audit cost would silently always read zero.
+    #[test]
+    fn usage_handle_is_shared_across_context_clones() {
+        let ctx = ProviderContext {
+            config: Arc::new(Config::default()),
+            toolkit: "gmail".to_string(),
+            connection_id: None,
+            usage: ComposioUsageHandle::default(),
+            max_items: None,
+            sync_depth_days: None,
+        };
+        let cloned = ctx.clone();
+
+        // Simulate two `execute` round-trips accumulating on the clone.
+        {
+            let mut usage = cloned.usage.lock().expect("lock usage");
+            usage.actions_called = usage.actions_called.saturating_add(2);
+            usage.cost_usd += 0.015;
+        }
+
+        // The original handle must observe the clone's tally.
+        let observed = ctx.usage.lock().expect("lock usage");
+        assert_eq!(observed.actions_called, 2);
+        assert!((observed.cost_usd - 0.015).abs() < 1e-9);
+    }
+
+    /// `ComposioUsage` defaults to a zero tally — the value
+    /// `run_connection_sync` returns for a sync that fired no Composio
+    /// actions, and what non-sync `ProviderContext` callers carry.
+    #[test]
+    fn composio_usage_defaults_to_zero() {
+        let usage = ComposioUsage::default();
+        assert_eq!(usage.actions_called, 0);
+        assert_eq!(usage.cost_usd, 0.0);
+    }
+
     // `ProviderContext::execute` and `ProviderContext::backend_client` reload
     // config from `ctx.config.config_path` (via `reload_config_snapshot_with_timeout`)
     // rather than from the process-global `OPENHUMAN_WORKSPACE`. Tests
@@ -392,6 +564,9 @@ mod tests {
             config: Arc::new(config),
             toolkit: "gmail".to_string(),
             connection_id: None,
+            usage: ComposioUsageHandle::default(),
+            max_items: None,
+            sync_depth_days: None,
         };
         let res = ctx.execute("GMAIL_FETCH_EMAILS", None).await;
         // The actual HTTP call will fail in the unit-test sandbox, but
@@ -424,6 +599,9 @@ mod tests {
             config: Arc::new(config),
             toolkit: "gmail".to_string(),
             connection_id: None,
+            usage: ComposioUsageHandle::default(),
+            max_items: None,
+            sync_depth_days: None,
         };
         let res = ctx.execute("GMAIL_FETCH_EMAILS", None).await;
         let err = res.expect_err("no backend session must error");

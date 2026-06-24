@@ -38,6 +38,8 @@ fn mk_running_job(kind: JobKind, payload_json: String) -> Job {
         created_at_ms: now_ms,
         started_at_ms: Some(now_ms),
         completed_at_ms: None,
+        failure_reason: None,
+        failure_class: None,
     }
 }
 
@@ -132,7 +134,12 @@ async fn reembed_backfill_repopulates_then_completes() {
         chunk_id, Chunk, Metadata, SourceKind, SourceRef,
     };
 
-    let (_tmp, cfg) = test_config();
+    let (_tmp, mut cfg) = test_config();
+    // Deliberate "none" opt-out → build_write_embedder yields an InertEmbedder
+    // (correct-dim zero vectors, no network). This test pins backfill
+    // *mechanics* (worklist → sidecar write → Defer/Done), not embed quality;
+    // the no-provider skip path is covered separately.
+    cfg.embeddings_provider = Some("none".to_string());
     let ts = chrono::Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
     let chunk = Chunk {
         id: chunk_id(SourceKind::Chat, "slack:#eng", 0, "reembed-seed"),
@@ -212,6 +219,85 @@ async fn reembed_backfill_repopulates_then_completes() {
     );
 }
 
+/// #002 (FR-002) regression gate: when NO usable embeddings provider is
+/// configured, the re-embed backfill must SKIP (return `Done`) instead of
+/// falling back to an `InertEmbedder` and persisting all-zero vectors that
+/// would silently poison semantic recall — the same hazard the extract and
+/// seal write paths already guard against. The chunk stays embedding-less at
+/// the active signature (re-embeddable once a provider is configured).
+#[tokio::test]
+async fn reembed_backfill_skips_when_no_provider() {
+    use crate::openhuman::memory_store::chunks::store::{
+        get_chunk_embedding_for_signature, tree_active_signature, upsert_chunks,
+        upsert_staged_chunks_tx,
+    };
+    use crate::openhuman::memory_store::chunks::types::{
+        chunk_id, Chunk, Metadata, SourceKind, SourceRef,
+    };
+
+    // Default test config leaves embeddings unconfigured (no endpoint/model,
+    // provider unset) — the no-provider path build_write_embedder guards.
+    //
+    // Hold the shared health test-guard: the no-provider path marks the
+    // process-global semantic-recall degraded flag, so the guard resets it on
+    // entry and keeps the signal from leaking into parallel status tests.
+    let _health_guard = crate::openhuman::memory_tree::health::test_guard();
+    let (_tmp, cfg) = test_config();
+    let ts = chrono::Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+    let chunk = Chunk {
+        id: chunk_id(SourceKind::Chat, "slack:#eng", 0, "no-provider-seed"),
+        content: "memory content with no embeddings provider configured".into(),
+        metadata: Metadata {
+            source_kind: SourceKind::Chat,
+            source_id: "slack:#eng".into(),
+            owner: "alice".into(),
+            timestamp: ts,
+            time_range: (ts, ts),
+            tags: vec![],
+            source_ref: Some(SourceRef::new("slack://x")),
+            path_scope: None,
+        },
+        token_count: 12,
+        seq_in_source: 0,
+        created_at: ts,
+        partial_message: false,
+    };
+    upsert_chunks(&cfg, &[chunk.clone()]).unwrap();
+    let content_root = cfg.memory_tree_content_root();
+    std::fs::create_dir_all(&content_root).unwrap();
+    let staged = content_store::stage_chunks(&content_root, &[chunk.clone()]).unwrap();
+    with_connection(&cfg, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        upsert_staged_chunks_tx(&tx, &staged)?;
+        tx.commit()?;
+        Ok(())
+    })
+    .unwrap();
+
+    let sig = tree_active_signature(&cfg);
+    let job = mk_running_job(
+        JobKind::ReembedBackfill,
+        serde_json::to_string(&ReembedBackfillPayload {
+            signature: sig.clone(),
+        })
+        .unwrap(),
+    );
+
+    // No provider → skip the whole backfill (Done), do NOT write a vector.
+    let out = handle_reembed_backfill(&cfg, &job).await.unwrap();
+    assert_eq!(
+        out,
+        JobOutcome::Done,
+        "no usable provider must skip the backfill, not Defer/embed"
+    );
+    assert!(
+        get_chunk_embedding_for_signature(&cfg, &chunk.id, &sig)
+            .unwrap()
+            .is_none(),
+        "no zero/inert vector may be persisted when no provider is configured"
+    );
+}
+
 /// #1574 §6 regression gate: a terminal-failure chunk (its body file is
 /// missing on disk, despite the metadata row staying staged) is
 /// persistently tombstoned by `mark_chunk_reembed_skipped` on the first
@@ -237,7 +323,11 @@ async fn reembed_backfill_tombstones_orphan_and_terminates() {
         chunk_id, Chunk, Metadata, SourceKind, SourceRef,
     };
 
-    let (_tmp, cfg) = test_config();
+    let (_tmp, mut cfg) = test_config();
+    // Deliberate "none" opt-out → InertEmbedder (zero vectors, no network) so
+    // the backfill reaches the orphan body-read and tombstones it; this test
+    // pins the tombstone-and-terminate mechanics, not embed quality.
+    cfg.embeddings_provider = Some("none".to_string());
     let ts = chrono::Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
     let chunk = Chunk {
         id: chunk_id(SourceKind::Chat, "slack:#eng", 0, "orphan-seed"),
@@ -479,5 +569,114 @@ async fn ensure_reembed_backfill_enqueues_only_when_uncovered() {
         count_jobs_of_kind(&cfg, "reembed_backfill"),
         1,
         "re-call must dedupe to a single chain per signature"
+    );
+}
+
+/// `cap_embed_text` must bound an over-budget body to `EMBED_SAFE_TOKENS` before
+/// it is batched for embedding, and pass small bodies through verbatim, so no
+/// single `embed_batch` input can exceed the embedder's input limit.
+#[test]
+fn cap_embed_text_bounds_oversized_input() {
+    use crate::openhuman::memory_store::chunks::types::conservative_token_estimate;
+
+    // Punctuation-dense body (~1 token/char) far over the embed budget.
+    let big = "x,".repeat(EMBED_SAFE_TOKENS as usize);
+    assert!(conservative_token_estimate(&big) > EMBED_SAFE_TOKENS);
+    let capped = cap_embed_text(&big);
+    assert!(capped.len() < big.len(), "oversized body must be truncated");
+    assert!(
+        conservative_token_estimate(capped) <= EMBED_SAFE_TOKENS,
+        "capped body must be within the embed budget",
+    );
+    assert!(big.starts_with(capped), "cap must return a leading prefix");
+
+    // A small body is returned unchanged.
+    let small = "hello world";
+    assert_eq!(cap_embed_text(small), small);
+}
+
+/// C9: `prepare_extract` must score over the **full** on-disk body but leave
+/// the returned `PreparedExtract.chunk` holding only the ≤500-char preview —
+/// never the full body. This is the swap-then-restore guarantee that keeps a
+/// batch of N prepared items from retaining N full bodies in memory before
+/// finalize. We assert the body is read from disk (a body longer than the
+/// preview) yet the returned chunk content equals the preview again.
+#[tokio::test]
+async fn prepare_extract_scores_full_body_but_returns_preview() {
+    use crate::openhuman::memory::chat::{test_override, StaticChatProvider};
+    use crate::openhuman::memory_queue::types::ExtractChunkPayload;
+    use crate::openhuman::memory_store::chunks::store::upsert_chunks;
+    use crate::openhuman::memory_store::chunks::types::{
+        chunk_id, Chunk, Metadata, SourceKind, SourceRef,
+    };
+    use std::sync::Arc;
+
+    let (_tmp, cfg) = test_config();
+    let ts = chrono::Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+
+    // Full body is > 500 chars so the stored preview is a strict prefix and
+    // is observably different from the body the scorer reads off disk.
+    let body: String = "the quarterly planning notes from the engineering sync covering rollout sequencing and staffing. "
+        .repeat(12);
+    assert!(body.len() > 500, "test body must exceed the preview cap");
+    let expected_preview: String = body.chars().take(500).collect();
+
+    let chunk = Chunk {
+        id: chunk_id(SourceKind::Chat, "slack:#eng", 0, "c9-extract-seed"),
+        content: body.clone(),
+        metadata: Metadata {
+            source_kind: SourceKind::Chat,
+            source_id: "slack:#eng".into(),
+            owner: "alice".into(),
+            timestamp: ts,
+            time_range: (ts, ts),
+            tags: vec![],
+            source_ref: Some(SourceRef::new("slack://x")),
+            path_scope: None,
+        },
+        token_count: 64,
+        seq_in_source: 0,
+        created_at: ts,
+        partial_message: false,
+    };
+    // upsert_chunks stores only the ≤500-char preview in the `content` column.
+    upsert_chunks(&cfg, &[chunk.clone()]).unwrap();
+    // Stage the full body to disk so `read_chunk_body` returns it.
+    let content_root = cfg.memory_tree_content_root();
+    std::fs::create_dir_all(&content_root).unwrap();
+    let staged = content_store::stage_chunks(&content_root, &[chunk.clone()]).unwrap();
+    with_connection(&cfg, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        crate::openhuman::memory_store::chunks::store::upsert_staged_chunks_tx(&tx, &staged)?;
+        tx.commit()?;
+        Ok(())
+    })
+    .unwrap();
+
+    let payload = ExtractChunkPayload {
+        chunk_id: chunk.id.clone(),
+    };
+    let job = mk_running_job(
+        JobKind::ExtractChunk,
+        serde_json::to_string(&payload).unwrap(),
+    );
+
+    // Pin a static (offline) chat provider so any borderline LLM consult is
+    // deterministic and never touches the network.
+    let prepared = test_override::with_provider(
+        Arc::new(StaticChatProvider::new("[]")),
+        prepare_extract(&cfg, &job),
+    )
+    .await
+    .unwrap()
+    .expect("seeded chunk must produce a PreparedExtract");
+
+    assert_eq!(
+        prepared.chunk.content, expected_preview,
+        "returned chunk must hold the restored preview, not the full body"
+    );
+    assert_ne!(
+        prepared.chunk.content, body,
+        "returned chunk must NOT retain the full on-disk body"
     );
 }

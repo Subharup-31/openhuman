@@ -36,11 +36,19 @@ export const LEVEL_COLOR = [
 export const LEAF_COLOR = '#94A3B8'; // raw chunks / leaves (no level)
 export const CONTACT_COLOR = '#A78BFA'; // person entities (contacts mode)
 export const SOURCE_COLOR = '#F97316'; // synthetic source root nodes
+export const ROOT_COLOR = '#8B5CF6'; // master root hub (purple)
 
 /** Layout is computed in this fixed coordinate space; the renderer pans/zooms it. */
 export const VIEWPORT_W = 1100;
 export const VIEWPORT_H = 640;
-export const ZOOM_MIN = 0.3;
+// Lower bound shared by auto-fit framing and manual wheel zoom-out. Kept very
+// small (20× zoom-out) so large clouds — e.g. a Notion connection's hundreds
+// of page-chunk leaves — can be framed in full. At 0.3 the auto-fit was
+// clamped above the scale needed to show every node, so big graphs rendered
+// "too zoomed in" with the outer nodes spilling off-screen. Using one shared
+// floor (rather than a separate, lower auto-fit floor) avoids a zoom-snap
+// where the first wheel tick would jump back up to the manual floor.
+export const ZOOM_MIN = 0.05;
 export const ZOOM_MAX = 4;
 
 export function levelColor(level: number | null | undefined): string {
@@ -49,6 +57,7 @@ export function levelColor(level: number | null | undefined): string {
 }
 
 export function nodeColor(node: GraphNode): string {
+  if (node.kind === 'root') return ROOT_COLOR;
   if (node.kind === 'source') return SOURCE_COLOR;
   if (node.kind === 'summary') return levelColor(node.level);
   if (node.kind === 'contact') return CONTACT_COLOR;
@@ -56,8 +65,18 @@ export function nodeColor(node: GraphNode): string {
 }
 
 export function nodeRadius(node: GraphNode): number {
+  if (node.kind === 'root') return 20;
   if (node.kind === 'source') return 16;
-  if (node.kind === 'summary') return 5 + (node.level ?? 0) * 2.5;
+  if (node.kind === 'summary') {
+    // Higher levels render slightly larger, but the size MUST be capped:
+    // document source trees place their cross-document merge tier at a large
+    // synthetic level (MERGE_LEVEL_BASE = 1000+), so the raw `level * 2.5`
+    // would explode to thousands of px — rendering giant discs and, via the
+    // `forceCollide(nodeRadius + 2)` term, blowing the whole layout apart.
+    // The cap keeps merge nodes the largest summaries without distorting it.
+    const level = node.level ?? 0;
+    return Math.min(5 + level * 2.5, 14);
+  }
   if (node.kind === 'contact') return 9;
   return 3; // chunk / document leaf
 }
@@ -80,18 +99,35 @@ export type SimLink = SimulationLinkDatum<SimNode>;
  * Tree mode draws an edge from each node to its `parent_id`; contacts mode
  * uses the explicit `edges`. Dangling endpoints are dropped.
  */
+export const ROOT_NODE_ID = '__root__';
+
 export function buildGraph(
   nodes: GraphNode[],
   edges: GraphEdge[],
   mode: GraphMode
 ): { simNodes: SimNode[]; links: SimLink[] } {
   const ids = new Set(nodes.map(n => n.id));
-  const simNodes: SimNode[] = nodes.map((n, i) => {
+
+  // Synthetic master root at the origin — all source nodes fan out from it.
+  const rootNode: SimNode = { kind: 'root', id: ROOT_NODE_ID, label: 'Memory', x: 0, y: 0 };
+
+  const simNodes: SimNode[] = [rootNode];
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
     const angle = (i / Math.max(1, nodes.length)) * Math.PI * 2;
     const r = 180 + (i % 7) * 14;
-    return { ...n, x: Math.cos(angle) * r, y: Math.sin(angle) * r };
-  });
+    simNodes.push({ ...n, x: Math.cos(angle) * r, y: Math.sin(angle) * r });
+  }
+
   const links: SimLink[] = [];
+
+  // Link every source node to the master root.
+  for (const n of nodes) {
+    if (n.kind === 'source') {
+      links.push({ source: n.id, target: ROOT_NODE_ID });
+    }
+  }
+
   if (mode === 'tree') {
     for (const n of nodes) {
       if (!n.parent_id || !ids.has(n.parent_id) || !ids.has(n.id)) continue;
@@ -116,18 +152,37 @@ export function createSimulation(
   links: SimLink[]
 ): Simulation<SimNode, SimLink> {
   return forceSimulation(simNodes)
-    .force('charge', forceManyBody<SimNode>().strength(-140).distanceMax(420))
+    .force(
+      'charge',
+      forceManyBody<SimNode>()
+        .strength(n => {
+          if (n.kind === 'root') return -650;
+          if (n.kind === 'source') return -280;
+          return -140;
+        })
+        .distanceMax(300)
+    )
     .force(
       'link',
       forceLink<SimNode, SimLink>(links)
         .id(d => d.id)
-        .distance(58)
-        .strength(0.35)
+        .distance(link => {
+          const src = link.source as SimNode;
+          const tgt = link.target as SimNode;
+          if (src.kind === 'root' || tgt.kind === 'root') return 90;
+          if (src.kind === 'source' || tgt.kind === 'source') return 40;
+          return 22;
+        })
+        .strength(0.7)
     )
-    .force('center', forceCenter(0, 0).strength(0.04))
+    .force('center', forceCenter(0, 0).strength(0.12))
     .force(
       'collide',
-      forceCollide<SimNode>().radius(n => nodeRadius(n) + 2)
+      forceCollide<SimNode>().radius(n => {
+        if (n.kind === 'root') return 80;
+        if (n.kind === 'source') return 40;
+        return nodeRadius(n) + 2;
+      })
     )
     .stop();
 }

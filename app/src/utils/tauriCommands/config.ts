@@ -1,6 +1,7 @@
 /**
  * Config and settings commands.
  */
+import { invoke } from '@tauri-apps/api/core';
 import debug from 'debug';
 
 import { callCoreRpc } from '../../services/coreRpcClient';
@@ -48,6 +49,18 @@ export interface CloudProviderCreds {
   auth_style: AuthStyle;
 }
 
+/**
+ * Per-model registry entry. Mirrors the Rust `ModelRegistryEntry`
+ * (`config/schema/types.rs`). Carries the user-set `vision` flag that lets a
+ * custom/BYOK model accept chat image attachments.
+ */
+export interface ModelRegistryEntry {
+  id: string;
+  provider: string;
+  cost_per_1m_output: number;
+  vision: boolean;
+}
+
 export interface ModelSettingsUpdate {
   /**
    * OpenHuman product backend URL. Almost always left untouched; the
@@ -76,6 +89,12 @@ export interface ModelSettingsUpdate {
    * Each entry: { id?, slug, label?, endpoint, auth_style? }
    */
   cloud_providers?: CloudProviderCreds[] | null;
+  /**
+   * When present, REPLACES `config.model_registry` wholesale. Carries each
+   * model's `vision` flag (Settings → Advanced LLM → custom model → "Supports
+   * vision"). Send `[]` to clear; omit to leave untouched.
+   */
+  model_registry?: ModelRegistryEntry[] | null;
   /** @deprecated No longer used — slug-based routing replaces primary_cloud. */
   primary_cloud?: string | null;
   /** Per-workload provider strings — see Rust `providers::factory` grammar. */
@@ -83,6 +102,7 @@ export interface ModelSettingsUpdate {
   reasoning_provider?: string | null;
   agentic_provider?: string | null;
   coding_provider?: string | null;
+  vision_provider?: string | null;
   memory_provider?: string | null;
   embeddings_provider?: string | null;
   heartbeat_provider?: string | null;
@@ -148,6 +168,12 @@ export interface LocalAiSettingsUpdate {
   opt_in_confirmed?: boolean | null;
   provider?: string | null;
   base_url?: string | null;
+  /**
+   * Bearer credential for OpenAI-compatible local runtimes that require a key
+   * (e.g. OMLX). Stored in `config.local_ai.api_key` and sent as a Bearer token
+   * on inference. Keyless runtimes (Ollama / LM Studio) omit this.
+   */
+  api_key?: string | null;
   model_id?: string | null;
   chat_model_id?: string | null;
   usage_embeddings?: boolean | null;
@@ -214,13 +240,25 @@ export interface ClientConfig {
   model_routes: ModelRoute[];
   /** Configured cloud providers (no API keys — those live in auth-profiles.json). */
   cloud_providers: CloudProviderCreds[];
+  /** Per-model registry carrying each model's `vision` flag. */
+  model_registry: ModelRegistryEntry[];
   /** Id of the `cloud_providers` entry resolved by the `"cloud"` sentinel. */
   primary_cloud: string | null;
+  /**
+   * #3767: authoritative, core-side per-tier flags — for each chat-mode tier
+   * (`chat` = Quick mode, `reasoning` = Reasoning mode), true when that tier runs
+   * on a non-managed provider the user funds themselves (a usable BYO key, local
+   * runtime, or claude-code). The UI checks whichever tier the user has selected;
+   * when true the "buy credits" prompt is suppressed for that mode. Optional for
+   * back-compat with older snapshots.
+   */
+  credits_bypass?: { chat?: boolean; reasoning?: boolean };
   /** Per-workload provider strings (e.g. `"cloud"`, `"ollama:llama3.1:8b"`, `"openai:gpt-4o"`). */
   chat_provider: string | null;
   reasoning_provider: string | null;
   agentic_provider: string | null;
   coding_provider: string | null;
+  vision_provider: string | null;
   memory_provider: string | null;
   embeddings_provider: string | null;
   heartbeat_provider: string | null;
@@ -235,6 +273,127 @@ export async function openhumanGetClientConfig(): Promise<CommandResponse<Client
   return await callCoreRpc<CommandResponse<ClientConfig>>({
     method: 'openhuman.inference_get_client_config',
   });
+}
+
+/**
+ * Status payload for the Claude Code CLI provider — mirrors Rust
+ * `claude_code::types::CliStatus`. The `status` discriminator is the
+ * snake_case Serde rename; `path` and `version` may be absent depending
+ * on which variant fired.
+ */
+export type ClaudeCodeStatus =
+  | { status: 'ok'; version: string; path: string }
+  | { status: 'not_installed' }
+  | { status: 'outdated'; version: string; min_required: string; path: string }
+  | { status: 'unusable'; path: string; reason: string };
+
+/**
+ * Probe the local `claude` CLI binary (Claude Code CLI provider). Returns
+ * install + version status; never throws on a missing binary — the
+ * `not_installed` variant signals that case explicitly.
+ */
+export async function openhumanClaudeCodeStatus(): Promise<CommandResponse<ClaudeCodeStatus>> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+  return await callCoreRpc<CommandResponse<ClaudeCodeStatus>>({
+    method: 'openhuman.inference_claude_code_status',
+  });
+}
+
+/**
+ * Auth state for the Claude Code CLI provider — mirrors Rust
+ * `claude_code::auth_status::AuthSource`. The `source` discriminator is
+ * the snake_case Serde rename. `account_email` / `subscription_type` /
+ * `expires_at` are best-effort: absent when the CLI's auth-status schema
+ * drifts. `unknown` means we couldn't determine the state (binary missing,
+ * spawn failed, or a CLI older than `auth status`) — it is NEVER signed-out.
+ */
+export type ClaudeCodeAuthStatus =
+  | {
+      source: 'subscription';
+      account_email: string | null;
+      subscription_type: string | null;
+      expires_at: string | null;
+      last_checked: number;
+    }
+  | { source: 'api_key_env'; last_checked: number }
+  | { source: 'none'; last_checked: number }
+  | { source: 'unknown'; reason: string | null; last_checked: number };
+
+/**
+ * Detect Claude Code CLI auth state via `claude auth status --json`
+ * (cross-platform: abstracts the macOS Keychain vs. Linux/Windows file
+ * stores), or `ANTHROPIC_API_KEY` env. Spawns the CLI — call on-demand /
+ * Recheck, not on a tight loop.
+ */
+export async function openhumanClaudeCodeAuthStatus(): Promise<ClaudeCodeAuthStatus> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+  // The core handler returns the value via `RpcOutcome::new(_, vec![])` with no
+  // logs, which `into_cli_compatible_json` serializes as the BARE value (not a
+  // `{ result, logs }` envelope). `callCoreRpc` returns the JSON-RPC `result`,
+  // so this resolves directly to the AuthStatus — do NOT read `.result`.
+  return await callCoreRpc<ClaudeCodeAuthStatus>({
+    method: 'openhuman.inference_claude_code_auth_status',
+  });
+}
+
+/**
+ * Persisted Claude Code provider settings — mirrors Rust
+ * `claude_code::settings::ClaudeCodeSettings`. `full_access=true` runs the
+ * CLI with `--permission-mode bypassPermissions` + its full native toolset
+ * (Bash/network/subagents); `false` (default) is the safer `acceptEdits`
+ * posture (auto-apply file edits, gate the rest). On macOS the Seatbelt jail
+ * still walls off `~/.openhuman` in either mode.
+ */
+export interface ClaudeCodeSettings {
+  full_access: boolean;
+}
+
+/**
+ * Read the persisted Claude Code full-access toggle. Bare value (no
+ * `{ result, logs }` envelope) — see {@link openhumanClaudeCodeAuthStatus}.
+ */
+export async function openhumanClaudeCodeSettings(): Promise<ClaudeCodeSettings> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+  return await callCoreRpc<ClaudeCodeSettings>({
+    method: 'openhuman.inference_claude_code_settings',
+  });
+}
+
+/**
+ * Persist the Claude Code full-access toggle. Returns the saved settings.
+ * Takes effect on the next chat turn (the driver reads the file per-turn).
+ */
+export async function openhumanClaudeCodeSetFullAccess(
+  enabled: boolean
+): Promise<ClaudeCodeSettings> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+  return await callCoreRpc<ClaudeCodeSettings>({
+    method: 'openhuman.inference_claude_code_set_full_access',
+    params: { enabled },
+  });
+}
+
+/**
+ * Open the user's native terminal and run `claude login` inside it. The
+ * CLI's OAuth flow is interactive, so we can't host it in-app — we
+ * detach into a terminal window and let the user complete the flow
+ * there, then click Recheck back in the settings card.
+ *
+ * Returns the name of the terminal emulator that was launched.
+ */
+export async function openhumanClaudeCodeLoginLaunch(): Promise<string> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+  return await invoke<string>('claude_code_login_launch');
 }
 
 export async function openhumanUpdateModelSettings(
@@ -345,6 +504,54 @@ export async function openhumanGetAutonomySettings(): Promise<CommandResponse<Au
   });
 }
 
+/**
+ * Agent filesystem roots returned by `config_get_agent_paths`. All three are
+ * already-canonicalised path strings; the UI renders them verbatim instead of
+ * hard-coding defaults like `~/OpenHuman/projects`.
+ *
+ * - `action_dir` — agent CWD for `shell` / `node_exec` / `npm_exec` / file
+ *   writes. Defaults to `projects_dir`; overridable via `OPENHUMAN_ACTION_DIR`.
+ * - `workspace_dir` — internal product state (memory / sessions / vault).
+ *   Agent-blocked.
+ * - `projects_dir` — default projects home; matches `action_dir` when no
+ *   override is set.
+ * - `action_dir_source` — where the effective `action_dir` came from:
+ *   `'env'` (pinned by OPENHUMAN_ACTION_DIR — UI must disable editing),
+ *   `'override'` (a persisted user choice), or `'default'`.
+ */
+export interface AgentPaths {
+  action_dir: string;
+  workspace_dir: string;
+  projects_dir: string;
+  action_dir_source: 'env' | 'override' | 'default';
+}
+
+export async function openhumanGetAgentPaths(): Promise<CommandResponse<AgentPaths>> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+  return await callCoreRpc<CommandResponse<AgentPaths>>({
+    method: CORE_RPC_METHODS.configGetAgentPaths,
+  });
+}
+
+/** Partial update for the agent's editable filesystem roots (issue #3240). */
+export interface AgentPathsUpdate {
+  action_dir?: string;
+}
+
+export async function openhumanUpdateAgentPaths(
+  update: AgentPathsUpdate
+): Promise<CommandResponse<AgentPaths>> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+  return await callCoreRpc<CommandResponse<AgentPaths>>({
+    method: CORE_RPC_METHODS.configUpdateAgentPaths,
+    params: update,
+  });
+}
+
 export async function openhumanUpdateAutonomySettings(
   update: AutonomySettingsUpdate
 ): Promise<CommandResponse<ConfigSnapshot>> {
@@ -353,6 +560,100 @@ export async function openhumanUpdateAutonomySettings(
   }
   return await callCoreRpc<CommandResponse<ConfigSnapshot>>({
     method: CORE_RPC_METHODS.configUpdateAutonomySettings,
+    params: update,
+  });
+}
+
+// ── Sandbox execution backend settings ───────────────────────────────────────
+
+export type SandboxBackendId = 'auto' | 'docker' | 'landlock' | 'firejail' | 'bubblewrap' | 'none';
+
+/** Current sandbox settings returned by config_get_sandbox_settings. */
+export interface SandboxSettings {
+  enabled: boolean;
+  backend: SandboxBackendId;
+  docker_image: string;
+  docker_memory_limit_mb: number | null;
+  docker_cpu_limit: number | null;
+  docker_available: boolean;
+  detected_backend: string;
+  env_passthrough: string[];
+}
+
+/** Partial update — omitted fields are left unchanged. */
+export interface SandboxSettingsUpdate {
+  backend?: SandboxBackendId;
+  enabled?: boolean;
+  docker_image?: string;
+  docker_memory_limit_mb?: number | null;
+  docker_cpu_limit?: number | null;
+  env_passthrough?: string[];
+}
+
+export async function openhumanGetSandboxSettings(): Promise<CommandResponse<SandboxSettings>> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+  return await callCoreRpc<CommandResponse<SandboxSettings>>({
+    method: CORE_RPC_METHODS.configGetSandboxSettings,
+  });
+}
+
+export async function openhumanUpdateSandboxSettings(
+  update: SandboxSettingsUpdate
+): Promise<CommandResponse<ConfigSnapshot>> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+  return await callCoreRpc<CommandResponse<ConfigSnapshot>>({
+    method: CORE_RPC_METHODS.configUpdateSandboxSettings,
+    params: update,
+  });
+}
+
+// ── Memory sync schedule (#3302) ─────────────────────────────────────────────
+
+/** Global memory-sync schedule returned by config_get_memory_sync_settings. */
+export interface MemorySyncSettings {
+  /** Stored value: null = use the default cadence, 0 = Manual only, n>0 = seconds. */
+  sync_interval_secs: number | null;
+  /** Resolved cadence to highlight in the UI (the default when unset; 0 for manual). */
+  selected_secs: number;
+  /** True when the user picked "Manual only" (stored value is 0). */
+  is_manual: boolean;
+  /** True when no explicit choice is stored (falls back to `default_secs`). */
+  is_default: boolean;
+  /** The effective default cadence (seconds) applied when unset (24h). */
+  default_secs: number;
+  /** Preset cadences (seconds) offered in the UI: 4h / 12h / 24h. */
+  presets: number[];
+}
+
+/** Partial update — set `sync_interval_secs` to `null` to reset to default. */
+export interface MemorySyncSettingsUpdate {
+  /** null = default, 0 = Manual only, n>0 = sync every n seconds. */
+  sync_interval_secs?: number | null;
+}
+
+export async function openhumanGetMemorySyncSettings(): Promise<
+  CommandResponse<MemorySyncSettings>
+> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+  return await callCoreRpc<CommandResponse<MemorySyncSettings>>({
+    method: CORE_RPC_METHODS.configGetMemorySyncSettings,
+  });
+}
+
+export async function openhumanUpdateMemorySyncSettings(
+  update: MemorySyncSettingsUpdate
+): Promise<CommandResponse<MemorySyncSettings>> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+  return await callCoreRpc<CommandResponse<MemorySyncSettings>>({
+    method: CORE_RPC_METHODS.configUpdateMemorySyncSettings,
     params: update,
   });
 }
@@ -434,9 +735,32 @@ export async function openhumanGetAnalyticsSettings(): Promise<
   });
 }
 
-export async function openhumanUpdateMeetSettings(update: {
+/** Meeting Assistant calendar auto-join policy (issue #3511). */
+export type MeetAutoJoinPolicy = 'ask_each_time' | 'always' | 'never';
+/** Meeting Assistant post-call summary policy. */
+export type MeetAutoSummarizePolicy = 'ask' | 'always' | 'never';
+
+/** Full shape returned by `openhuman.config_get_meet_settings`. */
+export interface MeetSettings {
+  auto_orchestrator_handoff: boolean;
+  auto_join_policy: MeetAutoJoinPolicy;
+  auto_summarize_policy: MeetAutoSummarizePolicy;
+  listen_only_default: boolean;
+  ingest_backend_transcripts: boolean;
+}
+
+/** Partial update accepted by `openhuman.config_update_meet_settings`. */
+export interface MeetSettingsUpdate {
   auto_orchestrator_handoff?: boolean;
-}): Promise<CommandResponse<ConfigSnapshot>> {
+  auto_join_policy?: MeetAutoJoinPolicy;
+  auto_summarize_policy?: MeetAutoSummarizePolicy;
+  listen_only_default?: boolean;
+  ingest_backend_transcripts?: boolean;
+}
+
+export async function openhumanUpdateMeetSettings(
+  update: MeetSettingsUpdate
+): Promise<CommandResponse<ConfigSnapshot>> {
   if (!isTauri()) {
     throw new Error('Not running in Tauri');
   }
@@ -446,13 +770,11 @@ export async function openhumanUpdateMeetSettings(update: {
   });
 }
 
-export async function openhumanGetMeetSettings(): Promise<
-  CommandResponse<{ auto_orchestrator_handoff: boolean }>
-> {
+export async function openhumanGetMeetSettings(): Promise<CommandResponse<MeetSettings>> {
   if (!isTauri()) {
     throw new Error('Not running in Tauri');
   }
-  return await callCoreRpc<CommandResponse<{ auto_orchestrator_handoff: boolean }>>({
+  return await callCoreRpc<CommandResponse<MeetSettings>>({
     method: 'openhuman.config_get_meet_settings',
   });
 }

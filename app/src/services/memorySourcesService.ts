@@ -12,6 +12,7 @@ const log = debug('memory-sources');
 
 export type SourceKind =
   | 'composio'
+  | 'conversation'
   | 'folder'
   | 'github_repo'
   | 'twitter_query'
@@ -31,9 +32,16 @@ export interface MemorySourceEntry {
   branch?: string;
   paths?: string[];
   query?: string;
+  selector?: string;
+  // Sync limit fields (all optional; omit = use backend default / unlimited)
   since_days?: number;
   max_items?: number;
-  selector?: string;
+  max_commits?: number;
+  max_issues?: number;
+  max_prs?: number;
+  sync_depth_days?: number;
+  max_tokens_per_sync?: number;
+  max_cost_per_sync_usd?: number;
 }
 
 export interface SourceItem {
@@ -159,12 +167,47 @@ export async function syncMemorySource(sourceId: string): Promise<void> {
   });
 }
 
+/**
+ * Toolkit slugs that ship a native memory-sync provider (backend registry —
+ * `all_providers()`). The Add Source connection picker uses this to disable
+ * connections whose toolkit can never sync. Maps to
+ * `openhuman.memory_sources_supported_toolkits`. See issue #3352.
+ */
+export async function getSupportedToolkits(): Promise<string[]> {
+  log('supported_toolkits');
+  const resp = await callCoreRpc<{ toolkits: string[] }>({
+    method: 'openhuman.memory_sources_supported_toolkits',
+  });
+  const data = unwrap<{ toolkits: string[] }>(resp);
+  return data.toolkits ?? [];
+}
+
+export interface ApplyAllInResult {
+  sources: MemorySourceEntry[];
+  sync_triggered: number;
+}
+
+/**
+ * Enables every memory source, clears all per-source sync caps, and
+ * triggers a background sync for each. Equivalent to the UI "All In"
+ * action. Maps to `openhuman.memory_sources_apply_all_in`.
+ */
+export async function applyAllIn(): Promise<ApplyAllInResult> {
+  log('apply_all_in');
+  const resp = await callCoreRpc<ApplyAllInResult>({
+    method: 'openhuman.memory_sources_apply_all_in',
+  });
+  const data = unwrap<ApplyAllInResult>(resp);
+  return { sources: data.sources ?? [], sync_triggered: data.sync_triggered ?? 0 };
+}
+
 /// i18n keys for each source kind's user-visible label. Resolve via
 /// `t(SOURCE_KIND_LABEL_KEYS[kind])` in components — keeping the keys
 /// as a constant lets the dialog kind-picker render the same labels
 /// without each call site duplicating the switch.
 export const SOURCE_KIND_LABEL_KEYS: Record<SourceKind, string> = {
   composio: 'memorySources.kind.composio',
+  conversation: 'memorySources.kind.conversation',
   folder: 'memorySources.kind.folder',
   github_repo: 'memorySources.kind.github_repo',
   twitter_query: 'memorySources.kind.twitter_query',
@@ -174,6 +217,7 @@ export const SOURCE_KIND_LABEL_KEYS: Record<SourceKind, string> = {
 
 export const SOURCE_KIND_ICONS: Record<SourceKind, string> = {
   composio: '🔗',
+  conversation: '💬',
   folder: '📁',
   github_repo: '🐙',
   twitter_query: '🐦',

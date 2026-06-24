@@ -51,7 +51,7 @@ mod tests {
             model_name: "test",
             agent_id: "critic",
             tools: &[],
-            skills: &[],
+            workflows: &[],
             dispatcher_instructions: "",
             learned: LearnedContextData::default(),
             visible_tool_names: &visible,
@@ -65,7 +65,6 @@ mod tests {
             personality_soul_md: None,
             personality_memory_md: None,
             personality_roster: vec![],
-            workflows: &[],
         };
         let body = build(&ctx).unwrap();
         assert!(!body.is_empty());

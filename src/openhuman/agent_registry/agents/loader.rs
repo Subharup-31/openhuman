@@ -89,9 +89,54 @@ pub const BUILTINS: &[BuiltinAgent] = &[
         prompt_fn: super::markets_agent::prompt::build,
     },
     BuiltinAgent {
+        id: "tinyplace_agent",
+        toml: include_str!("../../tinyplace/agent/agent.toml"),
+        prompt_fn: crate::openhuman::tinyplace::agent::prompt::build,
+    },
+    BuiltinAgent {
         id: "tools_agent",
         toml: include_str!("tools_agent/agent.toml"),
         prompt_fn: super::tools_agent::prompt::build,
+    },
+    BuiltinAgent {
+        id: "task_manager_agent",
+        toml: include_str!("task_manager_agent/agent.toml"),
+        prompt_fn: super::task_manager_agent::prompt::build,
+    },
+    BuiltinAgent {
+        id: "settings_agent",
+        toml: include_str!("settings_agent/agent.toml"),
+        prompt_fn: super::settings_agent::prompt::build,
+    },
+    BuiltinAgent {
+        id: "profile_memory_agent",
+        toml: include_str!("profile_memory_agent/agent.toml"),
+        prompt_fn: super::profile_memory_agent::prompt::build,
+    },
+    BuiltinAgent {
+        id: "account_admin_agent",
+        toml: include_str!("account_admin_agent/agent.toml"),
+        prompt_fn: super::account_admin_agent::prompt::build,
+    },
+    BuiltinAgent {
+        id: "screen_awareness_agent",
+        toml: include_str!("screen_awareness_agent/agent.toml"),
+        prompt_fn: super::screen_awareness_agent::prompt::build,
+    },
+    BuiltinAgent {
+        id: "scheduler_agent",
+        toml: include_str!("scheduler_agent/agent.toml"),
+        prompt_fn: super::scheduler_agent::prompt::build,
+    },
+    BuiltinAgent {
+        id: "presentation_agent",
+        toml: include_str!("presentation_agent/agent.toml"),
+        prompt_fn: super::presentation_agent::prompt::build,
+    },
+    BuiltinAgent {
+        id: "desktop_control_agent",
+        toml: include_str!("desktop_control_agent/agent.toml"),
+        prompt_fn: super::desktop_control_agent::prompt::build,
     },
     BuiltinAgent {
         id: "tool_maker",
@@ -109,14 +154,29 @@ pub const BUILTINS: &[BuiltinAgent] = &[
         prompt_fn: super::researcher::prompt::build,
     },
     BuiltinAgent {
+        id: "context_scout",
+        toml: include_str!("context_scout/agent.toml"),
+        prompt_fn: super::context_scout::prompt::build,
+    },
+    BuiltinAgent {
         id: "critic",
         toml: include_str!("critic/agent.toml"),
         prompt_fn: super::critic::prompt::build,
     },
     BuiltinAgent {
+        id: "vision_agent",
+        toml: include_str!("vision_agent/agent.toml"),
+        prompt_fn: super::vision_agent::prompt::build,
+    },
+    BuiltinAgent {
         id: "archivist",
         toml: include_str!("archivist/agent.toml"),
         prompt_fn: super::archivist::prompt::build,
+    },
+    BuiltinAgent {
+        id: "goals_agent",
+        toml: include_str!("goals_agent/agent.toml"),
+        prompt_fn: super::goals_agent::prompt::build,
     },
     BuiltinAgent {
         id: "trigger_triage",
@@ -148,6 +208,31 @@ pub const BUILTINS: &[BuiltinAgent] = &[
         toml: include_str!("mcp_setup/agent.toml"),
         prompt_fn: super::mcp_setup::prompt::build,
     },
+    BuiltinAgent {
+        id: "mcp_agent",
+        toml: include_str!("mcp_agent/agent.toml"),
+        prompt_fn: super::mcp_agent::prompt::build,
+    },
+    BuiltinAgent {
+        id: "skill_setup",
+        toml: include_str!("../../skill_registry/agent/skill_setup/agent.toml"),
+        prompt_fn: crate::openhuman::skill_registry::agent::skill_setup::prompt::build,
+    },
+    BuiltinAgent {
+        id: "skill_executor",
+        toml: include_str!("../../skill_runtime/agent/skill_executor/agent.toml"),
+        prompt_fn: crate::openhuman::skill_runtime::agent::skill_executor::prompt::build,
+    },
+    BuiltinAgent {
+        id: "agent_memory",
+        toml: include_str!("../../agent_memory/agent/agent.toml"),
+        prompt_fn: crate::openhuman::agent_memory::agent::prompt::build,
+    },
+    BuiltinAgent {
+        id: "subconscious",
+        toml: include_str!("../../subconscious/agent/agent.toml"),
+        prompt_fn: crate::openhuman::subconscious::agent::prompt::build,
+    },
 ];
 
 /// Parse every entry in [`BUILTINS`] into an [`AgentDefinition`].
@@ -171,11 +256,11 @@ pub fn load_builtins() -> Result<Vec<AgentDefinition>> {
 /// * `Reasoning` agents MUST NOT list another `Reasoning` agent in
 ///   `subagents`.
 /// * `Worker` agents MUST NOT list any [`SubagentEntry::AgentId`]
-///   entries. (Skill wildcards are allowed: they expand to the generic
+///   entries. (Workflow wildcards are allowed: they expand to the generic
 ///   `integrations_agent`, which is itself a `Worker`, and the call
 ///   happens via a single delegation tool rather than recursive spawn.)
 ///
-/// Skill-wildcard entries (`{ skills = "*" }`) are intentionally
+/// Workflow-wildcard entries (`{ skills = "*" }`) are intentionally
 /// untouched: they collapse to one `delegate_to_integrations_agent`
 /// tool whose target is a `Worker` and whose use sites are well
 /// understood. Mis-tiering of the `integrations_agent` itself is still
@@ -194,18 +279,17 @@ pub fn validate_tier_hierarchy(defs: &[AgentDefinition]) -> Result<()> {
         for entry in &def.subagents {
             let child_id = match entry {
                 SubagentEntry::AgentId(id) => id.as_str(),
-                // Skill wildcards always route to `integrations_agent`
+                // Workflow wildcards always route to `integrations_agent`
                 // (a Worker) via a single collapsed delegation tool —
                 // not subject to the tier-mismatch rule.
                 SubagentEntry::Skills(_) => continue,
             };
 
-            // Worker leaves: no spawn surface at all.
+            // Worker leaves: no open-ended spawn surface.
             if def.agent_tier == AgentTier::Worker {
                 anyhow::bail!(
-                    "agent `{parent}` is a `worker` tier and must not list `{child}` (or any \
-                     agent) in its subagents — workers are leaf executors. Either remove the \
-                     entry or re-tier `{parent}` as `chat` / `reasoning`.",
+                    "agent `{parent}` is a `worker` tier and must not list `{child}` in its \
+                     subagents — workers are leaf executors.",
                     parent = def.id,
                     child = child_id,
                 );
@@ -272,7 +356,9 @@ fn parse_builtin(b: &BuiltinAgent) -> Result<AgentDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openhuman::agent::harness::definition::{ModelSpec, SandboxMode, ToolScope};
+    use crate::openhuman::agent::harness::definition::{
+        ModelSpec, SandboxMode, SubagentEntry, ToolScope, TriggerMemoryAgent,
+    };
 
     #[test]
     fn all_builtins_parse() {
@@ -281,15 +367,39 @@ mod tests {
     }
 
     #[test]
+    fn automatic_memory_agents_do_not_expose_call_memory_agent() {
+        for def in load_builtins().expect("built-in TOML must parse") {
+            if def.trigger_memory_agent != TriggerMemoryAgent::Always {
+                continue;
+            }
+
+            let exposes_call_memory_agent = match &def.tools {
+                ToolScope::Named(tools) => tools.iter().any(|tool| tool == "call_memory_agent"),
+                ToolScope::Wildcard => false,
+            };
+
+            assert!(
+                !exposes_call_memory_agent,
+                "{} uses trigger_memory_agent but still exposes call_memory_agent",
+                def.id
+            );
+            assert!(
+                !def.subagents.iter().any(
+                    |entry| matches!(entry, SubagentEntry::AgentId(id) if id == "agent_memory")
+                ),
+                "{} uses trigger_memory_agent but still lists agent_memory in subagents",
+                def.id
+            );
+        }
+    }
+
+    #[test]
     fn trigger_reactor_has_agentic_hint_and_narrow_tools() {
         let def = find("trigger_reactor");
         assert!(matches!(def.model, ModelSpec::Hint(ref h) if h == "agentic"));
         match &def.tools {
             ToolScope::Named(tools) => {
-                assert!(
-                    tools.iter().any(|t| t == "memory_recall"),
-                    "trigger_reactor needs memory_recall"
-                );
+                assert!(!tools.iter().any(|t| t == "call_memory_agent"));
                 assert!(
                     tools.iter().any(|t| t == "memory_store"),
                     "trigger_reactor needs memory_store"
@@ -341,6 +451,41 @@ mod tests {
         }
     }
 
+    /// Regression guard for #3236.
+    ///
+    /// PR #3074 introduced the `Config.action_dir` / `Config.workspace_dir`
+    /// split: acting tools resolve to `action_dir` (default
+    /// `~/OpenHuman/projects`), and `workspace_dir` is reserved for
+    /// internal product state (memory / sessions / vault / etc.) that is
+    /// denied to agent tools. The coding-agent prompts must reflect that
+    /// split — saying "in a sandboxed environment" or "the workspace has
+    /// code …" without anchoring contradicts the new model and steers
+    /// the model toward paths that hit the internal-state denylist.
+    ///
+    /// If a future edit reintroduces stale phrasing, this assertion fires
+    /// at `cargo test` time before the bad prompt ships.
+    #[test]
+    fn coding_agent_prompts_reference_action_sandbox_not_stale_workspace() {
+        let code_executor = include_str!("code_executor/prompt.md");
+        assert!(
+            !code_executor.contains("sandboxed environment"),
+            "code_executor/prompt.md still says 'sandboxed environment' \
+             generically — anchor in the action sandbox path (see #3236)"
+        );
+        assert!(
+            code_executor.contains("action sandbox") || code_executor.contains("action_dir"),
+            "code_executor/prompt.md must reference the action sandbox or action_dir (see #3236)"
+        );
+
+        let planner = include_str!("planner/prompt.md");
+        assert!(
+            !planner.contains("the workspace has code"),
+            "planner/prompt.md still says 'the workspace has code …' — \
+             use 'the project tree' or similar to avoid colliding with \
+             `Config.workspace_dir` (internal product state). See #3236."
+        );
+    }
+
     #[test]
     fn every_builtin_has_a_prompt_body() {
         use crate::openhuman::context::prompt::{
@@ -357,7 +502,7 @@ mod tests {
                         model_name: "test",
                         agent_id: &def.id,
                         tools: &empty_tools,
-                        skills: &[],
+                        workflows: &[],
                         dispatcher_instructions: "",
                         learned: LearnedContextData::default(),
                         visible_tool_names: &empty_visible,
@@ -371,7 +516,6 @@ mod tests {
                         personality_soul_md: None,
                         personality_memory_md: None,
                         personality_roster: vec![],
-                        workflows: &[],
                     };
                     let body = build(&ctx)
                         .unwrap_or_else(|e| panic!("{} prompt build failed: {e}", def.id));
@@ -400,6 +544,24 @@ mod tests {
     }
 
     #[test]
+    fn vision_agent_loads_on_vision_hint() {
+        // The vision sub-agent rides the multimodal `vision-v1` tier (via the
+        // `vision` hint) so its model is image-capable, and it must be reachable
+        // from the orchestrator's subagent allowlist.
+        let def = find("vision_agent");
+        assert!(matches!(def.model, ModelSpec::Hint(ref h) if h == "vision"));
+
+        let orchestrator = find("orchestrator");
+        assert!(
+            orchestrator
+                .subagents
+                .iter()
+                .any(|s| matches!(s, SubagentEntry::AgentId(id) if id == "vision_agent")),
+            "orchestrator must list vision_agent in its subagents allowlist"
+        );
+    }
+
+    #[test]
     fn orchestrator_has_chat_hint_and_named_tools() {
         let def = find("orchestrator");
         assert!(matches!(def.model, ModelSpec::Hint(ref h) if h == "chat"));
@@ -411,20 +573,63 @@ mod tests {
                     "orchestrator must have spawn_worker_thread"
                 );
                 assert!(
+                    tools.iter().any(|t| t == "spawn_async_subagent"),
+                    "orchestrator must have spawn_async_subagent for sparse background work"
+                );
+                assert!(
                     !tools.iter().any(|t| t == "spawn_subagent"),
                     "spawn_subagent must not appear — removed in #1141"
                 );
-                // consolidated memory_tree* → single memory_tree with mode dispatch
-                assert!(
-                    tools.iter().any(|t| t == "memory_tree"),
-                    "orchestrator must have memory_tree"
-                );
+                assert!(!tools.iter().any(|t| t == "call_memory_agent"));
                 assert!(!tools.iter().any(|t| t == "shell"));
                 assert!(!tools.iter().any(|t| t == "file_write"));
             }
             ToolScope::Wildcard => panic!("orchestrator must have named tool allowlist"),
         }
         assert_eq!(def.max_iterations, 15);
+        // Memory retrieval is on-demand (via the `agent_memory` subagent,
+        // surfaced as `delegate_retrieve_memory`), not an eager pre-turn
+        // pre-fetch. The allowlist entry is what makes that route reachable
+        // (see the `agent_memory::tools` allowlist gate).
+        assert_eq!(def.trigger_memory_agent, TriggerMemoryAgent::Never);
+        assert!(
+            def.subagents.iter().any(|entry| matches!(
+                entry,
+                SubagentEntry::AgentId(id) if id == "agent_memory"
+            )),
+            "orchestrator must allow `agent_memory` for on-demand retrieval"
+        );
+    }
+
+    /// Regression guard for the `resolve_time` wiring. Agents that emit
+    /// timestamp arguments to downstream tools must keep the deterministic
+    /// time resolver in their allowlist — otherwise the model falls back to
+    /// hand-computing epoch seconds, which once produced a ~10-month-wrong
+    /// `oldest` and silently fetched the wrong Slack window. If any of these
+    /// drops `resolve_time`, this test fails loudly.
+    #[test]
+    fn time_sensitive_agents_expose_resolve_time() {
+        for id in [
+            "orchestrator",
+            "integrations_agent",
+            "scheduler_agent",
+            "task_manager_agent",
+            "crypto_agent",
+            "markets_agent",
+            "tinyplace_agent",
+        ] {
+            let def = find(id);
+            match def.tools {
+                ToolScope::Named(tools) => assert!(
+                    tools.iter().any(|t| t == "resolve_time"),
+                    "{id} must keep `resolve_time` in its named tool allowlist"
+                ),
+                ToolScope::Wildcard => {
+                    // Wildcard agents inherit the full built-in surface, which
+                    // already includes resolve_time — nothing to assert here.
+                }
+            }
+        }
     }
 
     #[test]
@@ -504,6 +709,45 @@ mod tests {
         }
     }
 
+    /// The planner grounds plans in connected-MCP context the same way it
+    /// grounds in Composio — but read-only. It must carry the MCP *discovery*
+    /// tools (`status` / `installed_list` / `list_tools`, all
+    /// `PermissionLevel::ReadOnly`) and must NOT carry `mcp_registry_tool_call`
+    /// (no read-only gate exists for an arbitrary MCP tool call) nor the
+    /// install/connect mutators. Execution stays with `mcp_agent`.
+    #[test]
+    fn planner_has_readonly_mcp_discovery_not_execute() {
+        let def = find("planner");
+        assert_eq!(def.sandbox_mode, SandboxMode::ReadOnly);
+        match &def.tools {
+            ToolScope::Named(names) => {
+                for required in [
+                    "mcp_registry_status",
+                    "mcp_registry_installed_list",
+                    "mcp_registry_list_tools",
+                ] {
+                    assert!(
+                        names.iter().any(|n| n == required),
+                        "planner needs read-only MCP discovery tool `{required}`"
+                    );
+                }
+                for forbidden in [
+                    "mcp_registry_tool_call",
+                    "mcp_registry_connect",
+                    "mcp_registry_install",
+                    "mcp_registry_uninstall",
+                ] {
+                    assert!(
+                        !names.iter().any(|n| n == forbidden),
+                        "planner must NOT have `{forbidden}` — it is read-only; MCP execution \
+                         belongs to mcp_agent"
+                    );
+                }
+            }
+            other => panic!("planner must use Named tool scope, got {other:?}"),
+        }
+    }
+
     #[test]
     fn integrations_agent_tool_scope_honours_toml() {
         let def = find("integrations_agent");
@@ -526,6 +770,107 @@ mod tests {
     }
 
     #[test]
+    fn tinyplace_agent_is_registered_and_narrow() {
+        let def = find("tinyplace_agent");
+        assert!(matches!(def.model, ModelSpec::Hint(ref h) if h == "agentic"));
+        assert_eq!(def.sandbox_mode, SandboxMode::None);
+        assert!(!def.omit_safety_preamble);
+        assert_eq!(def.delegate_name.as_deref(), Some("use_tinyplace"));
+        match &def.tools {
+            ToolScope::Named(names) => {
+                // Curated flow surface (replaced the per-controller 1:1 tools).
+                for required in [
+                    "tinyplace_whoami",
+                    "tinyplace_status",
+                    "tinyplace_feed",
+                    "tinyplace_find_work",
+                    "tinyplace_register",
+                    "tinyplace_post_bounty",
+                    "tinyplace_submit_work",
+                    "tinyplace_job_apply",
+                    "tinyplace_graphql",
+                    "tinyplace_call",
+                    "tinyplace_help",
+                    "ask_user_clarification",
+                    "resolve_time",
+                    "current_time",
+                ] {
+                    assert!(
+                        names.iter().any(|name| name == required),
+                        "tinyplace_agent tool list missing `{required}`"
+                    );
+                }
+                for forbidden in [
+                    "shell",
+                    "file_write",
+                    "composio_execute",
+                    "mcp_registry_tool_call",
+                ] {
+                    assert!(
+                        !names.iter().any(|name| name == forbidden),
+                        "tinyplace_agent must not expose broad tool `{forbidden}`"
+                    );
+                }
+            }
+            other => panic!("tinyplace_agent must use Named tool scope, got {other:?}"),
+        }
+
+        let orchestrator = find("orchestrator");
+        assert!(
+            orchestrator.subagents.iter().any(
+                |entry| matches!(entry, SubagentEntry::AgentId(id) if id == "tinyplace_agent")
+            ),
+            "orchestrator must allow `tinyplace_agent` so use_tinyplace can spawn it"
+        );
+    }
+
+    #[test]
+    fn specialist_agents_are_registered_with_narrow_tools() {
+        let scheduler = find("scheduler_agent");
+        match &scheduler.tools {
+            ToolScope::Named(names) => {
+                for required in ["current_time", "cron_add", "cron_list", "cron_remove"] {
+                    assert!(
+                        names.iter().any(|name| name == required),
+                        "scheduler_agent missing `{required}`"
+                    );
+                }
+            }
+            other => panic!("scheduler_agent must use Named tool scope, got {other:?}"),
+        }
+
+        let presentation = find("presentation_agent");
+        match &presentation.tools {
+            ToolScope::Named(names) => {
+                assert!(names.iter().any(|name| name == "generate_presentation"));
+                assert!(!names.iter().any(|name| name == "call_memory_agent"));
+                assert!(names.iter().any(|name| name == "web_search_tool"));
+            }
+            other => panic!("presentation_agent must use Named tool scope, got {other:?}"),
+        }
+        // Memory pre-fetch is no longer eager; `omit_memory_context = false`
+        // still gives the deck builder the cheap per-turn recall.
+        assert_eq!(presentation.trigger_memory_agent, TriggerMemoryAgent::Never);
+
+        let desktop = find("desktop_control_agent");
+        match &desktop.tools {
+            ToolScope::Named(names) => {
+                for required in [
+                    "launch_app",
+                    "ax_interact",
+                    "automate",
+                    "screenshot",
+                    "mouse",
+                    "keyboard",
+                ] {
+                    assert!(names.iter().any(|name| name == required));
+                }
+            }
+            other => panic!("desktop_control_agent must use Named tool scope, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn archivist_runs_in_background() {
         let def = find("archivist");
         assert!(def.background);
@@ -537,10 +882,17 @@ mod tests {
         let def = find("morning_briefing");
         assert_eq!(def.sandbox_mode, SandboxMode::ReadOnly);
         assert!(matches!(def.tools, ToolScope::Wildcard));
-        assert!(!def.omit_memory_context);
+        // The brief pulls its own last-24h memory via the `memory_tree`
+        // `cover_window` tool, so the stale all-time memory blob is suppressed.
+        assert!(def.omit_memory_context);
         assert!(def.omit_identity);
         assert!(def.omit_safety_preamble);
         assert_eq!(def.max_iterations, 8);
+        assert!(
+            def.disallowed_tools.iter().any(|t| t == "tinyplace_*"),
+            "morning_briefing.disallowed_tools must contain `tinyplace_*` so \
+             tiny.place routes through tinyplace_agent exclusively"
+        );
     }
 
     #[test]
@@ -557,10 +909,7 @@ mod tests {
                     tools.iter().any(|t| t == "gitbooks_get_page"),
                     "help needs gitbooks_get_page"
                 );
-                assert!(
-                    tools.iter().any(|t| t == "memory_recall"),
-                    "help needs memory_recall for personalisation"
-                );
+                assert!(!tools.iter().any(|t| t == "call_memory_agent"));
                 // Help is docs-only — no write/exec tools.
                 assert!(!tools.iter().any(|t| t == "shell"));
                 assert!(!tools.iter().any(|t| t == "file_write"));
@@ -572,6 +921,82 @@ mod tests {
         assert!(def.omit_identity);
         assert!(def.omit_safety_preamble);
         assert!(!def.omit_memory_context);
+        // Help personalises from the cheap per-turn recall (memory_context on),
+        // so it no longer pre-fetches the full memory agent before every turn.
+        assert_eq!(def.trigger_memory_agent, TriggerMemoryAgent::Never);
+    }
+
+    #[test]
+    fn orchestrator_exposes_agent_prepare_context_planner_does_not() {
+        // The orchestrator owns the first-message context-scout pass.
+        let orch = find("orchestrator");
+        match &orch.tools {
+            ToolScope::Named(tools) => assert!(
+                tools.iter().any(|t| t == "agent_prepare_context"),
+                "orchestrator must allowlist `agent_prepare_context`"
+            ),
+            ToolScope::Wildcard => {}
+        }
+        // The planner must NOT: when invoked via delegate_plan it runs under
+        // the orchestrator's PARENT_CONTEXT, so a nested scout would render the
+        // wrong (orchestrator) visible catalog/session.
+        let planner = find("planner");
+        if let ToolScope::Named(tools) = &planner.tools {
+            assert!(
+                !tools.iter().any(|t| t == "agent_prepare_context"),
+                "planner must NOT allowlist `agent_prepare_context` (nested-context mismatch)"
+            );
+        }
+        // The scout itself must NOT see the tool (would be circular).
+        let scout = find("context_scout");
+        if let ToolScope::Named(tools) = &scout.tools {
+            assert!(!tools.iter().any(|t| t == "agent_prepare_context"));
+        }
+    }
+
+    #[test]
+    fn context_scout_is_read_only_worker_with_bounded_output() {
+        let def = find("context_scout");
+        assert_eq!(def.agent_tier, AgentTier::Worker);
+        assert_eq!(def.sandbox_mode, SandboxMode::ReadOnly);
+        // ~1000-token bundle cap — load-bearing for the parent's context budget.
+        assert_eq!(def.max_result_chars, Some(4000));
+        // Keeps goals/profile + long-term memory so it can ground the
+        // orchestrator in who the user is and what they want.
+        assert!(!def.omit_profile, "context_scout needs PROFILE.md (goals)");
+        assert!(!def.omit_memory_md, "context_scout needs MEMORY.md");
+        // Strictly read-only gathering surface — no writes / shell / delegation.
+        match &def.tools {
+            ToolScope::Named(tools) => {
+                for required in ["memory_recall", "web_search_tool", "web_fetch"] {
+                    assert!(
+                        tools.iter().any(|t| t == required),
+                        "context_scout needs read-only gathering tool `{required}`"
+                    );
+                }
+                for forbidden in [
+                    "shell",
+                    "file_write",
+                    "spawn_subagent",
+                    "spawn_async_subagent",
+                    "agent_prepare_context",
+                    // memory_tree bundles a write mode (ingest_document) under a
+                    // ReadOnly wrapper — must not be reachable by the auto-run scout.
+                    "memory_tree",
+                ] {
+                    assert!(
+                        !tools.iter().any(|t| t == forbidden),
+                        "context_scout must NOT have `{forbidden}` — it only gathers context"
+                    );
+                }
+            }
+            ToolScope::Wildcard => panic!("context_scout must have a Named tool scope"),
+        }
+        // Worker leaf: no onward delegation.
+        assert!(
+            def.subagents.is_empty(),
+            "context_scout is a leaf and must not list subagents"
+        );
     }
 
     #[test]
@@ -685,17 +1110,13 @@ mod tests {
                     tools.iter().any(|t| t == "ask_user_clarification"),
                     "crypto_agent needs ask_user_clarification to gate write ops"
                 );
-                // Market grounding + context helpers. Pin the full set so a
-                // TOML edit that silently drops `stock_quote`,
-                // `stock_exchange_rate`, `memory_recall`, or `current_time`
-                // gets caught here — the agent's quote-before-execute
-                // discipline and "ground in user preferences before re-asking"
-                // behaviour both depend on these being present.
+                // Market grounding + time helpers. Memory retrieval is the
+                // orchestrator's on-demand concern — this specialist gets a
+                // grounded request and does not pre-fetch memory itself.
                 for required in [
                     "stock_quote",
                     "stock_exchange_rate",
                     "stock_crypto_series",
-                    "memory_recall",
                     "current_time",
                 ] {
                     assert!(
@@ -703,6 +1124,13 @@ mod tests {
                         "crypto_agent needs supporting tool `{required}`"
                     );
                 }
+                // x402 paid HTTP requests — signs on-chain USDC payments
+                // for APIs behind HTTP 402 challenges.
+                assert!(
+                    tools.iter().any(|t| t == "x402_request"),
+                    "crypto_agent needs x402_request for paid API access"
+                );
+                assert!(!tools.iter().any(|t| t == "call_memory_agent"));
                 // Hard exclusions — no broad-surface or write-anywhere tools.
                 // Includes the orchestrator-level delegate_* tools so a future
                 // TOML edit can't accidentally hand crypto writes to the
@@ -739,6 +1167,9 @@ mod tests {
         assert!(def.omit_identity);
         assert!(def.omit_memory_context);
         assert!(def.omit_skills_catalog);
+        // Pure-function specialist (omit_memory_context = true) — no eager
+        // memory pre-fetch; the orchestrator hands it a grounded request.
+        assert_eq!(def.trigger_memory_agent, TriggerMemoryAgent::Never);
     }
 
     /// Routing: the orchestrator must list `crypto_agent` in its
@@ -787,16 +1218,16 @@ mod tests {
                     tools.iter().any(|t| t == "ask_user_clarification"),
                     "markets_agent needs ask_user_clarification to gate write ops"
                 );
-                // Context helpers. Pin the full set so a TOML edit that
-                // silently drops `memory_recall` or `current_time` gets
-                // caught here — the agent's "ground in user preferences"
-                // and "as of <when>" framing depend on these.
-                for required in ["memory_recall", "current_time"] {
+                // Time grounding stays as a tool; memory retrieval is the
+                // orchestrator's on-demand concern — this specialist gets a
+                // grounded request and does not pre-fetch memory itself.
+                for required in ["current_time"] {
                     assert!(
                         tools.iter().any(|t| t == required),
                         "markets_agent needs supporting tool `{required}`"
                     );
                 }
+                assert!(!tools.iter().any(|t| t == "call_memory_agent"));
                 // Hard exclusions — no broad-surface tools, no wallet
                 // primitives (those belong to crypto_agent), no
                 // delegation tools (markets_agent is a worker leaf).
@@ -837,6 +1268,9 @@ mod tests {
         assert!(def.omit_identity);
         assert!(def.omit_memory_context);
         assert!(def.omit_skills_catalog);
+        // Pure-function specialist (omit_memory_context = true) — no eager
+        // memory pre-fetch; the orchestrator hands it a grounded request.
+        assert_eq!(def.trigger_memory_agent, TriggerMemoryAgent::Never);
         // Delegate name must be the stable, chat-friendly slug — the
         // orchestrator surfaces it as `delegate_do_prediction_markets`.
         assert_eq!(
@@ -867,13 +1301,11 @@ mod tests {
         );
     }
 
-    /// `tools_agent` must explicitly disallow `polymarket` and `kalshi`
-    /// so the prediction-market venues route ONLY through
-    /// `markets_agent` (`delegate_do_prediction_markets`). Without this
-    /// the wildcard inventory would also surface them as raw tools to
-    /// the generalist, bypassing the venue-aware approval-gate prompt.
+    /// `tools_agent` must explicitly disallow specialist-owned external action
+    /// families so the wildcard inventory does not surface raw paid/write
+    /// tools to the generalist, bypassing specialist prompts.
     #[test]
-    fn tools_agent_disallows_prediction_market_tools() {
+    fn tools_agent_disallows_specialist_owned_external_tools() {
         let def = find("tools_agent");
         assert!(
             def.disallowed_tools.iter().any(|t| t == "polymarket"),
@@ -885,6 +1317,102 @@ mod tests {
             "tools_agent.disallowed_tools must contain `kalshi` so the \
              venue routes through markets_agent exclusively"
         );
+        assert!(
+            def.disallowed_tools.iter().any(|t| t == "tinyplace_*"),
+            "tools_agent.disallowed_tools must contain `tinyplace_*` so \
+             tiny.place routes through tinyplace_agent exclusively"
+        );
+    }
+
+    /// Routing: the orchestrator must list `mcp_agent` in its `subagents`
+    /// so a `delegate_use_mcp_server` tool is synthesised at agent-build
+    /// time. Without this entry the orchestrator can only *set up* MCP
+    /// servers (via `mcp_setup`) and has no route to actually *use* an
+    /// already-connected server's tools from chat (issue #3495).
+    #[test]
+    fn orchestrator_subagents_include_mcp_agent() {
+        use crate::openhuman::agent::harness::definition::SubagentEntry;
+        let def = find("orchestrator");
+        let listed = def.subagents.iter().any(|e| match e {
+            SubagentEntry::AgentId(id) => id == "mcp_agent",
+            _ => false,
+        });
+        assert!(
+            listed,
+            "orchestrator.subagents must list `mcp_agent` so the routing \
+             layer can synthesise `delegate_use_mcp_server`"
+        );
+    }
+
+    /// The orchestrator gets lightweight MCP discovery (`mcp_registry_status`,
+    /// like `composio_list_connections`) but must NOT carry the per-server
+    /// enumerate/execute tools — those belong to `mcp_agent`, keeping the
+    /// chat agent's schema from ballooning with every connected server's
+    /// full toolset (#3495).
+    #[test]
+    fn orchestrator_has_mcp_discovery_but_not_execution() {
+        let def = find("orchestrator");
+        match &def.tools {
+            ToolScope::Named(tools) => {
+                assert!(
+                    tools.iter().any(|t| t == "mcp_registry_status"),
+                    "orchestrator must have mcp_registry_status for lightweight MCP discovery"
+                );
+                for forbidden in ["mcp_registry_list_tools", "mcp_registry_tool_call"] {
+                    assert!(
+                        !tools.iter().any(|t| t == forbidden),
+                        "orchestrator must NOT have `{forbidden}` — enumerating/calling \
+                         connected MCP tools is mcp_agent's job (keeps the chat schema small)"
+                    );
+                }
+            }
+            ToolScope::Wildcard => panic!("orchestrator must have a Named tool scope"),
+        }
+    }
+
+    /// `mcp_agent` is the connected-server execution specialist: it must hold
+    /// the discover + call surface and a stable `use_mcp_server` delegate name,
+    /// but must NOT hold the secret-handling install/uninstall tools (those are
+    /// `mcp_setup`'s) or any shell/file/network capability.
+    #[test]
+    fn mcp_agent_drives_connected_servers_without_install_or_shell() {
+        let def = find("mcp_agent");
+        assert_eq!(def.agent_tier, AgentTier::Worker);
+        assert_eq!(
+            def.delegate_name.as_deref(),
+            Some("use_mcp_server"),
+            "mcp_agent must keep its `use_mcp_server` delegate name stable"
+        );
+        match &def.tools {
+            ToolScope::Named(tools) => {
+                for required in [
+                    "mcp_registry_status",
+                    "mcp_registry_list_tools",
+                    "mcp_registry_connect",
+                    "mcp_registry_tool_call",
+                ] {
+                    assert!(
+                        tools.iter().any(|t| t == required),
+                        "mcp_agent missing `{required}`"
+                    );
+                }
+                for forbidden in [
+                    "mcp_registry_install",
+                    "mcp_registry_uninstall",
+                    "shell",
+                    "file_write",
+                    "curl",
+                    "http_request",
+                ] {
+                    assert!(
+                        !tools.iter().any(|t| t == forbidden),
+                        "mcp_agent must NOT have `{forbidden}` — it only relays through \
+                         already-connected servers; install/secrets belong to mcp_setup"
+                    );
+                }
+            }
+            ToolScope::Wildcard => panic!("mcp_agent must have a Named tool scope"),
+        }
     }
 
     #[test]
@@ -898,8 +1426,80 @@ mod tests {
         assert!(
             listed,
             "orchestrator.subagents must list `skill_creator` so the \
-             routing layer can synthesise `create_skill`"
+            routing layer can synthesise `create_skill`"
         );
+    }
+
+    #[test]
+    fn orchestrator_subagents_include_control_specialists() {
+        use crate::openhuman::agent::harness::definition::SubagentEntry;
+        let def = find("orchestrator");
+        let subagents: std::collections::HashSet<&str> = def
+            .subagents
+            .iter()
+            .filter_map(|entry| match entry {
+                SubagentEntry::AgentId(id) => Some(id.as_str()),
+                SubagentEntry::Skills(_) => None,
+            })
+            .collect();
+
+        for expected in [
+            "task_manager_agent",
+            "settings_agent",
+            "profile_memory_agent",
+            "account_admin_agent",
+            "screen_awareness_agent",
+        ] {
+            assert!(
+                subagents.contains(expected),
+                "orchestrator.subagents must list `{expected}` so the routing layer can synthesize its delegate tool"
+            );
+        }
+    }
+
+    #[test]
+    fn control_specialists_have_named_tools_and_are_worker_leaves() {
+        use crate::openhuman::agent::harness::definition::SubagentEntry;
+
+        for expected in [
+            "task_manager_agent",
+            "settings_agent",
+            "profile_memory_agent",
+            "account_admin_agent",
+            "screen_awareness_agent",
+        ] {
+            let def = find(expected);
+            assert_eq!(def.agent_tier, AgentTier::Worker);
+            let visible_subagents: Vec<&str> = def
+                .subagents
+                .iter()
+                .filter_map(|entry| match entry {
+                    SubagentEntry::AgentId(id) => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                visible_subagents.is_empty(),
+                "{expected} must be a worker leaf"
+            );
+            match def.tools {
+                ToolScope::Named(tools) => {
+                    assert!(
+                        !tools.is_empty(),
+                        "{expected} must have a concrete tool allowlist"
+                    );
+                    assert!(
+                        tools.iter().any(|tool| tool == "ask_user_clarification"),
+                        "{expected} must be able to ask for confirmation before risky writes"
+                    );
+                    assert!(
+                        !tools.iter().any(|tool| tool == "shell"),
+                        "{expected} must not inherit shell access"
+                    );
+                }
+                ToolScope::Wildcard => panic!("{expected} must not use wildcard tools"),
+            }
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -919,13 +1519,13 @@ mod tests {
     #[test]
     fn other_builtins_default_to_worker_tier() {
         for def in load_builtins().unwrap() {
-            if def.id == "orchestrator" || def.id == "planner" {
+            if def.id == "orchestrator" || def.id == "planner" || def.id == "subconscious" {
                 continue;
             }
             assert_eq!(
                 def.agent_tier,
                 AgentTier::Worker,
-                "{} should default to worker tier (only orchestrator/planner are non-worker today)",
+                "{} should default to worker tier (only orchestrator/planner/subconscious are non-worker today)",
                 def.id
             );
         }

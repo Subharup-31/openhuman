@@ -18,10 +18,11 @@ use crate::openhuman::config::Config;
 use crate::openhuman::memory_queue::handlers;
 use crate::openhuman::memory_queue::redact::scrub_for_log;
 use crate::openhuman::memory_queue::store::{
-    claim_next, mark_deferred, mark_done, mark_failed, recover_stale_locks, release_running_locks,
-    DEFAULT_LOCK_DURATION_MS,
+    claim_next, claim_ready_extract_batch, mark_deferred, mark_done, mark_failed_typed,
+    recover_stale_locks, release_running_locks, DEFAULT_LOCK_DURATION_MS,
 };
-use crate::openhuman::memory_queue::types::JobOutcome;
+use crate::openhuman::memory_queue::types::{Job, JobKind, JobOutcome};
+use crate::openhuman::memory_tree::health::PipelineFailure;
 
 /// Number of concurrent job-worker tasks. Each worker claims one job
 /// at a time via `claim_next` (atomic UPDATE under SQLite WAL with
@@ -142,6 +143,22 @@ pub fn start(config: Config) {
                                      backing off 30s: {err:#}"
                                 );
                                 tokio::time::sleep(Duration::from_secs(30)).await;
+                            } else if is_sqlite_disk_full(&err) {
+                                // SQLITE_FULL (code 13): the host disk is full.
+                                // A claim UPDATE cannot succeed until the user
+                                // frees space — this is persistent, not
+                                // transient, so re-polling every second and
+                                // paging Sentry on each failure floods the
+                                // dashboard (TAURI-RUST-4R8: ~95k events, one
+                                // user) for a condition only the user can
+                                // clear. Back off long and stay silent; the
+                                // `ready` rows resume when space returns and
+                                // `notify` still wakes us on new enqueues.
+                                log::warn!(
+                                    "[memory::jobs] worker {idx} hit SQLITE_FULL (disk full), \
+                                     backing off 300s without reporting: {err:#}"
+                                );
+                                tokio::time::sleep(Duration::from_secs(300)).await;
                             } else {
                                 crate::core::observability::report_error(
                                     &err,
@@ -213,7 +230,28 @@ pub async fn run_once(config: &Config) -> Result<bool> {
         None
     };
 
-    let result = handlers::handle_job(config, &job).await;
+    let mut jobs = vec![job];
+    if jobs[0].kind == JobKind::ExtractChunk {
+        let extra_limit = handlers::EXTRACT_EMBED_BATCH.saturating_sub(1);
+        let mut extra = claim_ready_extract_batch(config, DEFAULT_LOCK_DURATION_MS, extra_limit)?;
+        if !extra.is_empty() {
+            log::debug!(
+                "[memory::jobs] running extract batch count={}",
+                extra.len() + 1
+            );
+            jobs.append(&mut extra);
+        }
+    }
+
+    let results = if jobs.len() > 1 && jobs[0].kind == JobKind::ExtractChunk {
+        handlers::handle_extract_batch(config, &jobs).await?
+    } else {
+        let job = jobs
+            .pop()
+            .expect("worker has exactly one claimed job in non-batch path");
+        let result = handlers::handle_job(config, &job).await;
+        vec![(job, result)]
+    };
     drop(llm_permit);
 
     // A failed settle (`mark_done` / `mark_failed` / `mark_deferred` below)
@@ -222,6 +260,14 @@ pub async fn run_once(config: &Config) -> Result<bool> {
     // report) via [`is_sqlite_busy`]. On a stale settle the row's
     // `locked_until_ms` eventually elapses and `recover_stale_locks`
     // requeues it, so dropping the error here is at-most a re-run.
+    for (job, result) in results {
+        settle_job(config, &job, result)?;
+    }
+
+    Ok(true)
+}
+
+fn settle_job(config: &Config, job: &Job, result: Result<JobOutcome>) -> Result<()> {
     match result {
         Ok(JobOutcome::Done) => {
             log::debug!(
@@ -257,17 +303,23 @@ pub async fn run_once(config: &Config) -> Result<bool> {
             // the same chain after `scrub_for_log`, since anyhow chains
             // commonly embed upstream HTTP bodies / auth headers.
             let message = format!("{err:#}");
+            // #002: if the error chain carries a typed `PipelineFailure`
+            // (attached at the embed/extract boundary), pass it through so
+            // `mark_failed_typed` can fail fast on unrecoverable causes
+            // (budget/auth/dim) instead of burning the retry budget, and
+            // persist the typed reason for the status/doctor surface.
+            let typed = err.downcast_ref::<PipelineFailure>();
             log::warn!(
-                "[memory::jobs] job failed id={} kind={} err={}",
+                "[memory::jobs] job failed id={} kind={} reason={:?} err={}",
                 job.id,
                 job.kind.as_str(),
+                typed.map(|f| f.code.as_str()),
                 scrub_for_log(&message)
             );
-            mark_failed(config, &job, &message)?;
+            mark_failed_typed(config, &job, &message, typed)?;
         }
     }
-
-    Ok(true)
+    Ok(())
 }
 
 /// Classify whether an error is a transient I/O failure that should be
@@ -329,6 +381,34 @@ fn is_sqlite_busy(err: &anyhow::Error) -> bool {
     // phrases SQLite emits for these codes.
     let msg = format!("{err:#}").to_ascii_lowercase();
     msg.contains("database is locked") || msg.contains("database table is locked")
+}
+
+/// Classify whether an error from `claim_next` is a `SQLITE_FULL` disk-full
+/// condition (primary code `DiskFull`, extended 13).
+///
+/// Unlike `SQLITE_BUSY`/`LOCKED` or the transient I/O family, a full disk is a
+/// **persistent** host condition: the claim `UPDATE` cannot succeed until the
+/// user frees space. Re-polling every second and paging Sentry on each failure
+/// turns one unrecoverable condition into a flood (Sentry TAURI-RUST-4R8:
+/// ~95k events from a single user). The worker backs off long and stays
+/// silent; the rows stay `ready` and resume when space returns.
+///
+/// Matching on the `DiskFull` error code is rusqlite-version-stable. The text
+/// fallback covers the case where the error was flattened to a plain `anyhow!`
+/// string across `.context()` layers — rusqlite renders `SQLITE_FULL` as
+/// `"database or disk is full: Error code 13: Insertion failed because
+/// database is full"`, so anchor on either canonical fragment.
+fn is_sqlite_disk_full(err: &anyhow::Error) -> bool {
+    if let Some(rusqlite::Error::SqliteFailure(sqlite_err, _)) =
+        err.downcast_ref::<rusqlite::Error>()
+    {
+        if sqlite_err.code == rusqlite::ErrorCode::DiskFull {
+            return true;
+        }
+    }
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    msg.contains("database or disk is full")
+        || msg.contains("insertion failed because database is full")
 }
 
 #[cfg(test)]
@@ -511,6 +591,81 @@ mod tests {
         assert!(!is_sqlite_io_transient(&anyhow::Error::from(raw)));
     }
 
+    // ── is_sqlite_disk_full tests (#3909 / Sentry TAURI-RUST-4R8) ─────────
+
+    /// `SQLITE_FULL` (primary code `DiskFull`, extended 13) is the disk-full
+    /// signal from `claim_next`; it must classify so the worker backs off
+    /// long instead of paging Sentry every second.
+    #[test]
+    fn is_sqlite_disk_full_matches_disk_full_code() {
+        let raw = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DiskFull,
+                extended_code: 13,
+            },
+            Some("database or disk is full".into()),
+        );
+        assert!(is_sqlite_disk_full(&anyhow::Error::from(raw)));
+    }
+
+    /// The rusqlite error sits a few `.context()` layers deep when it bubbles
+    /// out of `claim_next` → `with_connection`; the downcast must still find
+    /// the `DiskFull` code.
+    #[test]
+    fn is_sqlite_disk_full_matches_through_context_layers() {
+        let raw = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DiskFull,
+                extended_code: 13,
+            },
+            Some("database or disk is full".into()),
+        );
+        let wrapped = anyhow::Error::from(raw)
+            .context("Failed to claim next mem_tree_jobs row")
+            .context("with_connection closure failed");
+        assert!(is_sqlite_disk_full(&wrapped));
+    }
+
+    /// Text fallback: the exact flattened Sentry string (TAURI-RUST-4R8) is
+    /// classified even when no rusqlite error is available to downcast (the
+    /// canonical phrase is mid-string, not a suffix).
+    #[test]
+    fn is_sqlite_disk_full_text_fallback() {
+        let err = anyhow::anyhow!(
+            "Failed to claim next mem_tree_jobs row: database or disk is full: \
+             Error code 13: Insertion failed because database is full"
+        );
+        assert!(is_sqlite_disk_full(&err));
+    }
+
+    /// Busy/locked, constraint violations, and unrelated errors must NOT be
+    /// swallowed as disk-full — those still warrant their own handling /
+    /// Sentry escalation.
+    #[test]
+    fn is_sqlite_disk_full_does_not_match_other_errors() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy,
+                extended_code: 5,
+            },
+            Some("database is locked".into()),
+        );
+        assert!(!is_sqlite_disk_full(&anyhow::Error::from(busy)));
+
+        let constraint = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                extended_code: 19,
+            },
+            Some("UNIQUE constraint failed: mem_tree_jobs.dedupe_key".into()),
+        );
+        assert!(!is_sqlite_disk_full(&anyhow::Error::from(constraint)));
+
+        assert!(!is_sqlite_disk_full(&anyhow::anyhow!(
+            "upstream returned 500: internal server error"
+        )));
+    }
+
     #[tokio::test]
     async fn wake_workers_is_noop_before_start() {
         wake_workers();
@@ -542,7 +697,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_once_reschedules_reembed_backfill_jobs_that_defer() {
-        let (_tmp, cfg) = test_config();
+        let (_tmp, mut cfg) = test_config();
+        // Deliberate "none" opt-out → InertEmbedder (zero vectors, no network)
+        // so the backfill has work and Defers; this test pins the worker's
+        // defer-reschedule path, not embed quality.
+        cfg.embeddings_provider = Some("none".to_string());
         let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
         let chunk = Chunk {
             id: chunk_id(SourceKind::Chat, "slack:#eng", 0, "reembed-worker-seed"),

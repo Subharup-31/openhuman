@@ -25,6 +25,21 @@
 //! - [`DomainEvent::ChannelMessageReceived`]
 //! - [`DomainEvent::ChannelMessageProcessed`]
 
+/// Voice-domain events.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub enum VoiceEvent {
+    /// A PTT session committed a transcript to a thread. Carries only
+    /// length/timing — never the raw text, per the PII-safe logging rule.
+    PttTranscriptCommitted {
+        thread_id: String,
+        session_id: u64,
+        text_len: usize,
+        held_ms: u64,
+        finalized_by_watchdog: bool,
+    },
+}
+
 /// Top-level domain event. Non-exhaustive so new variants can be added
 /// without breaking existing match arms.
 #[non_exhaustive]
@@ -115,6 +130,64 @@ pub enum DomainEvent {
         reason: Option<String>,
     },
 
+    // ── Subconscious orchestrator ───────────────────────────────────────
+    /// A subconscious trigger finished gate evaluation (promote or drop).
+    /// Observability only — lets dashboards see ingestion volume and the
+    /// gate's promote/drop ratio without reading logs.
+    SubconsciousTriggerProcessed {
+        /// Trigger source family (`cron` / `user_message` / …).
+        source: String,
+        /// Gate decision (`promote` / `drop`).
+        decision: String,
+        /// Whether the trigger was promoted into the long-lived session.
+        promoted: bool,
+        /// Gate evaluation latency in milliseconds.
+        latency_ms: u64,
+    },
+
+    // ── Run Queue ──────────────────────────────────────────────────────
+    /// A message was queued into the active-run queue instead of interrupting.
+    RunQueueMessageQueued {
+        thread_id: String,
+        mode: String,
+        queue_depth: usize,
+    },
+    /// A queued steer/collect message was delivered to the engine at an
+    /// iteration boundary.
+    RunQueueMessageDelivered {
+        thread_id: String,
+        mode: String,
+        iteration: u32,
+    },
+    /// A queued followup message was dispatched as a fresh turn after the
+    /// current turn completed.
+    RunQueueFollowupDispatched {
+        thread_id: String,
+        followup_count: usize,
+    },
+    /// The active turn was interrupted by a new message (default behavior).
+    RunQueueInterrupted {
+        thread_id: String,
+        cancelled_request_id: String,
+    },
+
+    // ── Monitor ───────────────────────────────────────────────────────
+    /// A background monitor changed lifecycle state.
+    MonitorStatusChanged {
+        monitor_id: String,
+        status: String,
+        thread_id: Option<String>,
+        description: String,
+    },
+    /// A background monitor emitted one bounded stdout/stderr line.
+    MonitorLine {
+        monitor_id: String,
+        thread_id: Option<String>,
+        timestamp_ms: u64,
+        stream: String,
+        line: String,
+    },
+
     // ── Memory ──────────────────────────────────────────────────────────
     /// The configured embedding provider is unreachable or the requested model
     /// is not installed, so the memory pipeline fell back to an alternative.
@@ -157,12 +230,24 @@ pub enum DomainEvent {
     ///
     /// Emitted by the `memory` domain so the frontend can surface progress
     /// across request → fetch → store → queue → ingest → complete.
+    ///
+    /// `source_id` is the originating memory-source id (from
+    /// `memory_sources`) when the event can be attributed to a specific
+    /// source row. The frontend prefers this over `connection_id` for
+    /// per-row indicator matching (see RC#2, issue #3295). Set to `None`
+    /// when the event originates from a non-memory-source sync path (e.g. a
+    /// channel-provider ingest) — `connection_id` remains unchanged for
+    /// those callers.
     MemorySyncStageChanged {
         trigger: String,
         stage: String,
         provider: Option<String>,
         connection_id: Option<String>,
         detail: Option<String>,
+        /// Originating memory-source id for frontend per-row indicator
+        /// matching. `None` when the event is not attributable to a
+        /// specific `MemorySourceEntry`.
+        source_id: Option<String>,
     },
     /// A memory ingestion job started running on the local extraction LLM.
     /// Ingestion is singleton — this fires once, then a matching
@@ -180,6 +265,25 @@ pub enum DomainEvent {
         success: bool,
         elapsed_ms: u64,
         queue_depth: usize,
+    },
+
+    // ── Memory Diff ─────────────────────────────────────────────────────
+    /// A snapshot of a memory source's chunk state was captured.
+    MemoryDiffSnapshotTaken {
+        snapshot_id: String,
+        source_id: String,
+        source_kind: String,
+        item_count: usize,
+        trigger: String,
+    },
+    /// A diff was computed between two snapshots.
+    MemoryDiffComputed {
+        source_id: String,
+        from_snapshot_id: Option<String>,
+        to_snapshot_id: String,
+        added: usize,
+        removed: usize,
+        modified: usize,
     },
 
     // ── Channels ────────────────────────────────────────────────────────
@@ -285,13 +389,13 @@ pub enum DomainEvent {
 
     // ── Skills ──────────────────────────────────────────────────────────
     /// A skill was loaded into the runtime.
-    SkillLoaded { skill_id: String, runtime: String },
+    WorkflowLoaded { skill_id: String, runtime: String },
     /// A skill was stopped.
-    SkillStopped { skill_id: String },
+    WorkflowStopped { skill_id: String },
     /// A skill failed to start.
-    SkillStartFailed { skill_id: String, error: String },
+    WorkflowStartFailed { skill_id: String, error: String },
     /// A skill tool was executed.
-    SkillExecuted {
+    WorkflowExecuted {
         skill_id: String,
         tool_name: String,
         arguments: serde_json::Value,
@@ -299,6 +403,11 @@ pub enum DomainEvent {
         success: bool,
         elapsed_ms: u64,
     },
+    /// The set of installed skills/workflows changed (install / uninstall /
+    /// create). Lets a live agent session refresh its `## Installed Skills`
+    /// catalogue mid-conversation instead of waiting for a restart. `reason`
+    /// is a short tag for logs (e.g. `"install"`, `"uninstall"`, `"create"`).
+    WorkflowsChanged { reason: String },
 
     // ── Tools ───────────────────────────────────────────────────────────
     /// A tool execution started.
@@ -350,6 +459,97 @@ pub enum DomainEvent {
         tool_name: String,
         /// `"approve_once"`, `"approve_always_for_tool"`, or `"deny"`.
         decision: String,
+    },
+
+    // ── Artifacts ───────────────────────────────────────────────────────
+    /// An artifact transitioned to [`ArtifactStatus::Ready`] — file
+    /// is on disk and ready to be downloaded. Published by
+    /// [`crate::openhuman::artifacts::store::finalize_artifact`].
+    /// Bridged to the web channel as an `artifact_ready` socket event
+    /// when the publishing turn carries an `APPROVAL_CHAT_CONTEXT`
+    /// (see [`crate::openhuman::approval::ApprovalChatContext`]).
+    /// Sub-task #2779 of #1535.
+    ArtifactReady {
+        /// UUID of the artifact record.
+        artifact_id: String,
+        /// Lowercase variant of `ArtifactKind` (`presentation`,
+        /// `document`, `image`, `other`).
+        kind: String,
+        /// Human-readable title (also the on-disk filename stem).
+        title: String,
+        /// Absolute workspace root the artifact belongs to (matches
+        /// the `workspace_dir` parameter passed to
+        /// `finalize_artifact`). Bound to the event so a subscriber
+        /// firing AFTER the user switched workspaces can detect the
+        /// mismatch and drop the surface — `path` is workspace-
+        /// relative and would otherwise resolve into the wrong
+        /// `<workspace>/artifacts/` tree.
+        workspace_dir: String,
+        /// Relative path under `<workspace>/artifacts/`, e.g.
+        /// `"<uuid>/deck.pptx"`. The absolute path is reachable via
+        /// `ai_get_artifact` so the renderer never needs the
+        /// workspace root.
+        path: String,
+        /// Final on-disk file size in bytes.
+        size_bytes: u64,
+        /// Chat thread the artifact belongs to, when the producing
+        /// turn carried an `APPROVAL_CHAT_CONTEXT`. `None` for CLI /
+        /// cron / sub-agent paths — no client to fan out to.
+        thread_id: Option<String>,
+        /// Socket.IO client id (room) to surface the card to, when
+        /// known. `None` for non-chat callers.
+        client_id: Option<String>,
+    },
+    /// An artifact transitioned to [`ArtifactStatus::Failed`] — the
+    /// producer surfaced a reason and the UI should render a
+    /// retry-hint card instead of a download. Bridged the same way
+    /// as [`Self::ArtifactReady`]. Sub-task #2779 of #1535.
+    ArtifactFailed {
+        artifact_id: String,
+        kind: String,
+        title: String,
+        /// Absolute workspace root the artifact belongs to — see
+        /// [`Self::ArtifactReady::workspace_dir`] for rationale.
+        workspace_dir: String,
+        /// Producer-supplied failure reason. Already truncated by the
+        /// producer (e.g. `PresentationError::truncate_stderr`).
+        error: String,
+        thread_id: Option<String>,
+        client_id: Option<String>,
+    },
+    /// An artifact record has been **created** (`ArtifactStatus::Pending`)
+    /// but no bytes are on disk yet — the producing tool has only just
+    /// reserved the row. Published by
+    /// [`crate::openhuman::artifacts::store::create_artifact`].
+    /// Bridged to the web channel as an `artifact_pending` socket event
+    /// so the frontend can render an in-progress / "Generating…" card the
+    /// moment the tool dispatches, instead of waiting until the file
+    /// arrives via [`Self::ArtifactReady`]. The pending card is replaced
+    /// in place when the matching `ArtifactReady` / `ArtifactFailed`
+    /// event with the same `artifact_id` arrives. Sub-task #3162 of #1535.
+    ArtifactPending {
+        /// UUID of the freshly-created artifact record.
+        artifact_id: String,
+        /// Lowercase variant of `ArtifactKind` (`presentation`,
+        /// `document`, `image`, `other`).
+        kind: String,
+        /// Human-readable title (also the on-disk filename stem).
+        title: String,
+        /// Absolute workspace root the artifact belongs to — see
+        /// [`Self::ArtifactReady::workspace_dir`] for rationale.
+        workspace_dir: String,
+        /// Relative path under `<workspace>/artifacts/` where the file
+        /// *will* land. The frontend uses it to render a stable card key
+        /// so subsequent `ArtifactReady` can swap the same surface in
+        /// place without flicker.
+        path: String,
+        /// Chat thread the artifact belongs to, when the producing turn
+        /// carried an `APPROVAL_CHAT_CONTEXT`. `None` for CLI / cron /
+        /// sub-agent paths — no client to fan out to.
+        thread_id: Option<String>,
+        /// Socket.IO client id (room) to surface the card to, when known.
+        /// `None` for non-chat callers.
+        client_id: Option<String>,
     },
 
     // ── Webhooks ────────────────────────────────────────────────────────
@@ -658,6 +858,44 @@ pub enum DomainEvent {
         key_name: String,
         prompt: String,
     },
+    /// A remote MCP server returned a tool whose `description` or
+    /// `title` failed the input-validation scan and was dropped from
+    /// the registry before reaching the agent LLM context. Surfaced for
+    /// audit / observability only; carries no payload content because
+    /// the rejected text could itself be a vector.
+    McpToolRejected {
+        /// Registered MCP server name the tool came from.
+        server: String,
+        /// Remote tool name as advertised by the server.
+        tool: String,
+        /// Short pattern / rule code from the validator (e.g.
+        /// `"override.ignore_previous"`). Never the rejected payload.
+        reason: String,
+    },
+
+    /// An `OPENHUMAN_APPROVAL_GATE=0` env override was observed but
+    /// IGNORED because the host is the Tauri desktop shell. The gate is
+    /// always installed under the desktop host; this event lets the UI
+    /// surface a one-shot info banner so the user sees the override was
+    /// rejected. Audit-only; carries no payload content.
+    ApprovalGateOverrideIgnored {
+        /// Host tag (currently always `"tauri-shell"` — added for forward
+        /// compatibility when more desktop hosts land).
+        host: String,
+    },
+    /// The approval gate was NOT installed because an
+    /// `OPENHUMAN_APPROVAL_GATE=0` env override was honored on a
+    /// standalone host (CLI / Docker). Surfaces the elevated-privilege
+    /// state so any connected dashboard can flag it; the desktop UI
+    /// banner subscribes to this variant.
+    ApprovalGateDisabled {
+        /// Host tag (`"cli"` or `"docker"`).
+        host: String,
+        /// Short reason code so downstream consumers can switch on the
+        /// cause without parsing free-text logs. Currently always
+        /// `"env-override"`.
+        reason: String,
+    },
 
     // ── System lifecycle ────────────────────────────────────────────────
     /// A system component started up.
@@ -674,6 +912,11 @@ pub enum DomainEvent {
     /// changed at runtime. Live sessions should rebuild their `SecurityPolicy`
     /// from the persisted config before the next turn.
     AutonomyConfigChanged,
+    /// The agent's filesystem roots (currently the `action_dir` sandbox) were
+    /// changed at runtime via `config.update_agent_paths`. The live
+    /// `SecurityPolicy` is hot-swapped in-band; this broadcast lets other
+    /// listeners observe the change.
+    AgentPathsChanged,
     /// A component's health status changed.
     HealthChanged {
         component: String,
@@ -682,6 +925,20 @@ pub enum DomainEvent {
     },
     /// A component restart was observed.
     HealthRestarted { component: String },
+    /// A one-time harness-init step changed state (pending → running → done /
+    /// failed / skipped). Surfaced to the frontend initialization screen.
+    HarnessInitProgress {
+        step_id: String,
+        state: String,
+        message: Option<String>,
+        percent: Option<u8>,
+    },
+    /// The harness-init run reached a terminal state. `failed_required` is true
+    /// only when a *required* step failed (no required steps today).
+    HarnessInitCompleted {
+        overall: String,
+        failed_required: bool,
+    },
 
     // ── Keyring ─────────────────────────────────────────────────────────
     /// The OS keyring is unavailable and no user consent for local fallback
@@ -706,6 +963,10 @@ pub enum DomainEvent {
     /// detection (already redacted by the call site) — surfaced to logs,
     /// never to Sentry or the UI verbatim.
     SessionExpired { source: String, reason: String },
+
+    // ── Voice ────────────────────────────────────────────────────────────
+    /// A voice domain event (PTT, transcription lifecycle, etc.).
+    Voice(VoiceEvent),
 
     // ── Task sources ─────────────────────────────────────────────────────
     /// A task source completed a fetch pass.
@@ -742,6 +1003,131 @@ pub enum DomainEvent {
     /// deliberate follow-up; emitting the event now lets that bridge attach
     /// without a schema change.
     TaskPlanAwaitingApproval { card_id: String, thread_id: String },
+    /// A stale or wedged task run was reclaimed — the card moved back to
+    /// `todo` (re-dispatchable) or `blocked` (max reclaim count exceeded).
+    TaskRunReclaimed {
+        run_id: String,
+        card_id: String,
+        thread_id: String,
+        reason: String,
+    },
+
+    // ── Backend Meet Bot ──────────────────────────────────────────────
+    /// Backend gmeet bot successfully joined the meeting.
+    BackendMeetJoined {
+        meet_url: String,
+        correlation_id: Option<String>,
+    },
+    /// Backend gmeet bot left the meeting.
+    BackendMeetLeft {
+        reason: String,
+        correlation_id: Option<String>,
+    },
+    /// Backend gmeet bot produced a spoken reply.
+    BackendMeetReply {
+        transcript: String,
+        reply: String,
+        emotion: String,
+        correlation_id: Option<String>,
+    },
+    /// Backend gmeet bot needs the harness to execute a tool instruction.
+    BackendMeetHarness {
+        transcript: String,
+        instruction: String,
+        emotion: String,
+        correlation_id: Option<String>,
+    },
+    /// Backend gmeet bot sent the full meeting transcript on close.
+    BackendMeetTranscript {
+        turns: Vec<BackendMeetTurn>,
+        duration_ms: u64,
+        correlation_id: Option<String>,
+    },
+    /// Backend gmeet bot emitted an error.
+    BackendMeetError {
+        error: String,
+        correlation_id: Option<String>,
+    },
+    /// Backend gmeet bot detected a wake-phrase command from a participant.
+    BackendMeetInCallRequest {
+        correlation_id: Option<String>,
+        speaker: String,
+        command_text: String,
+        recent_transcript: Vec<BackendMeetTurn>,
+        timestamp_ms: u64,
+    },
+    /// Core asked the backend bot to speak into the call (`bot:speak`).
+    /// Published for observability after the Socket.IO emit succeeds.
+    BackendMeetSpeak {
+        text: String,
+        correlation_id: Option<String>,
+    },
+    /// An approval was parked during a live-meeting orchestrator turn
+    /// (issue #3513). The meeting bus speaks the prompt into the call;
+    /// the decision arrives by voice ("Hey Tiny, approve") or the
+    /// standard thread approval card — first response wins.
+    InCallApprovalRequested {
+        request_id: String,
+        tool_name: String,
+        action_summary: String,
+        correlation_id: Option<String>,
+    },
+    /// A Google Calendar event with a Meet link was detected and the
+    /// auto-join policy is "ask" — the UI should prompt the user.
+    MeetAutoJoinPrompt {
+        meet_url: String,
+        event_title: String,
+    },
+    /// A new meeting session was created (Pending) after a calendar Meet
+    /// link was detected and the auto-join prompt was surfaced (issue #3507).
+    MeetingSessionCreated {
+        meeting_id: String,
+        meet_url: String,
+        title: String,
+        /// Origin of the session: "calendar" | "manual" | "api".
+        source: String,
+    },
+    /// Auto-join was triggered for a meeting — either policy == Always or the
+    /// user clicked a join action on the auto-join prompt (issue #3507).
+    MeetingAutoJoinTriggered {
+        meeting_id: String,
+        meet_url: String,
+        listen_only: bool,
+        correlation_id: String,
+    },
+    /// Reserved for PR-4: a post-meeting summary was generated from the
+    /// transcript (action items, key decisions, etc.).
+    MeetingSummaryGenerated {
+        thread_id: String,
+        correlation_id: Option<String>,
+        summary: String,
+    },
+    /// A JSON message arrived on a tinyplace WebSocket stream.
+    /// Published by the stream manager's recv loop. Carries the raw
+    /// server-sent JSON value (inbox item, conversation message, etc.)
+    /// so the Socket.IO bridge can forward it to the renderer.
+    TinyPlaceStreamMessage {
+        /// Stream identifier (e.g. `"inbox"`, `"conversation:abc123"`).
+        stream_id: String,
+        /// Stream kind for routing.
+        kind: String,
+        /// The raw JSON message from the tinyplace server.
+        message: serde_json::Value,
+    },
+    /// A tinyplace WebSocket stream changed lifecycle status.
+    /// Published by the stream manager on connect, disconnect, and failure.
+    TinyPlaceStreamStatusChanged {
+        /// Stream identifier.
+        stream_id: String,
+        /// New status: `"connecting"`, `"connected"`, `"disconnected"`, `"failed"`.
+        status: String,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BackendMeetTurn {
+    pub role: String,
+    pub content: String,
 }
 
 impl DomainEvent {
@@ -758,7 +1144,13 @@ impl DomainEvent {
             | Self::AgentOrchestrationSpawned { .. }
             | Self::AgentOrchestrationCompleted { .. }
             | Self::AgentOrchestrationFailed { .. }
-            | Self::AgentOrchestrationClosed { .. } => "agent",
+            | Self::AgentOrchestrationClosed { .. }
+            | Self::RunQueueMessageQueued { .. }
+            | Self::RunQueueMessageDelivered { .. }
+            | Self::RunQueueFollowupDispatched { .. }
+            | Self::RunQueueInterrupted { .. } => "agent",
+
+            Self::MonitorStatusChanged { .. } | Self::MonitorLine { .. } => "monitor",
 
             Self::EmbeddingModelUnhealthy { .. }
             | Self::MemoryStored { .. }
@@ -767,7 +1159,9 @@ impl DomainEvent {
             | Self::MemorySyncStageChanged { .. }
             | Self::MemoryIngestionStarted { .. }
             | Self::MemoryIngestionCompleted { .. }
-            | Self::DocumentCanonicalized { .. } => "memory",
+            | Self::DocumentCanonicalized { .. }
+            | Self::MemoryDiffSnapshotTaken { .. }
+            | Self::MemoryDiffComputed { .. } => "memory",
 
             Self::CacheRebuilt { .. } => "learning",
 
@@ -784,10 +1178,11 @@ impl DomainEvent {
             | Self::CronDeliveryRequested { .. }
             | Self::ProactiveMessageRequested { .. } => "cron",
 
-            Self::SkillLoaded { .. }
-            | Self::SkillStopped { .. }
-            | Self::SkillStartFailed { .. }
-            | Self::SkillExecuted { .. } => "skill",
+            Self::WorkflowLoaded { .. }
+            | Self::WorkflowStopped { .. }
+            | Self::WorkflowStartFailed { .. }
+            | Self::WorkflowExecuted { .. }
+            | Self::WorkflowsChanged { .. } => "workflow",
 
             Self::ToolExecutionStarted { .. } | Self::ToolExecutionCompleted { .. } => "tool",
 
@@ -831,8 +1226,11 @@ impl DomainEvent {
             | Self::SystemRestartRequested { .. }
             | Self::SystemShutdownRequested { .. }
             | Self::AutonomyConfigChanged
+            | Self::AgentPathsChanged
             | Self::HealthChanged { .. }
-            | Self::HealthRestarted { .. } => "system",
+            | Self::HealthRestarted { .. }
+            | Self::HarnessInitProgress { .. }
+            | Self::HarnessInitCompleted { .. } => "system",
 
             Self::KeyringConsentRequired | Self::KeyringDecryptFailed { .. } => "keyring",
 
@@ -842,15 +1240,45 @@ impl DomainEvent {
             | Self::TaskSourceTaskIngested { .. }
             | Self::TaskSourceFetchFailed { .. } => "task_sources",
 
-            Self::TaskPlanAwaitingApproval { .. } => "agent",
+            Self::TaskPlanAwaitingApproval { .. } | Self::TaskRunReclaimed { .. } => "agent",
 
-            Self::ApprovalRequested { .. } | Self::ApprovalDecided { .. } => "approval",
+            Self::SubconsciousTriggerProcessed { .. } => "subconscious",
+
+            Self::Voice(_) => "voice",
+
+            Self::ApprovalRequested { .. }
+            | Self::ApprovalDecided { .. }
+            | Self::ApprovalGateOverrideIgnored { .. }
+            | Self::ApprovalGateDisabled { .. } => "approval",
+
+            Self::ArtifactReady { .. }
+            | Self::ArtifactFailed { .. }
+            | Self::ArtifactPending { .. } => "artifact",
 
             Self::McpServerInstalled { .. }
             | Self::McpServerConnected { .. }
             | Self::McpServerDisconnected { .. }
             | Self::McpClientToolExecuted { .. }
-            | Self::McpSetupSecretRequested { .. } => "mcp_client",
+            | Self::McpSetupSecretRequested { .. }
+            | Self::McpToolRejected { .. } => "mcp_client",
+
+            Self::BackendMeetJoined { .. }
+            | Self::BackendMeetLeft { .. }
+            | Self::BackendMeetReply { .. }
+            | Self::BackendMeetHarness { .. }
+            | Self::BackendMeetTranscript { .. }
+            | Self::BackendMeetError { .. }
+            | Self::BackendMeetInCallRequest { .. }
+            | Self::BackendMeetSpeak { .. }
+            | Self::InCallApprovalRequested { .. }
+            | Self::MeetAutoJoinPrompt { .. }
+            | Self::MeetingSessionCreated { .. }
+            | Self::MeetingAutoJoinTriggered { .. }
+            | Self::MeetingSummaryGenerated { .. } => "agent_meetings",
+
+            Self::TinyPlaceStreamMessage { .. } | Self::TinyPlaceStreamStatusChanged { .. } => {
+                "tinyplace"
+            }
         }
     }
 
@@ -868,6 +1296,13 @@ impl DomainEvent {
             Self::AgentOrchestrationCompleted { .. } => "AgentOrchestrationCompleted",
             Self::AgentOrchestrationFailed { .. } => "AgentOrchestrationFailed",
             Self::AgentOrchestrationClosed { .. } => "AgentOrchestrationClosed",
+            Self::SubconsciousTriggerProcessed { .. } => "SubconsciousTriggerProcessed",
+            Self::RunQueueMessageQueued { .. } => "RunQueueMessageQueued",
+            Self::RunQueueMessageDelivered { .. } => "RunQueueMessageDelivered",
+            Self::RunQueueFollowupDispatched { .. } => "RunQueueFollowupDispatched",
+            Self::RunQueueInterrupted { .. } => "RunQueueInterrupted",
+            Self::MonitorStatusChanged { .. } => "MonitorStatusChanged",
+            Self::MonitorLine { .. } => "MonitorLine",
             Self::MemoryStored { .. } => "MemoryStored",
             Self::MemoryRecalled { .. } => "MemoryRecalled",
             Self::MemorySyncRequested { .. } => "MemorySyncRequested",
@@ -875,6 +1310,8 @@ impl DomainEvent {
             Self::MemoryIngestionStarted { .. } => "MemoryIngestionStarted",
             Self::MemoryIngestionCompleted { .. } => "MemoryIngestionCompleted",
             Self::DocumentCanonicalized { .. } => "DocumentCanonicalized",
+            Self::MemoryDiffSnapshotTaken { .. } => "MemoryDiffSnapshotTaken",
+            Self::MemoryDiffComputed { .. } => "MemoryDiffComputed",
             Self::CacheRebuilt { .. } => "CacheRebuilt",
             Self::ChannelInboundMessage { .. } => "ChannelInboundMessage",
             Self::ChannelMessageReceived { .. } => "ChannelMessageReceived",
@@ -887,10 +1324,11 @@ impl DomainEvent {
             Self::CronJobCompleted { .. } => "CronJobCompleted",
             Self::CronDeliveryRequested { .. } => "CronDeliveryRequested",
             Self::ProactiveMessageRequested { .. } => "ProactiveMessageRequested",
-            Self::SkillLoaded { .. } => "SkillLoaded",
-            Self::SkillStopped { .. } => "SkillStopped",
-            Self::SkillStartFailed { .. } => "SkillStartFailed",
-            Self::SkillExecuted { .. } => "SkillExecuted",
+            Self::WorkflowLoaded { .. } => "WorkflowLoaded",
+            Self::WorkflowStopped { .. } => "WorkflowStopped",
+            Self::WorkflowStartFailed { .. } => "WorkflowStartFailed",
+            Self::WorkflowExecuted { .. } => "WorkflowExecuted",
+            Self::WorkflowsChanged { .. } => "WorkflowsChanged",
             Self::ToolExecutionStarted { .. } => "ToolExecutionStarted",
             Self::ToolExecutionCompleted { .. } => "ToolExecutionCompleted",
             Self::WebhookIncomingRequest { .. } => "WebhookIncomingRequest",
@@ -927,23 +1365,49 @@ impl DomainEvent {
             Self::SystemRestartRequested { .. } => "SystemRestartRequested",
             Self::SystemShutdownRequested { .. } => "SystemShutdownRequested",
             Self::AutonomyConfigChanged => "AutonomyConfigChanged",
+            Self::AgentPathsChanged => "AgentPathsChanged",
             Self::HealthChanged { .. } => "HealthChanged",
             Self::HealthRestarted { .. } => "HealthRestarted",
+            Self::HarnessInitProgress { .. } => "HarnessInitProgress",
+            Self::HarnessInitCompleted { .. } => "HarnessInitCompleted",
             Self::KeyringConsentRequired => "KeyringConsentRequired",
             Self::KeyringDecryptFailed { .. } => "KeyringDecryptFailed",
             Self::SessionExpired { .. } => "SessionExpired",
             Self::ApprovalRequested { .. } => "ApprovalRequested",
             Self::ApprovalDecided { .. } => "ApprovalDecided",
+            Self::ApprovalGateOverrideIgnored { .. } => "ApprovalGateOverrideIgnored",
+            Self::ApprovalGateDisabled { .. } => "ApprovalGateDisabled",
+            Self::ArtifactReady { .. } => "ArtifactReady",
+            Self::ArtifactFailed { .. } => "ArtifactFailed",
+            Self::ArtifactPending { .. } => "ArtifactPending",
             Self::McpServerInstalled { .. } => "McpServerInstalled",
             Self::McpServerConnected { .. } => "McpServerConnected",
             Self::McpServerDisconnected { .. } => "McpServerDisconnected",
             Self::McpClientToolExecuted { .. } => "McpClientToolExecuted",
             Self::McpSetupSecretRequested { .. } => "McpSetupSecretRequested",
+            Self::McpToolRejected { .. } => "McpToolRejected",
             Self::EmbeddingModelUnhealthy { .. } => "EmbeddingModelUnhealthy",
             Self::TaskSourceFetched { .. } => "TaskSourceFetched",
             Self::TaskSourceTaskIngested { .. } => "TaskSourceTaskIngested",
             Self::TaskSourceFetchFailed { .. } => "TaskSourceFetchFailed",
             Self::TaskPlanAwaitingApproval { .. } => "TaskPlanAwaitingApproval",
+            Self::TaskRunReclaimed { .. } => "TaskRunReclaimed",
+            Self::BackendMeetJoined { .. } => "BackendMeetJoined",
+            Self::BackendMeetLeft { .. } => "BackendMeetLeft",
+            Self::BackendMeetReply { .. } => "BackendMeetReply",
+            Self::BackendMeetHarness { .. } => "BackendMeetHarness",
+            Self::BackendMeetTranscript { .. } => "BackendMeetTranscript",
+            Self::BackendMeetError { .. } => "BackendMeetError",
+            Self::BackendMeetInCallRequest { .. } => "BackendMeetInCallRequest",
+            Self::BackendMeetSpeak { .. } => "BackendMeetSpeak",
+            Self::InCallApprovalRequested { .. } => "InCallApprovalRequested",
+            Self::MeetAutoJoinPrompt { .. } => "MeetAutoJoinPrompt",
+            Self::MeetingSessionCreated { .. } => "MeetingSessionCreated",
+            Self::MeetingAutoJoinTriggered { .. } => "MeetingAutoJoinTriggered",
+            Self::MeetingSummaryGenerated { .. } => "MeetingSummaryGenerated",
+            Self::TinyPlaceStreamMessage { .. } => "TinyPlaceStreamMessage",
+            Self::TinyPlaceStreamStatusChanged { .. } => "TinyPlaceStreamStatusChanged",
+            Self::Voice(_) => "Voice",
         }
     }
 
@@ -968,6 +1432,13 @@ impl DomainEvent {
             | Self::ChannelDisconnected { channel, .. } => Some(channel.as_str()),
             Self::ToolExecutionStarted { tool_name, .. }
             | Self::ToolExecutionCompleted { tool_name, .. } => Some(tool_name.as_str()),
+            Self::RunQueueMessageQueued { thread_id, .. }
+            | Self::RunQueueMessageDelivered { thread_id, .. }
+            | Self::RunQueueFollowupDispatched { thread_id, .. }
+            | Self::RunQueueInterrupted { thread_id, .. } => Some(thread_id.as_str()),
+            Self::MonitorStatusChanged { thread_id, .. } | Self::MonitorLine { thread_id, .. } => {
+                thread_id.as_deref()
+            }
             _ => None,
         }
     }

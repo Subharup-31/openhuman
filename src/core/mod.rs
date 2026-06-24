@@ -20,8 +20,10 @@ pub mod logging;
 pub mod memory_cli;
 pub mod observability;
 pub mod rpc_log;
+pub mod runtime;
 pub mod shutdown;
 pub mod socketio;
+pub mod subconscious_cli;
 pub mod types;
 
 /// Canonical function contract for domain controllers.

@@ -78,6 +78,7 @@ pub fn add_agent_job(
         delivery,
         delete_after_run,
         None,
+        true,
     )
 }
 
@@ -95,6 +96,7 @@ pub fn add_agent_job_with_definition(
     delivery: Option<DeliveryConfig>,
     delete_after_run: bool,
     agent_id: Option<String>,
+    enabled: bool,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -105,11 +107,15 @@ pub fn add_agent_job_with_definition(
     let delivery = delivery.unwrap_or_default();
 
     with_connection(config, |conn| {
+        // `enabled` is bound (?13) rather than hard-coded so callers can insert a
+        // job in its final disabled state in one statement — important for opt-in
+        // jobs (e.g. the autopilot) where a create-then-disable sequence could
+        // leave the row enabled if the process died between the two writes.
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run, agent_id
-             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12)",
+             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, ?13, ?8, ?9, ?10, ?11, ?12)",
             params![
                 id,
                 expression,
@@ -123,6 +129,7 @@ pub fn add_agent_job_with_definition(
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
                 agent_id,
+                if enabled { 1 } else { 0 },
             ],
         )
         .context("Failed to insert cron agent job")?;
@@ -197,6 +204,80 @@ pub fn clear_all_jobs(config: &Config) -> Result<usize> {
     Ok(removed)
 }
 
+/// Remove duplicate cron jobs that share the same `name`.
+///
+/// Older builds used a non-atomic check-then-insert in `seed_proactive_agents`,
+/// which allowed two identical rows (e.g. two `morning_briefing` entries) to
+/// land in the database when the function raced or was called twice before the
+/// first insert committed. The `cron_jobs` table has no `UNIQUE` constraint on
+/// `name`, so both rows persist and the Routines screen renders two cards.
+///
+/// For each duplicated name this function keeps the row with the most
+/// `cron_runs` history (ties broken by earliest `created_at`) and deletes
+/// all others. Returns the total number of rows removed across all names.
+///
+/// Idempotent: calling it on a database with no duplicates removes nothing
+/// and returns `Ok(0)`.
+pub fn dedup_named_jobs(config: &Config) -> Result<usize> {
+    with_connection(config, |conn| {
+        // 1. Find all names that appear more than once.
+        let duplicated_names: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM cron_jobs \
+                 WHERE name IS NOT NULL \
+                 GROUP BY name \
+                 HAVING COUNT(*) > 1",
+            )?;
+            let names = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for n in names {
+                out.push(n?);
+            }
+            out
+        };
+
+        if duplicated_names.is_empty() {
+            return Ok(0);
+        }
+
+        let mut canonical_stmt = conn.prepare(
+            "SELECT j.id \
+             FROM cron_jobs j \
+             LEFT JOIN cron_runs r ON r.job_id = j.id \
+             WHERE j.name = ?1 \
+             GROUP BY j.id \
+             ORDER BY COUNT(r.id) DESC, j.created_at ASC, j.id ASC \
+             LIMIT 1",
+        )?;
+
+        let mut total_removed = 0usize;
+        for name in &duplicated_names {
+            // 2. Find the canonical id: most run history, tie-break earliest created_at.
+            let canonical_id: Option<String> = {
+                let mut rows = canonical_stmt.query(params![name])?;
+                rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?
+            };
+
+            let Some(keep_id) = canonical_id else {
+                continue;
+            };
+
+            // 3. Delete every other row sharing this name.
+            let deleted = conn.execute(
+                "DELETE FROM cron_jobs WHERE name = ?1 AND id != ?2",
+                params![name, keep_id],
+            )?;
+            log::info!(
+                "[cron] dedup_named_jobs: removed {deleted} duplicate(s) of '{name}' \
+                 (keeping id={keep_id})"
+            );
+            total_removed += deleted;
+        }
+
+        Ok(total_removed)
+    })
+}
+
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let lim = i64::try_from(config.scheduler.max_tasks.max(1))
         .context("Scheduler max_tasks overflows i64")?;
@@ -223,6 +304,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
 
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
     let mut job = get_job(config, job_id)?;
+    let was_enabled = job.enabled;
     let mut schedule_changed = false;
 
     if let Some(schedule) = patch.schedule {
@@ -261,6 +343,24 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
 
     if schedule_changed {
         job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
+    } else if job.enabled && !was_enabled {
+        // Disabled→enabled transition (e.g. opting into a seeded morning
+        // briefing). A job that sat disabled past its originally computed
+        // next_run would otherwise fire immediately on opt-in, because the
+        // scheduler selects `enabled = 1 AND next_run <= now`. Refresh a stale
+        // next_run so the first run lands on the next scheduled occurrence
+        // rather than firing the instant the user flips the switch.
+        let now = Utc::now();
+        if job.next_run <= now {
+            let refreshed = next_run_for_schedule(&job.schedule, now)?;
+            tracing::debug!(
+                job_id = %job.id,
+                stale_next_run = %job.next_run.to_rfc3339(),
+                next_run = %refreshed.to_rfc3339(),
+                "[cron::update_job] refreshed stale next_run on disabled→enabled transition"
+            );
+            job.next_run = refreshed;
+        }
     }
 
     with_connection(config, |conn| {
@@ -391,6 +491,18 @@ pub fn record_run(
         tx.commit()
             .context("Failed to commit cron run transaction")?;
         Ok(())
+    })
+}
+
+/// Remove all "queued" placeholder records for a given job so that only the
+/// real (ok/error) result row remains in the run history.
+pub fn delete_queued_runs(config: &Config, job_id: &str) -> Result<usize> {
+    with_connection(config, |conn| {
+        let deleted = conn.execute(
+            "DELETE FROM cron_runs WHERE job_id = ?1 AND status = 'queued'",
+            params![job_id],
+        )?;
+        Ok(deleted)
     })
 }
 

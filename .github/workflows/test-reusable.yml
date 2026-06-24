@@ -1,7 +1,6 @@
 ---
 # Reusable test workflow — frontend unit tests, Rust core tests, Rust Tauri
-# shell tests. Same job graph used by both PR/push (`test.yml`) and the
-# release pretest gate (`release-staging.yml`, `release-production.yml`).
+# shell tests. Used by PR/push (`test.yml`).
 #
 # Caching: pnpm store, Swatinem rust-cache, CEF runtime, and sccache backed
 # by the GitHub Actions cache. Cache keys mirror what the release build
@@ -41,6 +40,7 @@ jobs:
     if: inputs.run_unit
     name: i18n Coverage
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     container:
       image: ghcr.io/tinyhumansai/openhuman_ci:rust-1.93.0
     steps:
@@ -65,6 +65,7 @@ jobs:
     if: inputs.run_unit
     name: Frontend Unit Tests
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     container:
       image: ghcr.io/tinyhumansai/openhuman_ci:rust-1.93.0
     steps:
@@ -128,7 +129,7 @@ jobs:
     if: inputs.run_rust_core
     name: Rust Core Tests (Windows — secrets ACL)
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 30
     env:
       CARGO_INCREMENTAL: '0'
       SCCACHE_GHA_ENABLED: 'true'
@@ -165,6 +166,7 @@ jobs:
     if: inputs.run_rust_tauri
     name: Rust Tauri Shell Tests
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     container:
       image: ghcr.io/tinyhumansai/openhuman_ci:rust-1.93.0
     env:

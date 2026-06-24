@@ -21,35 +21,37 @@ pub use daemon::DaemonConfig;
 pub use ops as rpc;
 pub use ops::*;
 
+pub use schema::{
+    action_dir_env_override, active_user_marker_path, clear_active_user, default_action_dir,
+    default_projects_dir, default_root_openhuman_dir, pre_login_user_dir, read_active_user_id,
+    resolve_action_dir, user_openhuman_dir, write_active_user_id, PRE_LOGIN_USER_ID,
+};
 #[allow(unused_imports)]
 pub use schema::{
     apply_runtime_proxy_to_builder, build_runtime_proxy_client,
     build_runtime_proxy_client_with_timeouts, output_language_directive, runtime_proxy_config,
-    set_runtime_proxy_config, AgentConfig, AuditConfig, AutocompleteConfig, AutonomyConfig,
-    BrowserComputerUseConfig, BrowserConfig, CapabilityProviderConfig,
-    CapabilityProviderTrustState, ChannelsConfig, ComposioConfig, Config, ContextConfig,
-    CostConfig, CronConfig, CurlConfig, DashboardConfig, DelegateAgentConfig, DiagramViewerConfig,
-    DictationActivationMode, DictationConfig, DiscordConfig, DockerRuntimeConfig,
-    EmbeddingRouteConfig, GitbooksConfig, HeartbeatConfig, HttpRequestConfig, IMessageConfig,
-    IntegrationToggle, IntegrationsConfig, LarkConfig, LearningConfig, LlmBackend, LocalAiConfig,
-    MatrixConfig, McpAuthConfig, McpClientConfig, McpClientIdentityConfig, McpServerConfig,
-    MeetConfig, MemoryConfig, MemoryTreeConfig, ModelRouteConfig, MultimodalConfig,
-    MultimodalFileConfig, ObservabilityConfig, OrchestratorModelConfig, PolymarketClobCredentials,
-    PolymarketConfig, ProxyConfig, ProxyScope, ReflectionSource, ReliabilityConfig,
-    ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
-    SchedulerGateConfig, SchedulerGateMode, ScreenIntelligenceConfig, SearchConfig, SearchEngine,
-    SearchEngineCredentials, SearxngConfig, SecretsConfig, SecurityConfig, SlackConfig,
-    StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode, TeamModelConfig,
-    TelegramConfig, UpdateConfig, UpdateRestartStrategy, VoiceActivationMode, VoiceServerConfig,
-    WebSearchConfig, WebhookConfig, DEFAULT_CLOUD_LLM_MODEL, DEFAULT_MODEL, MODEL_AGENTIC_V1,
-    MODEL_CHAT_V1, MODEL_CODING_V1, MODEL_REASONING_QUICK_V1, MODEL_REASONING_V1,
-    MODEL_SUMMARIZATION_V1, SEARCH_ENGINE_BRAVE, SEARCH_ENGINE_DISABLED, SEARCH_ENGINE_MANAGED,
-    SEARCH_ENGINE_PARALLEL, SEARCH_ENGINE_QUERIT,
-};
-pub use schema::{
-    clear_active_user, default_action_dir, default_projects_dir, default_root_openhuman_dir,
-    pre_login_user_dir, read_active_user_id, user_openhuman_dir, write_active_user_id,
-    PRE_LOGIN_USER_ID,
+    set_runtime_proxy_config, AgentConfig, AuditConfig, AutoJoinPolicy, AutoSummarizePolicy,
+    AutocompleteConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
+    CapabilityProviderConfig, CapabilityProviderTrustState, ChannelsConfig, ComposioConfig, Config,
+    ContextConfig, CostConfig, CronConfig, CurlConfig, DashboardConfig, DelegateAgentConfig,
+    DiagramViewerConfig, DictationActivationMode, DictationConfig, DiscordConfig,
+    DockerRuntimeConfig, EmbeddingRouteConfig, GitbooksConfig, HeartbeatConfig, HttpHeader,
+    HttpRequestConfig, IMessageConfig, IntegrationToggle, IntegrationsConfig, LarkConfig,
+    LearningConfig, LlmBackend, LocalAiConfig, MatrixConfig, McpAuthConfig, McpClientConfig,
+    McpClientIdentityConfig, McpServerConfig, MeetConfig, MemoryConfig, MemoryTreeConfig,
+    ModelRouteConfig, MultimodalConfig, MultimodalFileConfig, ObservabilityConfig,
+    OrchestratorModelConfig, PolymarketClobCredentials, PolymarketConfig, ProxyConfig, ProxyScope,
+    ReflectionSource, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend,
+    SandboxConfig, SchedulerConfig, SchedulerGateConfig, SchedulerGateMode,
+    ScreenIntelligenceConfig, SearchConfig, SearchEngine, SearchEngineCredentials, SearxngConfig,
+    SecretsConfig, SecurityConfig, ShellConfig, SlackConfig, StorageConfig, StorageProviderConfig,
+    StorageProviderSection, StreamMode, TeamModelConfig, TelegramConfig, UpdateConfig,
+    UpdateRestartStrategy, VoiceActivationMode, VoiceServerConfig, WebSearchConfig, WebhookConfig,
+    DEFAULT_CLOUD_LLM_MODEL, DEFAULT_MEMORY_SYNC_INTERVAL_SECS, DEFAULT_MODEL,
+    MEMORY_SYNC_INTERVAL_PRESETS_SECS, MODEL_AGENTIC_V1, MODEL_CHAT_V1, MODEL_CODING_V1,
+    MODEL_REASONING_QUICK_V1, MODEL_REASONING_V1, MODEL_SUMMARIZATION_V1, MODEL_VISION_V1,
+    SEARCH_ENGINE_BRAVE, SEARCH_ENGINE_DISABLED, SEARCH_ENGINE_MANAGED, SEARCH_ENGINE_PARALLEL,
+    SEARCH_ENGINE_QUERIT,
 };
 pub use schemas::{
     all_controller_schemas as all_config_controller_schemas,
@@ -80,6 +82,7 @@ mod tests {
     fn reexported_channel_configs_are_constructible() {
         let telegram = TelegramConfig {
             bot_token: "token".into(),
+            chat_id: None,
             allowed_users: vec!["alice".into()],
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,

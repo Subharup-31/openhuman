@@ -9,27 +9,23 @@
 //! receive a backend 401/403 surfaced verbatim as an RPC error string.
 //! API keys / JWTs are never written to logs.
 
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
+
 use reqwest::{Method, Url};
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::api::config::effective_backend_api_url;
-use crate::api::jwt::get_session_token;
 use crate::api::BackendOAuthClient;
 use crate::openhuman::config::Config;
 use crate::rpc::RpcOutcome;
 
+/// Canonical authed-session guard. Delegates to `require_live_session_token`,
+/// which rejects an expired token locally (publishing `SessionExpired`) instead
+/// of firing a doomed backend 401 — see #3297 / `session_support`.
 fn require_token(config: &Config) -> Result<String, String> {
-    get_session_token(config)?
-        .and_then(|v| {
-            let t = v.trim().to_string();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
-        })
-        .ok_or_else(|| "no backend session token; run auth_store_session first".to_string())
+    crate::openhuman::credentials::session_support::require_live_session_token(config)
 }
 
 fn normalize_id(input: &str, field: &str) -> Result<String, String> {
@@ -64,21 +60,24 @@ async fn get_authed_value(
     let token = require_token(config)?;
     let api_url = effective_backend_api_url(&config.api_url);
     let client = BackendOAuthClient::new(&api_url).map_err(|e| format!("{e:#}"))?;
-    // `{e:#}` renders the full anyhow chain. `authed_json` wraps the
-    // underlying reqwest error with `.context(format!("backend request {} {}", …))`
-    // (`api/rest.rs::authed_json`), so plain `e.to_string()` only emits
-    // the outer "backend request GET /teams" label and drops the cause
-    // (connect timeout, DNS failure, TLS handshake, non-2xx status, …)
-    // before the JSON-RPC layer reports it to Sentry. OPENHUMAN-TAURI-AD
-    // is the canonical instance: 2 events on `0.53.35` from a Russia
-    // user, all with the truncated label and elapsed_ms=49 — far too
-    // short for a real timeout, so the underlying cause is the only
-    // signal worth surfacing. Same failure mode the `report_error`
-    // doc-string in `core/observability.rs` calls out (TAURI-B2).
+    // `flatten_authed_error` maps the typed `BackendApiError::Unauthorized`
+    // (expected session-lapse 401) onto the `SESSION_EXPIRED` sentinel so the
+    // JSON-RPC layer classifies it as session expiry and skips Sentry (#3297,
+    // TAURI-RUST-8WY on `/teams/me/usage`); every other error keeps its full
+    // `{e:#}` anyhow chain. `authed_json` wraps the underlying reqwest error
+    // with `.context(format!("backend request {} {}", …))`
+    // (`api/rest.rs::authed_json`), so `{e:#}` (not `e.to_string()`) is required
+    // to surface the cause (connect timeout, DNS failure, TLS handshake, non-2xx
+    // status, …) before the JSON-RPC layer reports it to Sentry.
+    // OPENHUMAN-TAURI-AD is the canonical instance: 2 events on `0.53.35` from a
+    // Russia user, all with the truncated label and elapsed_ms=49 — far too
+    // short for a real timeout, so the underlying cause is the only signal worth
+    // surfacing. Same failure mode the `report_error` doc-string in
+    // `core/observability.rs` calls out (TAURI-B2).
     client
         .authed_json(&token, method, path, body)
         .await
-        .map_err(|e| format!("{e:#}"))
+        .map_err(crate::api::flatten_authed_error)
 }
 
 pub async fn get_usage(config: &Config) -> Result<RpcOutcome<Value>, String> {
@@ -87,6 +86,122 @@ pub async fn get_usage(config: &Config) -> Result<RpcOutcome<Value>, String> {
         data,
         "team usage fetched from backend",
     ))
+}
+
+fn usage_number(data: &Value, key: &str) -> f64 {
+    data.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+/// Returns true when backend usage says OpenHuman-managed spend should stop.
+///
+/// A brand-new free account can legitimately have `remainingUsd == 0` and no
+/// recurring budget; that should not disable managed tools on its own. We only
+/// gate once there is an actual cycle budget/spend signal, matching the
+/// frontend's exhausted-budget semantics while covering spend-only payloads.
+pub fn usage_budget_exhausted(data: &Value) -> bool {
+    let remaining = usage_number(data, "remainingUsd");
+    let cycle_budget = usage_number(data, "cycleBudgetUsd");
+    let cycle_spent = usage_number(data, "cycleSpentUsd");
+    let cycle_limit_7day = usage_number(data, "cycleLimit7day");
+    let bypass = data
+        .get("bypassCycleLimit")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    !bypass
+        && remaining <= 0.01
+        && (cycle_budget > 0.01 || cycle_spent > 0.01 || cycle_limit_7day > 0.01)
+}
+
+/// How long a managed-tool budget probe result is reused before re-fetching.
+///
+/// `ensure_budget_available` runs before **every** managed `post`/`get`, so a
+/// burst of managed tool calls in one agent turn would otherwise fire one
+/// `GET /teams/me/usage` round-trip *per call* — doubling the network cost of
+/// each managed integration request and re-fetching identical usage data. A
+/// short TTL collapses that burst to one probe while keeping the gate
+/// responsive: the backend remains the authoritative gate (it rejects spend
+/// once credits run out), so the worst case of a stale cache is a handful of
+/// extra calls within the window that the backend itself still blocks.
+const BUDGET_PROBE_TTL: Duration = Duration::from_secs(30);
+
+/// Process-global cache for the managed-tool budget probe.
+struct BudgetProbeCache {
+    /// `(fetched_at, exhausted)` of the last successful probe, if any.
+    inner: RwLock<Option<(Instant, bool)>>,
+}
+
+impl BudgetProbeCache {
+    const fn new() -> Self {
+        Self {
+            inner: RwLock::new(None),
+        }
+    }
+
+    /// Cached `exhausted` flag if the last probe is still within `ttl`.
+    fn get(&self, now: Instant, ttl: Duration) -> Option<bool> {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        guard.and_then(|(fetched_at, exhausted)| {
+            (now.duration_since(fetched_at) < ttl).then_some(exhausted)
+        })
+    }
+
+    /// Record a fresh probe result.
+    fn put(&self, now: Instant, exhausted: bool) {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        *guard = Some((now, exhausted));
+    }
+}
+
+static BUDGET_PROBE_CACHE: BudgetProbeCache = BudgetProbeCache::new();
+
+pub async fn managed_tool_budget_exhausted(config: &Config) -> bool {
+    budget_exhausted_with_cache(&BUDGET_PROBE_CACHE, BUDGET_PROBE_TTL, || async {
+        match get_usage(config).await {
+            Ok(outcome) => Some(usage_budget_exhausted(&outcome.value)),
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "[budget-gate] usage probe failed; allowing managed tool to defer to backend"
+                );
+                None
+            }
+        }
+    })
+    .await
+}
+
+/// Cache-aware budget gate. Returns the cached `exhausted` flag when fresh;
+/// otherwise calls `fetch` and caches a successful result. A failed probe
+/// (`fetch` returns `None`) is **not** cached and reports "not exhausted" so
+/// the call defers to the backend gate — identical to the pre-cache behaviour.
+async fn budget_exhausted_with_cache<F, Fut>(
+    cache: &BudgetProbeCache,
+    ttl: Duration,
+    fetch: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<bool>>,
+{
+    if let Some(hit) = cache.get(Instant::now(), ttl) {
+        tracing::debug!(exhausted = hit, "[team] budget probe cache hit");
+        return hit;
+    }
+    match fetch().await {
+        Some(exhausted) => {
+            tracing::debug!(
+                exhausted,
+                "[team] budget probe cache miss; caching fresh probe"
+            );
+            cache.put(Instant::now(), exhausted);
+            exhausted
+        }
+        None => {
+            tracing::debug!("[team] budget probe failed; deferring to backend gate (not cached)");
+            false
+        }
+    }
 }
 
 pub async fn list_members(config: &Config, team_id: &str) -> Result<RpcOutcome<Value>, String> {
@@ -278,6 +393,101 @@ pub async fn revoke_invite(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn budget_cache_get_returns_none_when_empty() {
+        let cache = BudgetProbeCache::new();
+        assert_eq!(cache.get(Instant::now(), Duration::from_secs(30)), None);
+    }
+
+    #[test]
+    fn budget_cache_returns_value_within_ttl_and_expires_after() {
+        let cache = BudgetProbeCache::new();
+        let base = Instant::now();
+        cache.put(base, true);
+        // Within TTL → cached value.
+        assert_eq!(
+            cache.get(base + Duration::from_secs(5), Duration::from_secs(30)),
+            Some(true)
+        );
+        // Past TTL → miss (caller must re-probe).
+        assert_eq!(
+            cache.get(base + Duration::from_secs(31), Duration::from_secs(30)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_hit_skips_fetch() {
+        let cache = BudgetProbeCache::new();
+        cache.put(Instant::now(), true);
+        let calls = AtomicUsize::new(0);
+        let result = budget_exhausted_with_cache(&cache, Duration::from_secs(30), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Some(false) }
+        })
+        .await;
+        assert!(result, "fresh cache value should be returned");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "fetch must be skipped on cache hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_miss_fetches_and_caches() {
+        let cache = BudgetProbeCache::new();
+        let calls = AtomicUsize::new(0);
+        // First call: empty cache → fetch runs and result is cached.
+        let first = budget_exhausted_with_cache(&cache, Duration::from_secs(30), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Some(true) }
+        })
+        .await;
+        assert!(first);
+        // Second call: cache is now warm → fetch is skipped.
+        let second = budget_exhausted_with_cache(&cache, Duration::from_secs(30), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Some(false) }
+        })
+        .await;
+        assert!(
+            second,
+            "second call should return the cached true, not the fresh false"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the first call should fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_probe_is_not_cached_and_defers_to_backend() {
+        let cache = BudgetProbeCache::new();
+        let calls = AtomicUsize::new(0);
+        // Probe failure (None) → returns false (defer to backend) and does not cache.
+        let first = budget_exhausted_with_cache(&cache, Duration::from_secs(30), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { None }
+        })
+        .await;
+        assert!(!first, "failed probe defers to backend (not exhausted)");
+        // Next call must re-probe because the failure wasn't cached.
+        let second = budget_exhausted_with_cache(&cache, Duration::from_secs(30), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Some(true) }
+        })
+        .await;
+        assert!(second);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "failed probe is re-fetched next time"
+        );
+    }
 
     #[test]
     fn build_api_path_encodes_reserved_characters_in_segments() {
@@ -329,6 +539,38 @@ mod tests {
         // Only leading/trailing whitespace is stripped — interior is preserved
         // so we don't silently corrupt caller-provided identifiers.
         assert_eq!(normalize_id("a b", "x").unwrap(), "a b");
+    }
+
+    #[test]
+    fn usage_budget_exhausted_requires_real_cycle_signal() {
+        assert!(!usage_budget_exhausted(&json!({
+            "remainingUsd": 0,
+            "cycleBudgetUsd": 0,
+            "cycleSpentUsd": 0,
+        })));
+        assert!(usage_budget_exhausted(&json!({
+            "remainingUsd": 0,
+            "cycleBudgetUsd": 10,
+            "cycleSpentUsd": 10,
+        })));
+        assert!(usage_budget_exhausted(&json!({
+            "remainingUsd": 0,
+            "cycleBudgetUsd": 0,
+            "cycleSpentUsd": 2,
+        })));
+    }
+
+    #[test]
+    fn usage_budget_exhausted_honors_remaining_and_bypass() {
+        assert!(!usage_budget_exhausted(&json!({
+            "remainingUsd": 0.25,
+            "cycleBudgetUsd": 10,
+        })));
+        assert!(!usage_budget_exhausted(&json!({
+            "remainingUsd": 0,
+            "cycleBudgetUsd": 10,
+            "bypassCycleLimit": true,
+        })));
     }
 
     // --- pre-HTTP input validation (no network) -----------------------------

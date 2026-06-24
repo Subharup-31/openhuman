@@ -8,7 +8,19 @@ use crate::openhuman::inference::provider::{temperature, thread_context};
 
 use super::{AuthStyle, OpenAiCompatibleProvider};
 
+const OPENROUTER_REFERER: &str = "https://openhuman.ai";
+const OPENROUTER_TITLE: &str = "OpenHuman";
+
 impl OpenAiCompatibleProvider {
+    /// Build the Ollama-specific `options` block for the request body.
+    /// Returns `None` when no `num_ctx` override is configured.
+    pub(super) fn build_ollama_options(&self) -> Option<super::compatible_types::OllamaOptions> {
+        self.ollama_num_ctx
+            .map(|num_ctx| super::compatible_types::OllamaOptions {
+                num_ctx: Some(num_ctx),
+            })
+    }
+
     /// Resolve the effective temperature for `model`. Returns `None` when the
     /// model matches a pattern in `temperature_unsupported_models` (causing the
     /// field to be omitted from the serialised request). Otherwise yields the
@@ -27,6 +39,28 @@ impl OpenAiCompatibleProvider {
             None
         } else {
             Some(self.temperature_override.unwrap_or(temperature))
+        }
+    }
+
+    /// Resolve the `frequency_penalty` to send on streaming chat requests.
+    ///
+    /// Returns `None` — omitting the field entirely — for endpoints whose
+    /// OpenAI-compatible surface rejects the parameter with an HTTP 400
+    /// (see [`endpoint_rejects_frequency_penalty`]). Google's Gemini shim
+    /// (`generativelanguage.googleapis.com/v1beta/openai`) is the known case:
+    /// it 400s on the unknown field, which previously forced every streaming
+    /// call into a wasted reject→retry round-trip and one Sentry report
+    /// (TAURI-RUST-4PJ). Omitting it up front removes the failing request at
+    /// the source. Every other provider keeps the configured penalty.
+    pub(super) fn effective_frequency_penalty(&self) -> Option<f64> {
+        if endpoint_rejects_frequency_penalty(&self.base_url) {
+            tracing::debug!(
+                "[provider:{}] endpoint rejects frequency_penalty — omitting it",
+                self.name
+            );
+            None
+        } else {
+            Some(super::compatible_repeat::CHAT_FREQUENCY_PENALTY)
         }
     }
 
@@ -82,8 +116,8 @@ impl OpenAiCompatibleProvider {
 
             // Platform-appropriate TLS backend — see [`crate::openhuman::tls`].
             let builder = crate::openhuman::tls::tls_client_builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(super::compatible_timeout::request_timeout())
+                .connect_timeout(super::compatible_timeout::connect_timeout())
                 .default_headers(headers);
             let builder = crate::openhuman::config::apply_runtime_proxy_to_builder(
                 builder,
@@ -100,8 +134,8 @@ impl OpenAiCompatibleProvider {
 
         // Platform-appropriate TLS backend — see [`crate::openhuman::tls`].
         let builder = crate::openhuman::tls::tls_client_builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .connect_timeout(std::time::Duration::from_secs(10));
+            .timeout(super::compatible_timeout::request_timeout())
+            .connect_timeout(super::compatible_timeout::connect_timeout());
         let builder = crate::openhuman::config::apply_runtime_proxy_to_builder(
             builder,
             "provider.compatible",
@@ -266,7 +300,7 @@ impl OpenAiCompatibleProvider {
                 .header("anthropic-version", "2023-06-01"),
             (AuthStyle::Custom(header), Some(credential)) => req.header(header, credential),
         };
-        self.apply_extra_headers(req)
+        self.apply_openrouter_attribution_headers(self.apply_extra_headers(req))
     }
 
     pub(super) fn apply_extra_headers(
@@ -281,4 +315,60 @@ impl OpenAiCompatibleProvider {
         }
         req
     }
+
+    pub(super) fn is_openrouter_endpoint(&self) -> bool {
+        if self.name.eq_ignore_ascii_case("openrouter") {
+            return true;
+        }
+
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+    }
+
+    pub(super) fn apply_openrouter_attribution_headers(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        if let Some((referer, title)) = self.openrouter_attribution_headers() {
+            req.header("HTTP-Referer", referer)
+                .header("X-OpenRouter-Title", title)
+        } else {
+            req
+        }
+    }
+
+    pub(super) fn openrouter_attribution_headers(&self) -> Option<(&'static str, &'static str)> {
+        self.is_openrouter_endpoint()
+            .then_some((OPENROUTER_REFERER, OPENROUTER_TITLE))
+    }
+}
+
+/// Endpoint hosts whose OpenAI-compatible surface rejects the
+/// `frequency_penalty` sampling field with an HTTP 400. Matched against the
+/// request host (exact or as a registrable-domain suffix), so a BYOK provider
+/// pointed at the same upstream is covered too. Single source of truth — add a
+/// host here if another strict endpoint surfaces the same rejection.
+const FREQUENCY_PENALTY_UNSUPPORTED_HOSTS: &[&str] = &["generativelanguage.googleapis.com"];
+
+/// Whether `base_url`'s host is known to reject `frequency_penalty`.
+///
+/// Google's Gemini OpenAI-compat shim
+/// (`https://generativelanguage.googleapis.com/v1beta/openai`) 400s on the
+/// unknown field (`Unknown name "frequency_penalty": Cannot find field`),
+/// which previously forced every streaming call into a wasted reject→retry
+/// and one Sentry report per first attempt (TAURI-RUST-4PJ). Detecting it by
+/// host — rather than provider slug — also covers BYOK providers configured
+/// against the same endpoint.
+pub(super) fn endpoint_rejects_frequency_penalty(base_url: &str) -> bool {
+    let host = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+    let Some(host) = host else {
+        return false;
+    };
+    FREQUENCY_PENALTY_UNSUPPORTED_HOSTS
+        .iter()
+        .any(|known| host == *known || host.ends_with(&format!(".{known}")))
 }

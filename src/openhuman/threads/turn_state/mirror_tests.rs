@@ -164,6 +164,7 @@ fn task_board_update_is_stored_and_flushed() {
             evidence: Vec::new(),
             notes: None,
             blocker: None,
+            session_thread_id: None,
             source_metadata: None,
             order: 0,
             updated_at: "2026-05-15T00:00:00Z".into(),
@@ -237,6 +238,7 @@ fn subagent_lifecycle_records_and_clears_active() {
         task_id: "sub-1".into(),
         call_id: "ctc-1".into(),
         tool_name: "search".into(),
+        arguments: serde_json::Value::Null,
         iteration: 1,
     });
     let activity = m.snapshot().tool_timeline[0]
@@ -251,6 +253,9 @@ fn subagent_lifecycle_records_and_clears_active() {
         elapsed_ms: 1234,
         iterations: 2,
         output_chars: 80,
+        worktree_path: None,
+        changed_files: Vec::new(),
+        dirty_status: None,
     });
     let s = m.snapshot();
     assert_eq!(s.tool_timeline[0].status, ToolTimelineStatus::Success);

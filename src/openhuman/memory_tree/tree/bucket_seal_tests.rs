@@ -41,6 +41,12 @@ fn test_config() -> (TempDir, Config) {
     cfg.memory_tree.embedding_endpoint = None;
     cfg.memory_tree.embedding_model = None;
     cfg.memory_tree.embedding_strict = false;
+    // #002: opt into the deterministic inert embedder via `provider="none"`.
+    // This is `Some(inert)` (vector search off by choice) and does NOT set the
+    // process-global semantic-recall degraded flag — unlike the no-provider
+    // path, which marks degraded and would leak that signal into parallel
+    // `pipeline_status` tests.
+    cfg.embeddings_provider = Some("none".into());
     (tmp, cfg)
 }
 
@@ -77,6 +83,387 @@ async fn append_below_budget_does_not_seal() {
     assert_eq!(buf.item_ids, vec!["leaf-1".to_string()]);
     assert_eq!(buf.token_sum, 100);
     assert_eq!(store::count_summaries(&cfg, &tree.id).unwrap(), 0);
+}
+
+/// Build + persist a Notion-style Document chunk (staged to disk so the
+/// seal hydrator can read its body).
+fn seed_doc_chunk(
+    cfg: &Config,
+    doc_id: &str,
+    seq: u32,
+    content: &str,
+) -> crate::openhuman::memory_store::chunks::types::Chunk {
+    use crate::openhuman::memory_store::chunks::store::upsert_chunks;
+    use crate::openhuman::memory_store::chunks::types::{
+        chunk_id, Chunk, Metadata, SourceKind, SourceRef,
+    };
+    let ts = Utc::now();
+    let c = Chunk {
+        id: chunk_id(SourceKind::Document, doc_id, seq, content),
+        content: content.to_string(),
+        metadata: Metadata {
+            source_kind: SourceKind::Document,
+            source_id: doc_id.to_string(),
+            owner: "notion:conn1".into(),
+            timestamp: ts,
+            time_range: (ts, ts),
+            tags: vec!["notion".into()],
+            source_ref: Some(SourceRef::new("notion://page/pageA")),
+            path_scope: Some("notion:conn1".into()),
+        },
+        token_count: 10,
+        seq_in_source: seq,
+        created_at: ts,
+        partial_message: false,
+    };
+    upsert_chunks(cfg, &[c.clone()]).unwrap();
+    stage_test_chunks(cfg, &[c.clone()]);
+    c
+}
+
+#[tokio::test]
+async fn seal_document_subtree_force_seals_small_doc_to_one_root() {
+    let (_tmp, cfg) = test_config();
+    let tree = get_or_create_source_tree(&cfg, "notion:conn1").unwrap();
+    let provider: Arc<dyn ChatProvider> = Arc::new(StaticChatProvider::new("doc summary"));
+
+    let doc_id = "notion:conn1:pageA";
+    let c0 = seed_doc_chunk(&cfg, doc_id, 0, "first chunk body");
+    let c1 = seed_doc_chunk(&cfg, doc_id, 1, "second chunk body");
+
+    let doc_root_id = test_override::with_provider(provider, async {
+        seal_document_subtree(
+            &cfg,
+            &tree,
+            doc_id,
+            Some(100),
+            &[c0.id.clone(), c1.id.clone()],
+            &LabelStrategy::Empty,
+        )
+        .await
+        .unwrap()
+    })
+    .await;
+
+    // Two small chunks collapse to exactly ONE doc-root, tagged with the
+    // document id + version.
+    let root = store::get_summary(&cfg, &doc_root_id).unwrap().unwrap();
+    assert_eq!(root.doc_id.as_deref(), Some(doc_id));
+    assert_eq!(root.version_ms, Some(100));
+    assert_eq!(
+        root.child_ids.len(),
+        2,
+        "both chunks roll into the doc-root"
+    );
+
+    // The doc-root is fed into the cross-document merge buffer (not the flat
+    // L0 buffer), so the connection tree can fold it with other documents.
+    let merge_buf = store::get_buffer(&cfg, &tree.id, MERGE_LEVEL_BASE).unwrap();
+    assert!(
+        merge_buf.item_ids.contains(&doc_root_id),
+        "doc-root must land in the merge buffer; got {:?}",
+        merge_buf.item_ids
+    );
+    // Per-doc subtree must NOT pollute the flat L0 buffer.
+    let l0 = store::get_buffer(&cfg, &tree.id, 0).unwrap();
+    assert!(
+        l0.item_ids.is_empty(),
+        "L0 buffer stays empty for documents"
+    );
+}
+
+#[tokio::test]
+async fn seal_document_subtree_new_version_is_additive() {
+    let (_tmp, cfg) = test_config();
+    let tree = get_or_create_source_tree(&cfg, "notion:conn1").unwrap();
+    let provider: Arc<dyn ChatProvider> = Arc::new(StaticChatProvider::new("doc summary"));
+
+    let doc_id = "notion:conn1:pageA";
+
+    // Version 1.
+    let v1c = seed_doc_chunk(&cfg, doc_id, 0, "v1 body");
+    let v1_root = test_override::with_provider(Arc::clone(&provider), async {
+        seal_document_subtree(
+            &cfg,
+            &tree,
+            doc_id,
+            Some(100),
+            &[v1c.id.clone()],
+            &LabelStrategy::Empty,
+        )
+        .await
+        .unwrap()
+    })
+    .await;
+
+    // Version 2 (edited page → new chunk content → new chunk id).
+    let v2c = seed_doc_chunk(&cfg, doc_id, 0, "v2 body edited");
+    let v2_root = test_override::with_provider(Arc::clone(&provider), async {
+        seal_document_subtree(
+            &cfg,
+            &tree,
+            doc_id,
+            Some(200),
+            &[v2c.id.clone()],
+            &LabelStrategy::Empty,
+        )
+        .await
+        .unwrap()
+    })
+    .await;
+
+    assert_ne!(v1_root, v2_root, "a new version mints a new doc-root");
+
+    // Forward-only: BOTH doc-roots persist (nothing tombstoned), and both
+    // sit in the merge buffer. Read-time latest-wins (drill_down) is what
+    // surfaces only v2 — the write path never destroys v1.
+    let r1 = store::get_summary(&cfg, &v1_root).unwrap().unwrap();
+    let r2 = store::get_summary(&cfg, &v2_root).unwrap().unwrap();
+    assert_eq!(r1.version_ms, Some(100));
+    assert_eq!(r2.version_ms, Some(200));
+
+    let merge_buf = store::get_buffer(&cfg, &tree.id, MERGE_LEVEL_BASE).unwrap();
+    assert!(merge_buf.item_ids.contains(&v1_root));
+    assert!(merge_buf.item_ids.contains(&v2_root));
+}
+
+/// A byte-identical body chunk reused across two versions of a multi-chunk doc
+/// upserts to the SAME row (content-addressed id). Its single
+/// `parent_summary_id` backlink must follow the NEWEST version's doc-root — the
+/// one drill_down surfaces — not stay stranded on the first (now-superseded)
+/// version. Guards the unconditional re-point in `seal_explicit_children`.
+#[tokio::test]
+async fn shared_chunk_backlink_repoints_to_latest_doc_version() {
+    use crate::openhuman::memory_store::chunks::store::with_connection;
+
+    let (_tmp, cfg) = test_config();
+    let tree = get_or_create_source_tree(&cfg, "notion:conn1").unwrap();
+    let provider: Arc<dyn ChatProvider> = Arc::new(StaticChatProvider::new("doc summary"));
+    let doc_id = "notion:conn1:pageA";
+
+    // seq 0 is byte-identical across versions → one shared row. seq 1 differs,
+    // so each version is a genuine 2-chunk doc (not the single-chunk passthrough).
+    let shared = seed_doc_chunk(&cfg, doc_id, 0, "shared body identical across versions");
+
+    let v1_other = seed_doc_chunk(&cfg, doc_id, 1, "v1 second chunk");
+    let v1_root = test_override::with_provider(Arc::clone(&provider), async {
+        seal_document_subtree(
+            &cfg,
+            &tree,
+            doc_id,
+            Some(100),
+            &[shared.id.clone(), v1_other.id.clone()],
+            &LabelStrategy::Empty,
+        )
+        .await
+        .unwrap()
+    })
+    .await;
+
+    // After v1, the shared chunk backlinks to v1's doc-root.
+    let p1: Option<String> = with_connection(&cfg, |conn| {
+        Ok(conn
+            .query_row(
+                "SELECT parent_summary_id FROM mem_tree_chunks WHERE id = ?1",
+                rusqlite::params![shared.id],
+                |r| r.get(0),
+            )
+            .unwrap())
+    })
+    .unwrap();
+    assert_eq!(p1.as_deref(), Some(v1_root.as_str()));
+
+    // Re-ingest the same shared chunk (idempotent upsert) and seal version 2.
+    let _shared_again = seed_doc_chunk(&cfg, doc_id, 0, "shared body identical across versions");
+    let v2_other = seed_doc_chunk(&cfg, doc_id, 1, "v2 second chunk edited");
+    let v2_root = test_override::with_provider(Arc::clone(&provider), async {
+        seal_document_subtree(
+            &cfg,
+            &tree,
+            doc_id,
+            Some(200),
+            &[shared.id.clone(), v2_other.id.clone()],
+            &LabelStrategy::Empty,
+        )
+        .await
+        .unwrap()
+    })
+    .await;
+    assert_ne!(v1_root, v2_root);
+
+    // The shared chunk's backlink now follows the LATEST version's doc-root.
+    let p2: Option<String> = with_connection(&cfg, |conn| {
+        Ok(conn
+            .query_row(
+                "SELECT parent_summary_id FROM mem_tree_chunks WHERE id = ?1",
+                rusqlite::params![shared.id],
+                |r| r.get(0),
+            )
+            .unwrap())
+    })
+    .unwrap();
+    assert_eq!(
+        p2.as_deref(),
+        Some(v2_root.as_str()),
+        "shared chunk must re-point to the latest doc-root, not stay on v1"
+    );
+}
+
+/// Single-chunk passthrough: a doc that rolls up from exactly one
+/// budget-fitting chunk must NOT invoke the summariser — the doc-root content
+/// is the chunk **verbatim**. Proven two ways: (1) no `ChatProvider` override
+/// is installed, so any summarise() call would hit the (unconfigured) cloud
+/// path and never reproduce this exact text; (2) the doc-root body is asserted
+/// byte-equal to the chunk body.
+#[tokio::test]
+async fn seal_document_subtree_single_chunk_is_verbatim_passthrough_no_llm() {
+    use crate::openhuman::memory_store::content::read as content_read;
+
+    let (_tmp, cfg) = test_config();
+    let tree = get_or_create_source_tree(&cfg, "notion:conn1").unwrap();
+    let doc_id = "notion:conn1:pageX";
+    // Distinctive content the summariser would never emit verbatim.
+    let unique = "UNIQUE-PASSTHROUGH-MARKER-7Z\n\n- line one\n- line two";
+    let c = seed_doc_chunk(&cfg, doc_id, 0, unique);
+
+    // NOTE: no test_override::with_provider — passthrough must not need the LLM.
+    let doc_root_id = seal_document_subtree(
+        &cfg,
+        &tree,
+        doc_id,
+        Some(100),
+        &[c.id.clone()],
+        &LabelStrategy::Empty,
+    )
+    .await
+    .unwrap();
+
+    let root = store::get_summary(&cfg, &doc_root_id).unwrap().unwrap();
+    assert_eq!(root.doc_id.as_deref(), Some(doc_id));
+    assert_eq!(root.version_ms, Some(100));
+
+    // Doc-root body (read full from disk) must be the chunk verbatim.
+    let body = content_read::read_summary_body(&cfg, &doc_root_id).unwrap();
+    assert_eq!(
+        body.trim(),
+        unique,
+        "single-chunk doc-root must be the chunk verbatim (no summarisation / LLM)"
+    );
+}
+
+/// Multi-batch document subtree: a doc whose chunks span several level-0
+/// batches must seal its siblings **concurrently** (overlapping the
+/// summarise + embed round-trips) while still producing an identical
+/// doc-root. A `ChatProvider` probe records the peak number of in-flight
+/// summarise calls; with four independent level-0 batches the peak must
+/// exceed 1 (proving overlap) yet stay within `DOC_SUBTREE_SEAL_CONCURRENCY`
+/// (proving the bound is respected). This is the regression guard for the
+/// serial → bounded-concurrency change in `seal_document_subtree`.
+#[tokio::test]
+async fn seal_document_subtree_seals_sibling_batches_concurrently() {
+    use crate::openhuman::memory::chat::ChatPrompt;
+    use crate::openhuman::memory_store::chunks::store::upsert_chunks;
+    use crate::openhuman::memory_store::chunks::types::{
+        chunk_id, Chunk, Metadata, SourceKind, SourceRef,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Records concurrent in-flight `chat_for_json` calls and the peak; a
+    /// short sleep forces would-be-concurrent calls to actually overlap so
+    /// the peak reflects real scheduling, not luck.
+    struct ConcurrencyProbe {
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ChatProvider for ConcurrencyProbe {
+        fn name(&self) -> &str {
+            "test:concurrency-probe"
+        }
+        async fn chat_for_json(&self, _p: &ChatPrompt) -> anyhow::Result<String> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok("doc batch summary".to_string())
+        }
+    }
+
+    let (_tmp, cfg) = test_config();
+    let tree = get_or_create_source_tree(&cfg, "notion:conn1").unwrap();
+    let doc_id = "notion:conn1:pageM";
+
+    // Four chunks, each ~60% of the input budget, so the greedy token-budget
+    // batcher puts each in its OWN level-0 batch → four independent
+    // summarise calls that should overlap under bounded concurrency.
+    let per_chunk = INPUT_TOKEN_BUDGET * 6 / 10;
+    let ts = Utc::now();
+    let mut ids = Vec::new();
+    let mut chunks = Vec::new();
+    for seq in 0..4u32 {
+        let content = format!("substantive document body number {seq}");
+        let c = Chunk {
+            id: chunk_id(SourceKind::Document, doc_id, seq, &content),
+            content,
+            metadata: Metadata {
+                source_kind: SourceKind::Document,
+                source_id: doc_id.to_string(),
+                owner: "notion:conn1".into(),
+                timestamp: ts,
+                time_range: (ts, ts),
+                tags: vec!["notion".into()],
+                source_ref: Some(SourceRef::new("notion://page/pageM")),
+                path_scope: Some("notion:conn1".into()),
+            },
+            token_count: per_chunk,
+            seq_in_source: seq,
+            created_at: ts,
+            partial_message: false,
+        };
+        ids.push(c.id.clone());
+        chunks.push(c);
+    }
+    upsert_chunks(&cfg, &chunks).unwrap();
+    stage_test_chunks(&cfg, &chunks);
+
+    let probe = Arc::new(ConcurrencyProbe {
+        in_flight: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+        calls: AtomicUsize::new(0),
+    });
+    let provider: Arc<dyn ChatProvider> = probe.clone();
+
+    let doc_root_id = test_override::with_provider(provider, async {
+        seal_document_subtree(&cfg, &tree, doc_id, Some(7), &ids, &LabelStrategy::Empty)
+            .await
+            .unwrap()
+    })
+    .await;
+
+    // Correctness: the four chunks roll up under a single doc-root tagged
+    // with the document id + version — tree shape unchanged by batching.
+    let root = store::get_summary(&cfg, &doc_root_id).unwrap().unwrap();
+    assert_eq!(root.doc_id.as_deref(), Some(doc_id));
+    assert_eq!(root.version_ms, Some(7));
+    assert_eq!(
+        root.child_ids.len(),
+        4,
+        "all four level-0 siblings must fan into the doc-root"
+    );
+
+    // Concurrency: at least two level-0 siblings overlapped, and the pool
+    // bound was respected.
+    let peak = probe.peak.load(Ordering::SeqCst);
+    assert!(
+        peak >= 2,
+        "expected overlapping sibling seals (peak in-flight = {peak})"
+    );
+    assert!(
+        peak <= DOC_SUBTREE_SEAL_CONCURRENCY,
+        "concurrency must stay within the pool bound (peak = {peak})"
+    );
 }
 
 #[tokio::test]
@@ -751,6 +1138,8 @@ async fn hydrate_summary_inputs_batch_preserves_order_and_skips_missing_ids() {
         sealed_at: ts,
         deleted: false,
         embedding: None,
+        doc_id: None,
+        version_ms: None,
     };
     let sum_b = SummaryNode {
         id: "sum-b".into(),
@@ -769,6 +1158,8 @@ async fn hydrate_summary_inputs_batch_preserves_order_and_skips_missing_ids() {
         sealed_at: ts,
         deleted: false,
         embedding: None,
+        doc_id: None,
+        version_ms: None,
     };
 
     // Stage bodies to disk + record content pointers so
@@ -836,4 +1227,131 @@ async fn hydrate_summary_inputs_batch_preserves_order_and_skips_missing_ids() {
     // Entities and topics tracked per id too.
     assert_eq!(out[0].entities, vec!["entity:bob".to_string()]);
     assert_eq!(out[1].entities, vec!["entity:alice".to_string()]);
+}
+
+/// Regression for Sentry #13021 — when the LLM summary collapses to an
+/// empty/whitespace string (e.g. the model returns just newlines, which
+/// `summarise()` trims to ""), the seal MUST NOT persist a blank parent.
+///
+/// Pre-fix, `truncate_for_embed("", 1000)` produced an empty string that
+/// got forwarded to the embedding provider. Real providers (cloud /
+/// OpenAI-compatible) 400 on that — `"input must be a non-empty string or
+/// array of non-empty strings"` — and the failure was captured as a
+/// recurring Sentry server fault even though the defect was on the client
+/// side.
+///
+/// Initial fix (provider guard) short-circuited the embed call but still
+/// persisted `content = ""`, losing the child text from the next rollup /
+/// retrieval layer. Final fix (this test): when `summarise()` returns
+/// blank, fall back to `fallback_summary` — the deterministic concatenation
+/// of the inputs — so the parent has recoverable text and the embedding
+/// runs on real content.
+#[tokio::test]
+async fn whitespace_llm_summary_falls_back_to_deterministic_content() {
+    use crate::openhuman::memory_store::chunks::store::upsert_chunks;
+    use crate::openhuman::memory_store::chunks::types::{
+        chunk_id, Chunk, Metadata, SourceKind, SourceRef,
+    };
+    use chrono::TimeZone;
+
+    let (_tmp, cfg) = test_config();
+    let tree = get_or_create_source_tree(&cfg, "slack:#eng").unwrap();
+    // The chat provider returns ONLY whitespace; `summarise()` trims to ""
+    // and `clamp_to_budget` keeps it empty → `output.content = ""`.
+    let provider: Arc<dyn ChatProvider> = Arc::new(StaticChatProvider::new("   \n\t  \n"));
+
+    let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+    let mk_chunk = |seq: u32, tokens: u32| Chunk {
+        id: chunk_id(SourceKind::Chat, "slack:#eng", seq, "test-content"),
+        content: format!("non-empty leaf content {seq}"),
+        metadata: Metadata {
+            source_kind: SourceKind::Chat,
+            source_id: "slack:#eng".into(),
+            owner: "alice".into(),
+            timestamp: ts,
+            time_range: (ts, ts),
+            tags: vec![],
+            source_ref: Some(SourceRef::new("slack://x")),
+            path_scope: None,
+        },
+        token_count: tokens,
+        seq_in_source: seq,
+        created_at: ts,
+        partial_message: false,
+    };
+    let per_leaf = INPUT_TOKEN_BUDGET * 6 / 10;
+    let c1 = mk_chunk(0, per_leaf);
+    let c2 = mk_chunk(1, per_leaf);
+    upsert_chunks(&cfg, &[c1.clone(), c2.clone()]).unwrap();
+    stage_test_chunks(&cfg, &[c1.clone(), c2.clone()]);
+
+    let leaf1 = LeafRef {
+        chunk_id: c1.id.clone(),
+        token_count: per_leaf,
+        timestamp: ts,
+        content: c1.content.clone(),
+        entities: vec![],
+        topics: vec![],
+        score: 0.5,
+    };
+    let leaf2 = LeafRef {
+        chunk_id: c2.id.clone(),
+        token_count: per_leaf,
+        timestamp: ts,
+        content: c2.content.clone(),
+        entities: vec![],
+        topics: vec![],
+        score: 0.5,
+    };
+
+    let _ = test_override::with_provider(Arc::clone(&provider), async {
+        append_leaf(&cfg, &tree, &leaf1, &LabelStrategy::Empty)
+            .await
+            .unwrap()
+    })
+    .await;
+    let sealed = test_override::with_provider(Arc::clone(&provider), async {
+        append_leaf(&cfg, &tree, &leaf2, &LabelStrategy::Empty)
+            .await
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(sealed.len(), 1, "second append crosses budget — one seal");
+    let summary = store::get_summary(&cfg, &sealed[0]).unwrap().unwrap();
+
+    // Content must be the deterministic fallback derived from the inputs,
+    // not the empty LLM output. `fallback_summary` joins each non-whitespace
+    // input with a `"— "` provenance prefix.
+    assert!(
+        !summary.content.trim().is_empty(),
+        "expected fallback content when LLM returned blank (#13021), got empty"
+    );
+    assert!(
+        summary.content.contains("non-empty leaf content 0"),
+        "fallback must include leaf 0 content; got: {:?}",
+        summary.content
+    );
+    assert!(
+        summary.content.contains("non-empty leaf content 1"),
+        "fallback must include leaf 1 content; got: {:?}",
+        summary.content
+    );
+
+    // Because the persisted content is now non-empty, the embed step runs.
+    // With `embeddings_provider = "none"` the test wires `InertEmbedder`,
+    // which returns a zero vector — its presence (not its value) is the
+    // signal that the new fallback path drove a real embed call.
+    //
+    // Read from the per-model sidecar (`mem_tree_summary_embeddings`); the
+    // legacy `mem_tree_summaries.embedding` column on `SummaryNode` is
+    // always written as `None` post-#1574 cutover, so checking
+    // `summary.embedding` alone would silently always pass.
+    let sidecar_embedding =
+        crate::openhuman::memory_store::trees::store::get_summary_embedding(&cfg, &sealed[0])
+            .unwrap();
+    assert!(
+        sidecar_embedding.is_some(),
+        "expected sidecar embedding for the fallback-filled summary (#13021)"
+    );
 }

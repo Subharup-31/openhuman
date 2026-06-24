@@ -1,3 +1,4 @@
+use crate::openhuman::file_state;
 use crate::openhuman::security::SecurityPolicy;
 use crate::openhuman::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
@@ -24,7 +25,10 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file in the workspace"
+        "Read the contents of a file in your working directory (the action sandbox). \
+         Relative paths resolve against that directory; paths outside it are blocked. \
+         To read a file written by `shell`, confirm its location with `pwd` and use the \
+         same relative path."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -90,7 +94,17 @@ impl Tool for FileReadTool {
         }
 
         match tokio::fs::read_to_string(&resolved_path).await {
-            Ok(contents) => Ok(ToolResult::success(contents)),
+            Ok(contents) => {
+                if let Some(agent_id) = file_state::current_file_state_agent_id() {
+                    let mtime = tokio::fs::metadata(&resolved_path)
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    file_state::record_read(&agent_id, resolved_path, mtime, false);
+                }
+                Ok(ToolResult::success(contents))
+            }
             Err(e) => Ok(ToolResult::error(format!("Failed to read file: {e}"))),
         }
     }

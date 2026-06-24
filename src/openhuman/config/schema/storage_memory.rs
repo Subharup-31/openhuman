@@ -347,6 +347,30 @@ pub struct MemoryTreeConfig {
     /// Env override: `OPENHUMAN_MEMORY_TREE_SMART_WALK_MODEL`.
     #[serde(default)]
     pub smart_walk_model: Option<String>,
+
+    /// Explicit opt-in to cloud-based summarization when local AI is disabled.
+    ///
+    /// Default `false` — "Build Summary Trees" was local-only before #002.
+    /// Enabling this routes workspace memory summaries to the configured cloud
+    /// provider. Set to `true` via Settings → AI → Memory or the env var
+    /// `OPENHUMAN_MEMORY_TREE_CLOUD_SUMMARIZATION=true` to acknowledge that
+    /// memory content will be sent to an external service.
+    #[serde(default)]
+    pub cloud_summarization_opt_in: bool,
+
+    /// Enable the spaCy NER sidecar used by the deterministic (E2GraphRAG)
+    /// retriever to extract entities from a query. When `true` (default), the
+    /// managed Python runtime provisions spaCy on first use and serves entity
+    /// extraction over stdio. When `false` — or whenever Python/spaCy is
+    /// unavailable — query-entity extraction falls back to the in-Rust
+    /// regex+LLM extractor (`score::extract`). Env override:
+    /// `OPENHUMAN_MEMORY_TREE_SPACY_ENABLED`.
+    #[serde(default = "default_memory_tree_spacy_enabled")]
+    pub spacy_enabled: bool,
+}
+
+fn default_memory_tree_spacy_enabled() -> bool {
+    true
 }
 
 /// Returns `None` so that existing installs that never opted into Phase 4
@@ -448,6 +472,8 @@ impl Default for MemoryTreeConfig {
             llm_backend: default_llm_backend(),
             cloud_llm_model: default_cloud_llm_model(),
             smart_walk_model: None,
+            cloud_summarization_opt_in: false,
+            spacy_enabled: default_memory_tree_spacy_enabled(),
         }
     }
 }

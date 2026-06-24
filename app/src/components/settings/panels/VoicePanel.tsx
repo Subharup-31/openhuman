@@ -1,6 +1,8 @@
+import debug from 'debug';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { useT } from '../../../lib/i18n/I18nContext';
+import PttSettingsPanel from '../../../pages/settings/voice/PttSettingsPanel';
 import {
   installPiper,
   installWhisper,
@@ -25,7 +27,16 @@ import {
   type VoiceServerSettings,
   type VoiceStatus,
 } from '../../../utils/tauriCommands';
-import SettingsHeader from '../components/SettingsHeader';
+import PanelPage from '../../layout/PanelPage';
+import Button from '../../ui/Button';
+import SettingsBackButton from '../components/SettingsBackButton';
+import {
+  SettingsRow,
+  SettingsSection,
+  SettingsSelect,
+  SettingsStatusLine,
+  SettingsTextField,
+} from '../controls';
 import { useSettingsNavigation } from '../hooks/useSettingsNavigation';
 import { ELEVENLABS_VOICE_PRESETS, isCuratedVoicePreset } from './elevenlabsVoicePresets';
 
@@ -78,6 +89,9 @@ const PIPER_VOICE_PRESET_IDS = [
   'en_GB-northern_english_male-medium',
 ] as const;
 
+const LOCAL_INSTALL_STATUS_POLL_MS = 2_000;
+const log = debug('voice:settings');
+
 interface VoicePanelProps {
   /** When true, render without the SettingsHeader chrome (used when embedded
    *  inside the onboarding custom wizard). */
@@ -86,7 +100,7 @@ interface VoicePanelProps {
 
 const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
   const { t } = useT();
-  const { navigateBack, navigateToSettings, breadcrumbs } = useSettingsNavigation();
+  const { navigateBack, navigateToSettings } = useSettingsNavigation();
   const [settings, setSettings] = useState<VoiceServerSettings | null>(null);
   const [savedSettings, setSavedSettings] = useState<VoiceServerSettings | null>(null);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus | null>(null);
@@ -154,15 +168,11 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
             // Status polls happen on a 2s loop; a single transient error
             // shouldn't blow up the entire settings panel. Log + keep the
             // previous snapshot.
-            if (process.env.NODE_ENV !== 'production') {
-              console.debug('[voice-install:whisper] status poll failed', err);
-            }
+            log('[voice-install:whisper] status poll failed %o', err);
             return null;
           }),
           piperInstallStatus().catch(err => {
-            if (process.env.NODE_ENV !== 'production') {
-              console.debug('[voice-install:piper] status poll failed', err);
-            }
+            log('[voice-install:piper] status poll failed %o', err);
             return null;
           }),
         ]);
@@ -218,9 +228,7 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
           setSavedTtsProvider(ttsStr);
         })
         .catch(err => {
-          if (process.env.NODE_ENV !== 'production') {
-            console.debug('[VoicePanel] voice settings load failed (expected on older cores)', err);
-          }
+          log('[VoicePanel] voice settings load failed (expected on older cores) %o', err);
           // Fallback: seed from legacy voice_status
           if (voiceResponse.stt_provider) {
             const seeded = voiceResponse.stt_provider === 'whisper' ? 'whisper' : 'cloud';
@@ -244,6 +252,52 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
     void loadData(true);
   }, []);
 
+  const shouldPollWhisperInstall = whisperInstall?.state === 'installing';
+  const shouldPollPiperInstall = piperInstall?.state === 'installing';
+
+  useEffect(() => {
+    if (!shouldPollWhisperInstall && !shouldPollPiperInstall) return;
+
+    let cancelled = false;
+    let inFlight = false;
+    const pollInstallStatuses = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const [nextWhisperStatus, nextPiperStatus] = await Promise.all([
+          shouldPollWhisperInstall
+            ? whisperInstallStatus().catch(err => {
+                log('[voice-install:whisper] status poll failed %o', err);
+                return null;
+              })
+            : Promise.resolve(null),
+          shouldPollPiperInstall
+            ? piperInstallStatus().catch(err => {
+                log('[voice-install:piper] status poll failed %o', err);
+                return null;
+              })
+            : Promise.resolve(null),
+        ]);
+
+        if (cancelled) return;
+        if (nextWhisperStatus) setWhisperInstall(nextWhisperStatus);
+        if (nextPiperStatus) setPiperInstall(nextPiperStatus);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void pollInstallStatuses();
+    const intervalId = window.setInterval(() => {
+      void pollInstallStatuses();
+    }, LOCAL_INSTALL_STATUS_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [shouldPollWhisperInstall, shouldPollPiperInstall]);
+
   const persistProviders = async (
     update: Partial<VoiceProvidersSnapshot> & {
       stt_provider?: string;
@@ -261,9 +315,7 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
         stt_model: update.stt_model,
         tts_voice: update.tts_voice,
       });
-      if (process.env.NODE_ENV !== 'production') {
-        console.debug('[VoicePanel:providers] saved', snapshot);
-      }
+      log('[VoicePanel:providers] saved %o', snapshot);
       setNotice(t('voice.providers.saved'));
       // Force a reload so the rest of the panel reflects the new state.
       await loadData(true);
@@ -360,9 +412,7 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
         setPendingKeySlug(null);
         setPendingKeyValue('');
         setNotice(t('voice.providers.saved'));
-        if (process.env.NODE_ENV !== 'production') {
-          console.debug('[VoicePanel:chip] enabled external provider', slug);
-        }
+        log('[VoicePanel:chip] enabled external provider %s', slug);
       } catch (err) {
         setError(err instanceof Error ? err.message : t('voice.providers.failedToSave'));
       } finally {
@@ -422,13 +472,37 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
     return t('voice.providers.installLocally');
   };
 
+  const installStatusText = (status: VoiceInstallStatus | null, ready: boolean): string => {
+    if (status?.state === 'installing') {
+      const progress =
+        typeof status.progress === 'number'
+          ? `${t('voice.providers.installing')} ${status.progress}%`
+          : t('voice.providers.installing');
+      return status.stage ? `${progress} · ${status.stage}` : progress;
+    }
+    if (ready) return t('voice.providers.installed');
+    if (status?.state === 'error' || status?.state === 'broken') {
+      return status.error_detail ?? t('voice.providers.installFailed');
+    }
+    return t('voice.providers.notInstalled');
+  };
+
+  const installStatusClassName = (status: VoiceInstallStatus | null, ready: boolean): string => {
+    if (status?.state === 'error' || status?.state === 'broken') {
+      return 'text-red-600 dark:text-red-300';
+    }
+    if (status?.state === 'installing') return 'text-amber-600 dark:text-amber-300';
+    if (ready) return 'text-emerald-600 dark:text-emerald-300';
+    return 'text-neutral-500 dark:text-neutral-400';
+  };
+
   const handleInstallWhisper = async () => {
     setIsInstallingWhisper(true);
     setError(null);
     setNotice(null);
     try {
       const force = whisperInstall?.state === 'installed';
-      console.debug('[voice-install:whisper] install click force=%s', force);
+      log('[voice-install:whisper] install click force=%s', force);
       const result = await installWhisper({ modelSize: sttModel || undefined, force });
       setWhisperInstall(result);
       setNotice(
@@ -452,7 +526,7 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
     setNotice(null);
     try {
       const force = piperInstall?.state === 'installed';
-      console.debug('[voice-install:piper] install click force=%s', force);
+      log('[voice-install:piper] install click force=%s', force);
       const result = await installPiper({ voiceId: ttsVoice || undefined, force });
       setPiperInstall(result);
       setNotice(
@@ -470,35 +544,28 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
     }
   };
 
-  const whisperReady = whisperInstall?.state === 'installed';
-  const piperReady = piperInstall?.state === 'installed';
+  const whisperReady =
+    whisperInstall?.state !== 'installing' &&
+    (whisperInstall?.state === 'installed' || Boolean(voiceStatus?.stt_available));
+  const piperReady =
+    piperInstall?.state !== 'installing' &&
+    (piperInstall?.state === 'installed' || Boolean(voiceStatus?.tts_available));
+  const pendingLocalProviderReady =
+    pendingKeySlug === 'whisper' ? whisperReady : pendingKeySlug === 'piper' ? piperReady : true;
 
   return (
-    <div>
-      {!embedded && (
-        <SettingsHeader
-          title={t('voice.title')}
-          showBackButton={true}
-          onBack={navigateBack}
-          breadcrumbs={breadcrumbs}
-        />
-      )}
-
+    <PanelPage
+      className="z-10"
+      contentClassName=""
+      description={embedded ? undefined : t('pages.settings.ai.voiceDesc')}
+      leading={embedded ? undefined : <SettingsBackButton onBack={navigateBack} />}>
       <div className={embedded ? 'space-y-4' : 'p-4 space-y-4'}>
-        {/* ─── Section 1: Voice Provider Chips ─────────────────────────── */}
-        <section className="space-y-3">
-          <div
-            className="bg-stone-50 dark:bg-neutral-800/60 rounded-lg border border-stone-200 dark:border-neutral-800 p-4 space-y-4"
-            data-testid="voice-providers-section">
-            <div>
-              <h3 className="text-sm font-semibold text-stone-900 dark:text-neutral-100">
-                {t('voice.providers.title')}
-              </h3>
-              <p className="text-xs text-stone-500 dark:text-neutral-400 mt-1">
-                {t('voice.providers.desc')}
-              </p>
-            </div>
+        {/* Always-on listening moved to Settings → Features → Desktop Agent. */}
 
+        {/* ─── Section 1: Voice Provider Chips ─────────────────────────── */}
+        {/* Provider chips are intentional bespoke UI — kept as-is. */}
+        <SettingsSection title={t('voice.providers.title')} description={t('voice.providers.desc')}>
+          <div className="px-4 py-3" data-testid="voice-providers-section">
             {/* Chip row */}
             <div className="flex flex-wrap gap-2">
               {/* Cloud — always enabled, locked */}
@@ -554,7 +621,7 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
                           setPendingKeyValue('');
                         }
                       }}
-                      className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${enabled ? 'bg-primary-500' : 'bg-stone-300 dark:bg-neutral-600'}`}>
+                      className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${enabled ? 'bg-primary-500' : 'bg-neutral-300 dark:bg-neutral-600'}`}>
                       <span
                         aria-hidden
                         className={`inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform ${enabled ? 'translate-x-3.5' : 'translate-x-0.5'}`}
@@ -593,7 +660,7 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
                           setPendingKeyValue('');
                         }
                       }}
-                      className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${enabled ? 'bg-primary-500' : 'bg-stone-300 dark:bg-neutral-600'}`}>
+                      className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${enabled ? 'bg-primary-500' : 'bg-neutral-300 dark:bg-neutral-600'}`}>
                       <span
                         aria-hidden
                         className={`inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform ${enabled ? 'translate-x-3.5' : 'translate-x-0.5'}`}
@@ -652,7 +719,7 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
                           setPendingKeyValue('');
                         }
                       }}
-                      className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${enabled ? 'bg-primary-500' : 'bg-stone-300 dark:bg-neutral-600'}`}>
+                      className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${enabled ? 'bg-primary-500' : 'bg-neutral-300 dark:bg-neutral-600'}`}>
                       <span
                         aria-hidden
                         className={`inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform ${enabled ? 'translate-x-3.5' : 'translate-x-0.5'}`}
@@ -663,7 +730,7 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
               })}
             </div>
           </div>
-        </section>
+        </SettingsSection>
 
         {/* ─── API Key Modal ──────────────────────────────────────────── */}
         {pendingKeySlug && (
@@ -677,18 +744,18 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
               }
             }}
             data-testid="voice-provider-key-modal">
-            <div className="w-full max-w-md rounded-2xl border border-stone-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 shadow-xl p-6 space-y-4">
+            <div className="w-full max-w-md rounded-2xl border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 shadow-xl p-6 space-y-4">
               {pendingKeySlug === 'whisper' || pendingKeySlug === 'piper' ? (
                 /* ── Local provider modal (Whisper / Piper) ──────────── */
                 <>
                   <div>
-                    <h3 className="text-base font-semibold text-stone-900 dark:text-neutral-100">
+                    <h3 className="text-base font-semibold text-neutral-800 dark:text-neutral-100">
                       {t('voice.modal.title')}{' '}
                       {pendingKeySlug === 'whisper'
                         ? t('voice.providers.chip.whisper')
                         : t('voice.providers.chip.piper')}
                     </h3>
-                    <p className="text-xs text-stone-500 dark:text-neutral-400 mt-1">
+                    <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-1">
                       {pendingKeySlug === 'whisper'
                         ? t('voice.modal.whisperDesc')
                         : t('voice.modal.piperDesc')}
@@ -697,13 +764,13 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
 
                   {pendingKeySlug === 'whisper' && (
                     <label className="block space-y-1">
-                      <span className="text-xs font-medium text-stone-600 dark:text-neutral-300">
+                      <span className="text-xs font-medium text-neutral-500 dark:text-neutral-300">
                         {t('voice.providers.whisperModel')}
                       </span>
-                      <select
+                      <SettingsSelect
                         value={sttModel || 'medium'}
                         onChange={e => setSttModel(e.target.value)}
-                        className="w-full rounded-md border border-stone-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 px-3 py-2 text-sm text-stone-900 dark:text-neutral-100 focus:outline-none focus:ring-1 focus:ring-primary-400">
+                        className="w-full">
                         <option value="tiny">{t('voice.providers.whisperModelTiny')}</option>
                         <option value="base">{t('voice.providers.whisperModelBase')}</option>
                         <option value="small">{t('voice.providers.whisperModelSmall')}</option>
@@ -711,107 +778,85 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
                         <option value="whisper-large-v3-turbo">
                           {t('voice.providers.whisperModelLargeTurbo')}
                         </option>
-                      </select>
+                      </SettingsSelect>
                     </label>
                   )}
 
                   {pendingKeySlug === 'piper' && (
                     <label className="block space-y-1">
-                      <span className="text-xs font-medium text-stone-600 dark:text-neutral-300">
+                      <span className="text-xs font-medium text-neutral-500 dark:text-neutral-300">
                         {t('voice.providers.piperVoice')}
                       </span>
-                      <select
+                      <SettingsSelect
                         value={
                           PIPER_VOICE_PRESET_IDS.some(v => v === ttsVoice) ? ttsVoice : '__custom__'
                         }
                         onChange={e => {
                           if (e.target.value !== '__custom__') setTtsVoice(e.target.value);
                         }}
-                        className="w-full rounded-md border border-stone-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 px-3 py-2 text-sm text-stone-900 dark:text-neutral-100 focus:outline-none focus:ring-1 focus:ring-primary-400">
+                        className="w-full">
                         {piperVoicePresets.map(v => (
                           <option key={v.id} value={v.id}>
                             {v.label}
                           </option>
                         ))}
                         <option value="__custom__">{t('voice.providers.customVoiceOption')}</option>
-                      </select>
+                      </SettingsSelect>
                     </label>
                   )}
 
                   {/* Install status */}
                   {pendingKeySlug === 'whisper' && (
                     <div className="flex items-center gap-2">
-                      <button
+                      <Button
                         type="button"
+                        variant={whisperReady ? 'secondary' : 'primary'}
+                        size="xs"
                         onClick={() => void handleInstallWhisper()}
-                        disabled={isInstallingWhisper || whisperInstall?.state === 'installing'}
-                        className={`px-3 py-1.5 text-xs rounded-md text-white disabled:opacity-60 ${
-                          whisperReady
-                            ? 'bg-stone-600 hover:bg-stone-700'
-                            : 'bg-primary-600 hover:bg-primary-700'
-                        }`}>
+                        disabled={isInstallingWhisper || whisperInstall?.state === 'installing'}>
                         {installButtonLabel(whisperInstall, isInstallingWhisper, 'Whisper')}
-                      </button>
+                      </Button>
                       <span
-                        className={`text-[11px] ${
-                          whisperReady
-                            ? 'text-emerald-600 dark:text-emerald-300'
-                            : whisperInstall?.state === 'error'
-                              ? 'text-red-600 dark:text-red-300'
-                              : 'text-stone-500 dark:text-neutral-400'
-                        }`}>
-                        {whisperReady
-                          ? t('voice.providers.installed')
-                          : whisperInstall?.state === 'error'
-                            ? (whisperInstall.error_detail ?? t('voice.providers.installFailed'))
-                            : t('voice.providers.notInstalled')}
+                        className={`text-[11px] ${installStatusClassName(whisperInstall, whisperReady)}`}>
+                        {installStatusText(whisperInstall, whisperReady)}
                       </span>
                     </div>
                   )}
 
                   {pendingKeySlug === 'piper' && (
                     <div className="flex items-center gap-2">
-                      <button
+                      <Button
                         type="button"
+                        variant={piperReady ? 'secondary' : 'primary'}
+                        size="xs"
                         onClick={() => void handleInstallPiper()}
-                        disabled={isInstallingPiper || piperInstall?.state === 'installing'}
-                        className={`px-3 py-1.5 text-xs rounded-md text-white disabled:opacity-60 ${
-                          piperReady
-                            ? 'bg-stone-600 hover:bg-stone-700'
-                            : 'bg-primary-600 hover:bg-primary-700'
-                        }`}>
+                        disabled={isInstallingPiper || piperInstall?.state === 'installing'}>
                         {installButtonLabel(piperInstall, isInstallingPiper, 'Piper')}
-                      </button>
+                      </Button>
                       <span
-                        className={`text-[11px] ${
-                          piperReady
-                            ? 'text-emerald-600 dark:text-emerald-300'
-                            : piperInstall?.state === 'error'
-                              ? 'text-red-600 dark:text-red-300'
-                              : 'text-stone-500 dark:text-neutral-400'
-                        }`}>
-                        {piperReady
-                          ? t('voice.providers.installed')
-                          : piperInstall?.state === 'error'
-                            ? (piperInstall.error_detail ?? t('voice.providers.installFailed'))
-                            : t('voice.providers.notInstalled')}
+                        className={`text-[11px] ${installStatusClassName(piperInstall, piperReady)}`}>
+                        {installStatusText(piperInstall, piperReady)}
                       </span>
                     </div>
                   )}
 
                   <div className="flex items-center justify-between pt-2">
-                    <button
+                    <Button
                       type="button"
+                      variant="secondary"
+                      size="xs"
                       onClick={() => {
                         setPendingKeySlug(null);
                         setKeyTestResult(null);
-                      }}
-                      className="px-3 py-1.5 text-xs rounded-md border border-stone-200 dark:border-neutral-700 text-stone-600 dark:text-neutral-300 hover:bg-stone-50 dark:hover:bg-neutral-800">
+                      }}>
                       {t('common.cancel')}
-                    </button>
-                    <button
+                    </Button>
+                    <Button
                       type="button"
+                      variant="primary"
+                      size="xs"
                       onClick={() => {
+                        if (!pendingLocalProviderReady) return;
                         if (pendingKeySlug === 'whisper') {
                           onSttProviderChange('whisper');
                           if (sttModel) void persistProviders({ stt_model: sttModel });
@@ -822,29 +867,29 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
                         setPendingKeySlug(null);
                         setKeyTestResult(null);
                       }}
-                      className="px-4 py-1.5 text-xs rounded-md bg-primary-600 text-white hover:bg-primary-700">
+                      disabled={!pendingLocalProviderReady || isSavingProviders}>
                       {t('voice.modal.enable')}
-                    </button>
+                    </Button>
                   </div>
                 </>
               ) : (
                 /* ── External provider modal (API key) ───────────────── */
                 <>
                   <div>
-                    <h3 className="text-base font-semibold text-stone-900 dark:text-neutral-100">
+                    <h3 className="text-base font-semibold text-neutral-800 dark:text-neutral-100">
                       {t('voice.modal.title')}{' '}
                       {BUILTIN_VOICE_PROVIDER_META[pendingKeySlug]?.label ?? pendingKeySlug}
                     </h3>
-                    <p className="text-xs text-stone-500 dark:text-neutral-400 mt-1">
+                    <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-1">
                       {t('voice.modal.desc')}
                     </p>
                   </div>
 
                   <label className="block space-y-1">
-                    <span className="text-xs font-medium text-stone-600 dark:text-neutral-300">
+                    <span className="text-xs font-medium text-neutral-500 dark:text-neutral-300">
                       {t('voice.providers.chip.apiKeyLabel')}
                     </span>
-                    <input
+                    <SettingsTextField
                       id="voice-provider-key-input"
                       type="password"
                       autoComplete="off"
@@ -859,7 +904,7 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
                       }}
                       disabled={isSavingPendingKey}
                       placeholder={t('voice.providers.chip.apiKeyPlaceholder')}
-                      className="w-full rounded-md border border-stone-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 px-3 py-2 text-sm text-stone-900 dark:text-neutral-100 placeholder:text-stone-400 dark:placeholder:text-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-400"
+                      className="w-full"
                     />
                   </label>
 
@@ -875,21 +920,24 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
                   )}
 
                   <div className="flex items-center justify-between pt-2">
-                    <button
+                    <Button
                       type="button"
+                      variant="secondary"
+                      size="xs"
                       onClick={() => {
                         setPendingKeySlug(null);
                         setPendingKeyValue('');
                         setKeyTestResult(null);
                       }}
-                      disabled={isSavingPendingKey}
-                      className="px-3 py-1.5 text-xs rounded-md border border-stone-200 dark:border-neutral-700 text-stone-600 dark:text-neutral-300 hover:bg-stone-50 dark:hover:bg-neutral-800 disabled:opacity-50">
+                      disabled={isSavingPendingKey}>
                       {t('common.cancel')}
-                    </button>
+                    </Button>
 
                     <div className="flex items-center gap-2">
-                      <button
+                      <Button
                         type="button"
+                        variant="secondary"
+                        size="xs"
                         disabled={!pendingKeyValue.trim() || isTestingKey || isSavingPendingKey}
                         onClick={async () => {
                           if (!pendingKeySlug || !pendingKeyValue.trim()) return;
@@ -915,19 +963,19 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
                           } finally {
                             setIsTestingKey(false);
                           }
-                        }}
-                        className="px-3 py-1.5 text-xs rounded-md border border-stone-300 dark:border-neutral-600 text-stone-700 dark:text-neutral-200 hover:bg-stone-50 dark:hover:bg-neutral-800 disabled:opacity-50">
+                        }}>
                         {isTestingKey ? t('voice.modal.testing') : t('voice.modal.testKey')}
-                      </button>
-                      <button
+                      </Button>
+                      <Button
                         type="button"
+                        variant="primary"
+                        size="xs"
                         onClick={() =>
                           void handleEnableExternalProvider(pendingKeySlug, pendingKeyValue)
                         }
-                        disabled={!pendingKeyValue.trim() || isSavingPendingKey}
-                        className="px-4 py-1.5 text-xs rounded-md bg-primary-600 text-white hover:bg-primary-700 disabled:opacity-50">
+                        disabled={!pendingKeyValue.trim() || isSavingPendingKey}>
                         {isSavingPendingKey ? t('common.loading') : t('voice.modal.saveAndEnable')}
-                      </button>
+                      </Button>
                     </div>
                   </div>
                 </>
@@ -937,332 +985,336 @@ const VoicePanel = ({ embedded = false }: VoicePanelProps = {}) => {
         )}
 
         {/* ─── Section 2: Voice Routing ─────────────────────────────────── */}
-        <section className="space-y-3">
-          <div className="bg-stone-50 dark:bg-neutral-800/60 rounded-lg border border-stone-200 dark:border-neutral-800 p-4 space-y-4">
-            <div>
-              <h3 className="text-sm font-semibold text-stone-900 dark:text-neutral-100">
-                {t('voice.routing.title')}
-              </h3>
-              <p className="text-xs text-stone-500 dark:text-neutral-400 mt-1">
-                {t('voice.routing.desc')}
-              </p>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              {/* STT routing */}
-              <div className="space-y-2">
-                <label className="block space-y-1">
-                  <span className="text-xs font-medium text-stone-600 dark:text-neutral-300">
-                    {t('voice.providers.sttProvider')}
-                  </span>
-                  <select
-                    aria-label={t('voice.providers.sttProviderAria')}
-                    data-testid="stt-provider-select"
-                    value={sttProvider || 'cloud'}
-                    disabled={isSavingProviders}
-                    onChange={e => onSttProviderChange(e.target.value)}
-                    className="w-full rounded-md border border-stone-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 px-3 py-2 text-sm text-stone-900 dark:text-neutral-100 focus:outline-none focus:ring-1 focus:ring-primary-400">
-                    <option value="cloud">{t('voice.providers.cloudWhisperProxy')}</option>
-                    {/* Whisper only shown when enabled */}
-                    {(sttProvider === 'whisper' ||
-                      (voiceSettings?.voiceProviders ?? []).some(p => p.slug === 'whisper')) && (
-                      <option value="whisper">{t('voice.providers.localWhisper')}</option>
-                    )}
-                    {/* External providers that support STT */}
-                    {sttExternalProviders.map(p => (
-                      <option key={p.slug} value={p.slug}>
-                        {p.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    data-testid="test-stt-button"
-                    disabled={isTestingStt || !sttProvider}
-                    onClick={async () => {
-                      setIsTestingStt(true);
-                      setSttTestResult(null);
-                      try {
-                        const result = await testVoiceProvider('stt', sttProvider || 'cloud');
-                        setSttTestResult(result);
-                      } catch (err) {
-                        setSttTestResult({
-                          ok: false,
-                          detail: err instanceof Error ? err.message : 'Test failed',
-                        });
-                      } finally {
-                        setIsTestingStt(false);
-                      }
-                    }}
-                    className="px-2.5 py-1 text-[11px] rounded-md border border-stone-300 dark:border-neutral-600 text-stone-600 dark:text-neutral-300 hover:bg-stone-100 dark:hover:bg-neutral-700 disabled:opacity-50">
-                    {isTestingStt ? t('voice.modal.testing') : t('voice.routing.testStt')}
-                  </button>
-                  {sttTestResult && (
-                    <span
-                      className={`text-[11px] ${
-                        sttTestResult.ok
-                          ? 'text-emerald-600 dark:text-emerald-300'
-                          : 'text-red-600 dark:text-red-300'
-                      }`}>
-                      {sttTestResult.detail}
-                    </span>
-                  )}
-                </div>
-
-                {/* Whisper model picker — shown when Whisper is selected */}
-                {sttProvider === 'whisper' && (
+        <SettingsSection title={t('voice.routing.title')} description={t('voice.routing.desc')}>
+          <SettingsRow
+            stacked
+            control={
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                {/* STT routing */}
+                <div className="space-y-2">
                   <label className="block space-y-1">
-                    <span className="text-xs font-medium text-stone-600 dark:text-neutral-300">
-                      {t('voice.providers.whisperModel')}
+                    <span className="text-xs font-medium text-neutral-500 dark:text-neutral-300">
+                      {t('voice.providers.sttProvider')}
                     </span>
-                    <select
-                      aria-label={t('voice.providers.whisperModelAria')}
-                      data-testid="stt-model-select"
-                      value={sttModel || 'medium'}
+                    <SettingsSelect
+                      aria-label={t('voice.providers.sttProviderAria')}
+                      data-testid="stt-provider-select"
+                      value={sttProvider || 'cloud'}
                       disabled={isSavingProviders}
-                      onChange={e => {
-                        const nextModel = e.target.value;
-                        setSttModel(nextModel);
-                        void persistProviders({ stt_model: nextModel });
-                      }}
-                      className="w-full rounded-md border border-stone-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 px-3 py-2 text-sm text-stone-900 dark:text-neutral-100 focus:outline-none focus:ring-1 focus:ring-primary-400">
-                      <option value="tiny">{t('voice.providers.whisperModelTiny')}</option>
-                      <option value="base">{t('voice.providers.whisperModelBase')}</option>
-                      <option value="small">{t('voice.providers.whisperModelSmall')}</option>
-                      <option value="medium">{t('voice.providers.whisperModelMedium')}</option>
-                      <option value="whisper-large-v3-turbo">
-                        {t('voice.providers.whisperModelLargeTurbo')}
-                      </option>
-                    </select>
+                      onChange={e => onSttProviderChange(e.target.value)}
+                      className="w-full">
+                      <option value="cloud">{t('voice.providers.cloudWhisperProxy')}</option>
+                      {/* Whisper only shown when enabled */}
+                      {(sttProvider === 'whisper' ||
+                        (voiceSettings?.voiceProviders ?? []).some(p => p.slug === 'whisper')) && (
+                        <option value="whisper">{t('voice.providers.localWhisper')}</option>
+                      )}
+                      {/* External providers that support STT */}
+                      {sttExternalProviders.map(p => (
+                        <option key={p.slug} value={p.slug}>
+                          {p.label}
+                        </option>
+                      ))}
+                    </SettingsSelect>
                   </label>
-                )}
-              </div>
 
-              {/* TTS routing */}
-              <div className="space-y-2">
-                <label className="block space-y-1">
-                  <span className="text-xs font-medium text-stone-600 dark:text-neutral-300">
-                    {t('voice.providers.ttsProvider')}
-                  </span>
-                  <select
-                    aria-label={t('voice.providers.ttsProviderAria')}
-                    data-testid="tts-provider-select"
-                    value={ttsProvider || 'cloud'}
-                    disabled={isSavingProviders}
-                    onChange={e => onTtsProviderChange(e.target.value)}
-                    className="w-full rounded-md border border-stone-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 px-3 py-2 text-sm text-stone-900 dark:text-neutral-100 focus:outline-none focus:ring-1 focus:ring-primary-400">
-                    <option value="cloud">{t('voice.providers.cloudElevenLabsProxy')}</option>
-                    {/* Piper only shown when enabled */}
-                    {(ttsProvider === 'piper' ||
-                      (voiceSettings?.voiceProviders ?? []).some(p => p.slug === 'piper')) && (
-                      <option value="piper">{t('voice.providers.localPiper')}</option>
-                    )}
-                    {/* External providers that support TTS */}
-                    {ttsExternalProviders.map(p => (
-                      <option key={p.slug} value={p.slug}>
-                        {p.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    data-testid="test-tts-button"
-                    disabled={isTestingTts || !ttsProvider}
-                    onClick={async () => {
-                      setIsTestingTts(true);
-                      setTtsTestResult(null);
-                      try {
-                        // For ElevenLabs, include the voice ID so the test
-                        // actually synthesizes audio with the selected voice.
-                        let ttsTestProvider = ttsProvider || 'cloud';
-                        if (ttsProvider === 'elevenlabs' && elevenlabsVoiceId) {
-                          ttsTestProvider = `elevenlabs:${elevenlabsVoiceId}`;
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="xs"
+                      data-testid="test-stt-button"
+                      disabled={isTestingStt || !sttProvider}
+                      onClick={async () => {
+                        setIsTestingStt(true);
+                        setSttTestResult(null);
+                        try {
+                          const result = await testVoiceProvider('stt', sttProvider || 'cloud');
+                          setSttTestResult(result);
+                        } catch (err) {
+                          setSttTestResult({
+                            ok: false,
+                            detail: err instanceof Error ? err.message : 'Test failed',
+                          });
+                        } finally {
+                          setIsTestingStt(false);
                         }
-                        const result = await testVoiceProvider('tts', ttsTestProvider);
-                        setTtsTestResult(result);
-                      } catch (err) {
-                        setTtsTestResult({
-                          ok: false,
-                          detail: err instanceof Error ? err.message : 'Test failed',
-                        });
-                      } finally {
-                        setIsTestingTts(false);
-                      }
-                    }}
-                    className="px-2.5 py-1 text-[11px] rounded-md border border-stone-300 dark:border-neutral-600 text-stone-600 dark:text-neutral-300 hover:bg-stone-100 dark:hover:bg-neutral-700 disabled:opacity-50">
-                    {isTestingTts ? t('voice.modal.testing') : t('voice.routing.testTts')}
-                  </button>
-                  {ttsTestResult && (
-                    <span
-                      className={`text-[11px] ${
-                        ttsTestResult.ok
-                          ? 'text-emerald-600 dark:text-emerald-300'
-                          : 'text-red-600 dark:text-red-300'
-                      }`}>
-                      {ttsTestResult.detail}
-                    </span>
+                      }}>
+                      {isTestingStt ? t('voice.modal.testing') : t('voice.routing.testStt')}
+                    </Button>
+                    {sttTestResult && (
+                      <span
+                        className={`text-[11px] ${
+                          sttTestResult.ok
+                            ? 'text-emerald-600 dark:text-emerald-300'
+                            : 'text-red-600 dark:text-red-300'
+                        }`}>
+                        {sttTestResult.detail}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Whisper model picker — shown when Whisper is selected */}
+                  {sttProvider === 'whisper' && (
+                    <label className="block space-y-1">
+                      <span className="text-xs font-medium text-neutral-500 dark:text-neutral-300">
+                        {t('voice.providers.whisperModel')}
+                      </span>
+                      <SettingsSelect
+                        aria-label={t('voice.providers.whisperModelAria')}
+                        data-testid="stt-model-select"
+                        value={sttModel || 'medium'}
+                        disabled={isSavingProviders}
+                        onChange={e => {
+                          const nextModel = e.target.value;
+                          setSttModel(nextModel);
+                          void persistProviders({ stt_model: nextModel });
+                        }}
+                        className="w-full">
+                        <option value="tiny">{t('voice.providers.whisperModelTiny')}</option>
+                        <option value="base">{t('voice.providers.whisperModelBase')}</option>
+                        <option value="small">{t('voice.providers.whisperModelSmall')}</option>
+                        <option value="medium">{t('voice.providers.whisperModelMedium')}</option>
+                        <option value="whisper-large-v3-turbo">
+                          {t('voice.providers.whisperModelLargeTurbo')}
+                        </option>
+                      </SettingsSelect>
+                    </label>
                   )}
                 </div>
 
-                {/* Piper voice picker — shown when Piper is selected */}
-                {ttsProvider === 'piper' && (
+                {/* TTS routing */}
+                <div className="space-y-2">
                   <label className="block space-y-1">
-                    <span className="text-xs font-medium text-stone-600 dark:text-neutral-300">
-                      {t('voice.providers.piperVoice')}
+                    <span className="text-xs font-medium text-neutral-500 dark:text-neutral-300">
+                      {t('voice.providers.ttsProvider')}
                     </span>
-                    <select
-                      aria-label={t('voice.providers.piperVoiceAria')}
-                      data-testid="tts-voice-select"
-                      value={
-                        PIPER_VOICE_PRESET_IDS.some(v => v === ttsVoice) ? ttsVoice : '__custom__'
-                      }
+                    <SettingsSelect
+                      aria-label={t('voice.providers.ttsProviderAria')}
+                      data-testid="tts-provider-select"
+                      value={ttsProvider || 'cloud'}
                       disabled={isSavingProviders}
-                      onChange={e => {
-                        const next = e.target.value;
-                        if (next === '__custom__') return;
-                        setTtsVoice(next);
-                        void persistProviders({ tts_voice: next });
-                        void installPiper({ voiceId: next }).catch(err =>
-                          console.warn(
-                            '[voice-install:piper] auto-install on voice change failed:',
-                            err
-                          )
-                        );
-                      }}
-                      className="w-full rounded-md border border-stone-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 px-3 py-2 text-sm text-stone-900 dark:text-neutral-100 focus:outline-none focus:ring-1 focus:ring-primary-400">
-                      {piperVoicePresets.map(v => (
-                        <option key={v.id} value={v.id}>
-                          {v.label}
+                      onChange={e => onTtsProviderChange(e.target.value)}
+                      className="w-full">
+                      <option value="cloud">{t('voice.providers.cloudElevenLabsProxy')}</option>
+                      {/* Piper only shown when enabled */}
+                      {(ttsProvider === 'piper' ||
+                        (voiceSettings?.voiceProviders ?? []).some(p => p.slug === 'piper')) && (
+                        <option value="piper">{t('voice.providers.localPiper')}</option>
+                      )}
+                      {/* External providers that support TTS */}
+                      {ttsExternalProviders.map(p => (
+                        <option key={p.slug} value={p.slug}>
+                          {p.label}
                         </option>
                       ))}
-                      <option value="__custom__">{t('voice.providers.customVoiceOption')}</option>
-                    </select>
-                    {!PIPER_VOICE_PRESET_IDS.some(v => v === ttsVoice) && (
-                      <input
-                        aria-label={t('voice.providers.customVoiceAria')}
-                        data-testid="tts-voice-input"
-                        value={ttsVoice}
-                        placeholder={t('voice.providers.customVoicePlaceholder')}
-                        disabled={isSavingProviders}
-                        onChange={e => setTtsVoice(e.target.value)}
-                        onBlur={() => {
-                          if (ttsVoice && ttsVoice !== voiceStatus?.tts_voice_id) {
-                            void persistProviders({ tts_voice: ttsVoice });
-                            void installPiper({ voiceId: ttsVoice }).catch(err =>
-                              console.warn(
-                                '[voice-install:piper] auto-install on custom voice failed:',
-                                err
-                              )
-                            );
+                    </SettingsSelect>
+                  </label>
+
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="xs"
+                      data-testid="test-tts-button"
+                      disabled={isTestingTts || !ttsProvider}
+                      onClick={async () => {
+                        setIsTestingTts(true);
+                        setTtsTestResult(null);
+                        try {
+                          // For ElevenLabs, include the voice ID so the test
+                          // actually synthesizes audio with the selected voice.
+                          let ttsTestProvider = ttsProvider || 'cloud';
+                          if (ttsProvider === 'elevenlabs' && elevenlabsVoiceId) {
+                            ttsTestProvider = `elevenlabs:${elevenlabsVoiceId}`;
                           }
-                        }}
-                        className="mt-1 w-full rounded-md border border-stone-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 px-3 py-2 text-sm text-stone-900 dark:text-neutral-100 placeholder:text-stone-400 dark:placeholder:text-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-400"
-                      />
+                          const result = await testVoiceProvider('tts', ttsTestProvider);
+                          setTtsTestResult(result);
+                        } catch (err) {
+                          setTtsTestResult({
+                            ok: false,
+                            detail: err instanceof Error ? err.message : 'Test failed',
+                          });
+                        } finally {
+                          setIsTestingTts(false);
+                        }
+                      }}>
+                      {isTestingTts ? t('voice.modal.testing') : t('voice.routing.testTts')}
+                    </Button>
+                    {ttsTestResult && (
+                      <span
+                        className={`text-[11px] ${
+                          ttsTestResult.ok
+                            ? 'text-emerald-600 dark:text-emerald-300'
+                            : 'text-red-600 dark:text-red-300'
+                        }`}>
+                        {ttsTestResult.detail}
+                      </span>
                     )}
-                    <p className="text-[11px] text-stone-500 dark:text-neutral-400 mt-0.5">
-                      {t('voice.providers.piperVoicesDesc')}
-                    </p>
-                  </label>
-                )}
+                  </div>
 
-                {/* ElevenLabs voice picker — shown when ElevenLabs is selected for TTS */}
-                {ttsProvider === 'elevenlabs' && (
-                  <label className="block space-y-1">
-                    <span className="text-xs font-medium text-stone-600 dark:text-neutral-300">
-                      {t('voice.routing.elevenlabsVoice')}
-                    </span>
-                    <select
-                      aria-label={t('voice.routing.elevenlabsVoiceAria')}
-                      data-testid="elevenlabs-voice-select"
-                      value={
-                        isCuratedVoicePreset(elevenlabsVoiceId) ? elevenlabsVoiceId : '__custom__'
-                      }
-                      disabled={isSavingProviders}
-                      onChange={e => {
-                        const next = e.target.value;
-                        if (next === '__custom__') return;
-                        setElevenlabsVoiceId(next);
-                      }}
-                      className="w-full rounded-md border border-stone-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 px-3 py-2 text-sm text-stone-900 dark:text-neutral-100 focus:outline-none focus:ring-1 focus:ring-primary-400">
-                      {ELEVENLABS_VOICE_PRESETS.map(v => (
-                        <option key={v.id} value={v.id}>
-                          {v.label}
-                        </option>
-                      ))}
-                      <option value="__custom__">{t('voice.providers.customVoiceOption')}</option>
-                    </select>
-                    {!isCuratedVoicePreset(elevenlabsVoiceId) && (
-                      <input
-                        aria-label={t('voice.routing.elevenlabsVoiceIdAria')}
-                        data-testid="elevenlabs-voice-input"
-                        value={elevenlabsVoiceId}
-                        placeholder="JBFqnCBsd6RMkjVDRZzb"
+                  {/* Piper voice picker — shown when Piper is selected */}
+                  {ttsProvider === 'piper' && (
+                    <label className="block space-y-1">
+                      <span className="text-xs font-medium text-neutral-500 dark:text-neutral-300">
+                        {t('voice.providers.piperVoice')}
+                      </span>
+                      <SettingsSelect
+                        aria-label={t('voice.providers.piperVoiceAria')}
+                        data-testid="tts-voice-select"
+                        value={
+                          PIPER_VOICE_PRESET_IDS.some(v => v === ttsVoice) ? ttsVoice : '__custom__'
+                        }
                         disabled={isSavingProviders}
-                        onChange={e => setElevenlabsVoiceId(e.target.value)}
-                        className="mt-1 w-full rounded-md border border-stone-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 px-3 py-2 text-sm text-stone-900 dark:text-neutral-100 placeholder:text-stone-400 dark:placeholder:text-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-400"
-                      />
-                    )}
-                    <p className="text-[11px] text-stone-500 dark:text-neutral-400 mt-0.5">
-                      {t('voice.routing.elevenlabsVoiceDesc')}
-                    </p>
-                  </label>
-                )}
-              </div>
-            </div>
+                        onChange={e => {
+                          const next = e.target.value;
+                          if (next === '__custom__') return;
+                          setTtsVoice(next);
+                          void persistProviders({ tts_voice: next });
+                          void installPiper({ voiceId: next }).catch(err =>
+                            console.warn(
+                              '[voice-install:piper] auto-install on voice change failed:',
+                              err
+                            )
+                          );
+                        }}
+                        className="w-full">
+                        {piperVoicePresets.map(v => (
+                          <option key={v.id} value={v.id}>
+                            {v.label}
+                          </option>
+                        ))}
+                        <option value="__custom__">{t('voice.providers.customVoiceOption')}</option>
+                      </SettingsSelect>
+                      {!PIPER_VOICE_PRESET_IDS.some(v => v === ttsVoice) && (
+                        <SettingsTextField
+                          aria-label={t('voice.providers.customVoiceAria')}
+                          data-testid="tts-voice-input"
+                          value={ttsVoice}
+                          placeholder={t('voice.providers.customVoicePlaceholder')}
+                          disabled={isSavingProviders}
+                          onChange={e => setTtsVoice(e.target.value)}
+                          onBlur={() => {
+                            if (ttsVoice && ttsVoice !== voiceStatus?.tts_voice_id) {
+                              void persistProviders({ tts_voice: ttsVoice });
+                              void installPiper({ voiceId: ttsVoice }).catch(err =>
+                                console.warn(
+                                  '[voice-install:piper] auto-install on custom voice failed:',
+                                  err
+                                )
+                              );
+                            }
+                          }}
+                          className="mt-1 w-full"
+                        />
+                      )}
+                      <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5">
+                        {t('voice.providers.piperVoicesDesc')}
+                      </p>
+                    </label>
+                  )}
 
-            <div className="flex justify-end pt-2">
-              <button
-                type="button"
-                data-testid="save-voice-routing"
-                disabled={!hasRoutingChanges || isSavingRouting}
-                onClick={() => void saveRouting()}
-                className="px-4 py-1.5 text-xs rounded-md bg-primary-600 text-white hover:bg-primary-700 disabled:opacity-40 disabled:cursor-not-allowed">
-                {isSavingRouting ? t('common.loading') : t('voice.routing.save')}
-              </button>
-            </div>
+                  {/* ElevenLabs voice picker — shown when ElevenLabs is selected for TTS */}
+                  {ttsProvider === 'elevenlabs' && (
+                    <label className="block space-y-1">
+                      <span className="text-xs font-medium text-neutral-500 dark:text-neutral-300">
+                        {t('voice.routing.elevenlabsVoice')}
+                      </span>
+                      <SettingsSelect
+                        aria-label={t('voice.routing.elevenlabsVoiceAria')}
+                        data-testid="elevenlabs-voice-select"
+                        value={
+                          isCuratedVoicePreset(elevenlabsVoiceId) ? elevenlabsVoiceId : '__custom__'
+                        }
+                        disabled={isSavingProviders}
+                        onChange={e => {
+                          const next = e.target.value;
+                          if (next === '__custom__') return;
+                          setElevenlabsVoiceId(next);
+                        }}
+                        className="w-full">
+                        {ELEVENLABS_VOICE_PRESETS.map(v => (
+                          <option key={v.id} value={v.id}>
+                            {v.label}
+                          </option>
+                        ))}
+                        <option value="__custom__">{t('voice.providers.customVoiceOption')}</option>
+                      </SettingsSelect>
+                      {!isCuratedVoicePreset(elevenlabsVoiceId) && (
+                        <SettingsTextField
+                          aria-label={t('voice.routing.elevenlabsVoiceIdAria')}
+                          data-testid="elevenlabs-voice-input"
+                          value={elevenlabsVoiceId}
+                          placeholder="JBFqnCBsd6RMkjVDRZzb"
+                          disabled={isSavingProviders}
+                          onChange={e => setElevenlabsVoiceId(e.target.value)}
+                          className="mt-1 w-full"
+                        />
+                      )}
+                      <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5">
+                        {t('voice.routing.elevenlabsVoiceDesc')}
+                      </p>
+                    </label>
+                  )}
+                </div>
+              </div>
+            }
+          />
+          <div className="flex justify-end px-4 py-3 border-t border-neutral-100 dark:border-neutral-800">
+            <Button
+              type="button"
+              variant="primary"
+              size="xs"
+              data-testid="save-voice-routing"
+              disabled={!hasRoutingChanges || isSavingRouting}
+              onClick={() => void saveRouting()}>
+              {isSavingRouting ? t('common.loading') : t('voice.routing.save')}
+            </Button>
           </div>
-        </section>
+        </SettingsSection>
+
+        {/* ─── Section 3: Push-to-talk ─────────────────────────────────
+            Global PTT hotkey + session preferences. The panel is
+            self-contained — it only mutates the `ptt` slice, and
+            `usePttHotkey` (T11) reacts to slice changes to (re)register
+            the binding with the Tauri shell. Mounted here so users hunt
+            for it under Voice settings alongside dictation. */}
+        <PttSettingsPanel />
 
         {/* Mascot voice picker now lives in Mascot settings. Link
             kept here so users hunting in Voice settings can find it. */}
         {ttsProvider !== 'piper' && (
-          <section className="space-y-3" data-testid="mascot-voice-link">
-            <div className="bg-stone-50 dark:bg-neutral-800/60 rounded-lg border border-stone-200 dark:border-neutral-800 p-4">
-              <h3 className="text-sm font-semibold text-stone-900 dark:text-neutral-100">
-                {t('voice.providers.mascotVoice')}
-              </h3>
-              <p className="text-xs text-stone-500 dark:text-neutral-400 mt-1">
-                {t('voice.providers.mascotVoiceDescPrefix')}{' '}
-                <button
-                  type="button"
-                  onClick={() => navigateToSettings('mascot')}
-                  className="underline text-primary-600 dark:text-primary-300 hover:text-primary-700 dark:hover:text-primary-200">
-                  {t('voice.providers.mascotSettings')}
-                </button>
-                {t('voice.providers.mascotVoiceDescSuffix')}
-              </p>
-            </div>
+          <section data-testid="mascot-voice-link">
+            <SettingsSection>
+              <SettingsRow
+                stacked
+                label={t('voice.providers.mascotVoice')}
+                control={
+                  <p className="text-xs text-neutral-500 dark:text-neutral-400">
+                    {t('voice.providers.mascotVoiceDescPrefix')}{' '}
+                    <button
+                      type="button"
+                      onClick={() => navigateToSettings('personality#face')}
+                      className="underline text-primary-600 dark:text-primary-300 hover:text-primary-700 dark:hover:text-primary-200">
+                      {t('voice.providers.mascotSettings')}
+                    </button>
+                    {t('voice.providers.mascotVoiceDescSuffix')}
+                  </p>
+                }
+              />
+            </SettingsSection>
           </section>
         )}
 
-        {error && (
-          <div className="rounded-md border border-red-200 dark:border-red-500/30 bg-red-50 dark:bg-red-500/10 p-3 text-xs text-red-600 dark:text-red-300">
-            {error}
-          </div>
-        )}
-        {notice && (
-          <div className="rounded-md border border-emerald-200 dark:border-emerald-500/30 bg-emerald-50 dark:bg-emerald-500/10 p-3 text-xs text-emerald-700 dark:text-emerald-300">
-            {notice}
-          </div>
-        )}
+        {/* Status line */}
+        <SettingsStatusLine
+          saving={isSavingProviders || isSavingRouting}
+          savedNote={notice}
+          error={error}
+          savingLabel={t('common.loading')}
+        />
       </div>
-    </div>
+    </PanelPage>
   );
 };
 

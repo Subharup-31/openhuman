@@ -1,4 +1,4 @@
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Deserializer};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -25,6 +25,11 @@ struct InferenceVisionPromptParams {
     prompt: String,
     image_refs: Vec<String>,
     max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InferenceResolveModelParams {
+    hint: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,11 +80,14 @@ struct InferenceUpdateModelSettingsParams {
     default_temperature: Option<f64>,
     model_routes: Option<Vec<InferenceModelRouteUpdate>>,
     cloud_providers: Option<Vec<InferenceCloudProviderUpdate>>,
+    #[serde(default)]
+    model_registry: Option<Vec<crate::openhuman::config::schema::ModelRegistryEntry>>,
     primary_cloud: Option<String>,
     chat_provider: Option<String>,
     reasoning_provider: Option<String>,
     agentic_provider: Option<String>,
     coding_provider: Option<String>,
+    vision_provider: Option<String>,
     memory_provider: Option<String>,
     embeddings_provider: Option<String>,
     heartbeat_provider: Option<String>,
@@ -88,17 +96,26 @@ struct InferenceUpdateModelSettingsParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct InferenceClaudeCodeSetFullAccessParams {
+    /// true → full access (`bypassPermissions` + full toolset); false → the
+    /// default `acceptEdits` posture (file edits only).
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct InferenceUpdateLocalSettingsParams {
     runtime_enabled: Option<bool>,
     opt_in_confirmed: Option<bool>,
     provider: Option<String>,
-    base_url: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_json")]
+    base_url: Option<Value>,
     model_id: Option<String>,
     chat_model_id: Option<String>,
     usage_embeddings: Option<bool>,
     usage_heartbeat: Option<bool>,
     usage_learning_reflection: Option<bool>,
     usage_subconscious: Option<bool>,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +136,7 @@ struct InferenceOpenAiOAuthCompleteParams {
 
 pub fn all_controller_schemas() -> Vec<ControllerSchema> {
     vec![
+        schemas("resolve_model"),
         schemas("status"),
         schemas("get_client_config"),
         schemas("update_model_settings"),
@@ -139,11 +157,19 @@ pub fn all_controller_schemas() -> Vec<ControllerSchema> {
         schemas("test_provider_model"),
         schemas("should_react"),
         schemas("analyze_sentiment"),
+        schemas("claude_code_status"),
+        schemas("claude_code_auth_status"),
+        schemas("claude_code_settings"),
+        schemas("claude_code_set_full_access"),
     ]
 }
 
 pub fn all_registered_controllers() -> Vec<RegisteredController> {
     vec![
+        RegisteredController {
+            schema: schemas("resolve_model"),
+            handler: handle_inference_resolve_model,
+        },
         RegisteredController {
             schema: schemas("status"),
             handler: handle_inference_status,
@@ -224,11 +250,40 @@ pub fn all_registered_controllers() -> Vec<RegisteredController> {
             schema: schemas("analyze_sentiment"),
             handler: handle_inference_analyze_sentiment,
         },
+        RegisteredController {
+            schema: schemas("claude_code_status"),
+            handler: handle_inference_claude_code_status,
+        },
+        RegisteredController {
+            schema: schemas("claude_code_auth_status"),
+            handler: handle_inference_claude_code_auth_status,
+        },
+        RegisteredController {
+            schema: schemas("claude_code_settings"),
+            handler: handle_inference_claude_code_settings,
+        },
+        RegisteredController {
+            schema: schemas("claude_code_set_full_access"),
+            handler: handle_inference_claude_code_set_full_access,
+        },
     ]
 }
 
 pub fn schemas(function: &str) -> ControllerSchema {
     match function {
+        "resolve_model" => ControllerSchema {
+            namespace: "inference",
+            function: "resolve_model",
+            description: "Resolve a model hint or tier name to the concrete model the provider router would use.",
+            inputs: vec![required_string("hint", "Model hint (e.g. hint:reasoning) or tier name (e.g. reasoning-v1).")],
+            outputs: vec![
+                json_output("model", "Resolved concrete model id."),
+                json_output(
+                    "vision",
+                    "Whether the resolved model accepts image input (vision-capable).",
+                ),
+            ],
+        },
         "status" => ControllerSchema {
             namespace: "inference",
             function: "status",
@@ -255,11 +310,13 @@ pub fn schemas(function: &str) -> ControllerSchema {
                 optional_f64("default_temperature", "Optional default temperature override."),
                 optional_json("model_routes", "Optional full replacement for legacy model routes."),
                 optional_json("cloud_providers", "Optional full replacement for configured cloud providers."),
+                optional_json("model_registry", "Optional full replacement for the per-model registry (carries each model's `vision` flag)."),
                 optional_string("primary_cloud", "Optional primary cloud provider id."),
                 optional_string("chat_provider", "Optional chat workload provider string."),
                 optional_string("reasoning_provider", "Optional reasoning workload provider string."),
                 optional_string("agentic_provider", "Optional agentic workload provider string."),
                 optional_string("coding_provider", "Optional coding workload provider string."),
+                optional_string("vision_provider", "Optional vision / multimodal workload provider string."),
                 optional_string("memory_provider", "Optional memory workload provider string."),
                 optional_string("embeddings_provider", "Optional embeddings workload provider string."),
                 optional_string("heartbeat_provider", "Optional heartbeat workload provider string."),
@@ -276,7 +333,14 @@ pub fn schemas(function: &str) -> ControllerSchema {
                 optional_bool("runtime_enabled", "Enable or disable local inference runtime routing."),
                 optional_bool("opt_in_confirmed", "Persist the local inference opt-in flag."),
                 optional_string("provider", "Optional local provider slug, e.g. ollama or lm_studio."),
-                optional_string("base_url", "Optional local provider base URL."),
+                optional_json(
+                    "base_url",
+                    "Optional local provider base URL string, or null to clear.",
+                ),
+                optional_string(
+                    "api_key",
+                    "Optional Bearer API key for a local provider that requires one (e.g. OMLX); empty string clears it.",
+                ),
                 optional_string("model_id", "Optional generic model id override."),
                 optional_string("chat_model_id", "Optional chat model id override."),
                 optional_bool("usage_embeddings", "Whether embeddings workload may use the local provider."),
@@ -432,6 +496,49 @@ pub fn schemas(function: &str) -> ControllerSchema {
             inputs: vec![required_string("message", "User message content to classify.")],
             outputs: vec![json_output("sentiment", "Sentiment analysis payload.")],
         },
+        "claude_code_status" => ControllerSchema {
+            namespace: "inference",
+            function: "claude_code_status",
+            description: "Probe the local `claude` CLI binary (Claude Code CLI provider) and return install + version status.",
+            inputs: vec![],
+            outputs: vec![json_output(
+                "status",
+                "CliStatus payload: ok | not_installed | outdated | unusable, with version + path when present.",
+            )],
+        },
+        "claude_code_auth_status" => ControllerSchema {
+            namespace: "inference",
+            function: "claude_code_auth_status",
+            description: "Detect Claude Code CLI auth state (Pro/Max subscription via credentials.json, API key env, or none). No CLI spawn, no token round-trip.",
+            inputs: vec![],
+            outputs: vec![json_output(
+                "auth",
+                "AuthStatus payload: source = subscription | api_key_env | none, plus optional account_email + expires_at + last_checked.",
+            )],
+        },
+        "claude_code_settings" => ControllerSchema {
+            namespace: "inference",
+            function: "claude_code_settings",
+            description: "Read the persisted Claude Code provider settings (currently just the full-access toggle). Self-contained per-install state stored under the workspace, not in the central config.",
+            inputs: vec![],
+            outputs: vec![json_output(
+                "settings",
+                "ClaudeCodeSettings payload: { full_access: bool }. full_access=true → bypassPermissions + full toolset; false (default) → acceptEdits.",
+            )],
+        },
+        "claude_code_set_full_access" => ControllerSchema {
+            namespace: "inference",
+            function: "claude_code_set_full_access",
+            description: "Persist the Claude Code full-access toggle. true → bypassPermissions + full native toolset (Bash/network/subagents); false (default) → acceptEdits (file edits only). The OPENHUMAN_CLAUDE_CODE_PERMISSION_MODE env var overrides this at runtime.",
+            inputs: vec![required_bool(
+                "enabled",
+                "true → full access (bypassPermissions); false → acceptEdits.",
+            )],
+            outputs: vec![json_output(
+                "settings",
+                "The persisted ClaudeCodeSettings after the update: { full_access: bool }.",
+            )],
+        },
         other => panic!("unknown inference schema: {other}"),
     }
 }
@@ -451,6 +558,15 @@ fn optional_bool(name: &'static str, comment: &'static str) -> FieldSchema {
         ty: TypeSchema::Option(Box::new(TypeSchema::Bool)),
         comment,
         required: false,
+    }
+}
+
+fn required_bool(name: &'static str, comment: &'static str) -> FieldSchema {
+    FieldSchema {
+        name,
+        ty: TypeSchema::Bool,
+        comment,
+        required: true,
     }
 }
 
@@ -497,6 +613,26 @@ fn json_output(name: &'static str, comment: &'static str) -> FieldSchema {
         comment,
         required: true,
     }
+}
+
+fn handle_inference_resolve_model(params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let p = deserialize_params::<InferenceResolveModelParams>(params)?;
+        let config = config_rpc::load_config_with_timeout().await?;
+        let resolved = crate::openhuman::inference::provider::factory::resolve_model_for_hint(
+            &p.hint, &config,
+        );
+        // Whether the resolved model accepts image input — drives the chat UI's
+        // image-attachment affordance. Managed OpenHuman tiers consult the
+        // core-owned per-tier map (currently all `false`); custom/BYOK models are
+        // covered by the user's per-model `model_registry.vision` flag.
+        let vision =
+            crate::openhuman::inference::model_context::model_supports_vision(&resolved, &config);
+        to_json(RpcOutcome::new(
+            serde_json::json!({ "model": resolved, "vision": vision }),
+            vec![],
+        ))
+    })
 }
 
 fn handle_inference_status(_params: Map<String, Value>) -> ControllerFuture {
@@ -611,11 +747,13 @@ fn handle_inference_update_model_settings(params: Map<String, Value>) -> Control
                         .collect::<Result<Vec<_>, String>>()
                 })
                 .transpose()?,
+            model_registry: update.model_registry,
             primary_cloud: update.primary_cloud,
             chat_provider: update.chat_provider,
             reasoning_provider: update.reasoning_provider,
             agentic_provider: update.agentic_provider,
             coding_provider: update.coding_provider,
+            vision_provider: update.vision_provider,
             memory_provider: update.memory_provider,
             embeddings_provider: update.embeddings_provider,
             heartbeat_provider: update.heartbeat_provider,
@@ -629,17 +767,24 @@ fn handle_inference_update_model_settings(params: Map<String, Value>) -> Control
 fn handle_inference_update_local_settings(params: Map<String, Value>) -> ControllerFuture {
     Box::pin(async move {
         let update = deserialize_params::<InferenceUpdateLocalSettingsParams>(params)?;
+        let base_url = match update.base_url {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(Value::String(value)) => Some(Some(value)),
+            Some(_) => return Err("invalid params: base_url must be a string or null".to_string()),
+        };
         let patch = config_rpc::LocalAiSettingsPatch {
             runtime_enabled: update.runtime_enabled,
             opt_in_confirmed: update.opt_in_confirmed,
             provider: update.provider,
-            base_url: update.base_url,
+            base_url,
             model_id: update.model_id,
             chat_model_id: update.chat_model_id,
             usage_embeddings: update.usage_embeddings,
             usage_heartbeat: update.usage_heartbeat,
             usage_learning_reflection: update.usage_learning_reflection,
             usage_subconscious: update.usage_subconscious,
+            api_key: update.api_key,
         };
         to_json(crate::openhuman::inference::rpc::inference_update_local_settings(patch).await?)
     })
@@ -808,8 +953,65 @@ fn handle_inference_analyze_sentiment(params: Map<String, Value>) -> ControllerF
     })
 }
 
+fn handle_inference_claude_code_status(_params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let status = tokio::task::spawn_blocking(
+            crate::openhuman::inference::provider::claude_code::version_check::probe,
+        )
+        .await
+        .map_err(|e| format!("claude_code_status join error: {e}"))?;
+        to_json(RpcOutcome::new(status, vec![]))
+    })
+}
+
+fn handle_inference_claude_code_auth_status(_params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let auth = tokio::task::spawn_blocking(
+            crate::openhuman::inference::provider::claude_code::auth_status::probe,
+        )
+        .await
+        .map_err(|e| format!("claude_code_auth_status join error: {e}"))?;
+        to_json(RpcOutcome::new(auth, vec![]))
+    })
+}
+
+fn handle_inference_claude_code_settings(_params: Map<String, Value>) -> ControllerFuture {
+    use crate::openhuman::inference::provider::claude_code::settings;
+    Box::pin(async move {
+        let config = config_rpc::load_config_with_timeout().await?;
+        let settings = settings::load_for_config(&config);
+        log::debug!(
+            "[rpc][inference.claude_code_settings] full_access={}",
+            settings.full_access
+        );
+        to_json(RpcOutcome::new(settings, vec![]))
+    })
+}
+
+fn handle_inference_claude_code_set_full_access(params: Map<String, Value>) -> ControllerFuture {
+    use crate::openhuman::inference::provider::claude_code::settings;
+    Box::pin(async move {
+        let p = deserialize_params::<InferenceClaudeCodeSetFullAccessParams>(params)?;
+        let config = config_rpc::load_config_with_timeout().await?;
+        let settings = settings::save_full_access_for_config(&config, p.enabled)
+            .map_err(|e| format!("failed to persist claude code settings: {e}"))?;
+        log::info!(
+            "[rpc][inference.claude_code_set_full_access] persisted full_access={}",
+            settings.full_access
+        );
+        to_json(RpcOutcome::new(settings, vec![]))
+    })
+}
+
 fn deserialize_params<T: DeserializeOwned>(params: Map<String, Value>) -> Result<T, String> {
     serde_json::from_value(Value::Object(params)).map_err(|e| format!("invalid params: {e}"))
+}
+
+fn deserialize_present_json<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 fn to_json<T: serde::Serialize>(outcome: RpcOutcome<T>) -> Result<Value, String> {

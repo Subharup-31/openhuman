@@ -7,6 +7,7 @@
 //! - `openhuman.memory_tree_list_chunks` — listing with filters.
 //! - `openhuman.memory_tree_get_chunk` — single chunk fetch.
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -138,6 +139,8 @@ pub async fn list_chunks_rpc(
         since_ms: req.since_ms,
         until_ms: req.until_ms,
         limit: req.limit,
+        source_scope: None,
+        exclude_dropped: false,
     };
     let rows = tokio::task::spawn_blocking({
         let config = config.clone();
@@ -273,13 +276,14 @@ pub struct PipelineJobCounts {
 ///   active sync, failed > 0 implies degraded.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PipelineStatusResponse {
-    /// Aggregated status string: `running` | `paused` | `syncing` | `error`
-    /// | `idle`. Derivation:
+    /// Aggregated status string: `running` | `paused` | `syncing` |
+    /// `degraded` | `error` | `idle`. Derivation:
     /// 1. `is_paused` (scheduler-gate `off`) wins → `paused`.
     /// 2. otherwise failed > 0 → `error`.
-    /// 3. otherwise running > 0 → `syncing`.
-    /// 4. otherwise total_chunks > 0 → `running`.
-    /// 5. otherwise → `idle`.
+    /// 3. otherwise degraded (#002, recall/structure reduced) → `degraded`.
+    /// 4. otherwise running > 0 → `syncing`.
+    /// 5. otherwise total_chunks > 0 → `running`.
+    /// 6. otherwise → `idle`.
     pub status: String,
     /// Optional human-readable reason — populated when status is
     /// `paused` or `error`. `None` otherwise.
@@ -301,6 +305,30 @@ pub struct PipelineStatusResponse {
     /// Convenience flag: scheduler-gate is in `off` mode, so all LLM-bound
     /// background work is paused cooperatively.
     pub is_paused: bool,
+    /// #002 (FR-002/FR-004): "the pipeline ran but output quality is reduced"
+    /// — `semantic_recall` true when embeddings were skipped (no usable
+    /// provider, so recall falls back to recency), `structure` true when
+    /// extraction yielded nothing across the board (empty wiki). Carries the
+    /// typed `cause` so the UI can render an actionable remediation. Additive:
+    /// `#[serde(default)]` keeps older clients deserialising the response.
+    #[serde(default)]
+    pub degraded: crate::openhuman::memory_tree::health::DegradedState,
+    /// #002 (FR-004): the single first blocking/most-significant cause, as a
+    /// typed failure with an i18n remediation key. Populated from a failed
+    /// job's classified reason or the active degradation cause; `None` when
+    /// the pipeline is healthy. The frontend renders this verbatim (resolving
+    /// `remediation_key`) instead of re-deriving a cause from raw counters.
+    #[serde(default)]
+    pub first_blocking_cause: Option<crate::openhuman::memory_tree::health::PipelineFailure>,
+    /// #002 (FR-010 / US5): fraction of chunks with ≥1 indexed entity, in
+    /// `[0.0, 1.0]`. Near 0 with `total_chunks > 0` means extraction is
+    /// producing no structure (the "empty-but-built wiki"). `None` when the
+    /// metric could not be measured (DB read error) — deliberately distinct
+    /// from a genuine `Some(0.0)` so the status surface never misreports a
+    /// broken measurement path as a structure failure. Additive
+    /// (`#[serde(default)]` → `None` for older clients).
+    #[serde(default)]
+    pub extraction_coverage: Option<f32>,
 }
 
 /// `memory_tree_pipeline_status` RPC handler (#1856 Part 1).
@@ -341,21 +369,29 @@ pub async fn pipeline_status_rpc(
             msg
         })??;
 
-    // Job counters — three parallel-safe blocking calls.
+    // Job counters — parallel-safe blocking calls. `failed_unrecoverable` is the
+    // #3365 left-right split: of the failed jobs, how many are the hard,
+    // user-actionable kind (`failure_class = 'unrecoverable'`) vs transient ones
+    // that self-heal via auto-requeue. Only the former escalates to `error`.
     let cfg_for_jobs = config.clone();
-    let pipeline_jobs =
-        tokio::task::spawn_blocking(move || -> Result<PipelineJobCounts, String> {
+    let (pipeline_jobs, failed_unrecoverable) =
+        tokio::task::spawn_blocking(move || -> Result<(PipelineJobCounts, u64), String> {
             let ready = queue_store::count_by_status(&cfg_for_jobs, JobStatus::Ready)
                 .map_err(|e| format!("count_by_status(ready): {e:#}"))?;
             let running = queue_store::count_by_status(&cfg_for_jobs, JobStatus::Running)
                 .map_err(|e| format!("count_by_status(running): {e:#}"))?;
             let failed = queue_store::count_by_status(&cfg_for_jobs, JobStatus::Failed)
                 .map_err(|e| format!("count_by_status(failed): {e:#}"))?;
-            Ok(PipelineJobCounts {
-                ready,
-                running,
-                failed,
-            })
+            let failed_unrecoverable = queue_store::count_failed_unrecoverable(&cfg_for_jobs)
+                .map_err(|e| format!("count_failed_unrecoverable: {e:#}"))?;
+            Ok((
+                PipelineJobCounts {
+                    ready,
+                    running,
+                    failed,
+                },
+                failed_unrecoverable,
+            ))
         })
         .await
         .map_err(|e| {
@@ -382,13 +418,69 @@ pub async fn pipeline_status_rpc(
     let is_paused = config.scheduler_gate.mode == SchedulerGateMode::Off;
     let is_syncing = pipeline_jobs.running > 0;
 
+    // #002: read the process-global degradation snapshot (set by the embed /
+    // extract stages) so a half-working sync surfaces as `degraded` with a
+    // cause rather than a misleading `running`. The structure-degraded latch is
+    // a liveness signal ("the extraction model is timing out") kept honest at
+    // its source in `extract::llm` — it self-clears on the next *completed*
+    // extraction (#3365), so the status surface never consults the unrelated
+    // `extraction_coverage` metric to second-guess it here.
+    let degraded = crate::openhuman::memory_tree::health::current_degraded_state();
+
     let (status, reason) = derive_pipeline_status(
         is_paused,
         config.scheduler_gate.mode,
         is_syncing,
         pipeline_jobs.failed,
+        failed_unrecoverable,
         total_chunks,
+        &degraded,
     );
+
+    // #002: both of these touch SQLite, so run them off the async runtime
+    // thread in a single blocking task (a contended DB could otherwise pin a
+    // Tokio worker for the busy-timeout window). Best-effort — failures degrade
+    // to `None` rather than failing the polled status RPC.
+    //   - first_blocking_cause (FR-004): the most-recent failed job's typed
+    //     reason, surfaced verbatim by the UI.
+    //   - extraction_coverage (FR-010/US5): fraction of chunks with structure,
+    //     surfaced as its own display metric — deliberately NOT folded into the
+    //     status pill (#3365: coverage is a cumulative measure, unrelated to the
+    //     live structure-degraded liveness signal).
+    //     `None` (not `0.0`) on a read error, so a broken measurement path is
+    //     never mistaken for a genuine 0% extraction rate.
+    let (latest_failure, extraction_coverage) = {
+        let cfg = config.clone();
+        tokio::task::spawn_blocking(move || {
+            // Log-then-drop: keep the None fallback (these reads must not fail
+            // the polled status RPC) but emit a grep-friendly diagnostic so a
+            // DB/query failure is distinguishable from "no blocking cause" /
+            // "metric unavailable by design".
+            let failure = latest_failed_job_failure(&cfg).unwrap_or_else(|e| {
+                log::warn!(
+                    "[memory-tree][rpc] pipeline_status: latest_failed_job_failure read failed: {e:#}"
+                );
+                None
+            });
+            let coverage = crate::openhuman::memory_store::chunks::store::extraction_coverage(&cfg)
+                .map_err(|e| {
+                    log::warn!(
+                        "[memory-tree][rpc] pipeline_status: extraction_coverage read failed: {e:#}"
+                    );
+                })
+                .ok();
+            (failure, coverage)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            log::warn!("[memory-tree][rpc] pipeline_status: ancillary metrics join error: {e:#}");
+            (None, None)
+        })
+    };
+
+    // A hard failed-job reason is more urgent than a soft degradation; fall
+    // back to the active degradation cause, then `None` when healthy.
+    let first_blocking_cause = latest_failure.or_else(|| degraded.cause.clone());
 
     let payload = PipelineStatusResponse {
         status: status.clone(),
@@ -399,6 +491,9 @@ pub async fn pipeline_status_rpc(
         pipeline_jobs,
         is_syncing,
         is_paused,
+        degraded,
+        first_blocking_cause,
+        extraction_coverage,
     };
 
     log::debug!(
@@ -414,6 +509,104 @@ pub async fn pipeline_status_rpc(
             "memory_tree: pipeline_status status={status} total_chunks={total_chunks} is_paused={is_paused} is_syncing={is_syncing}",
         ),
     ))
+}
+
+/// `memory_tree_doctor` RPC handler (#002 FR-009). Runs the one-shot
+/// pipeline diagnostic and returns the [`DoctorReport`] — per-stage health,
+/// the first blocking cause, the degraded snapshot, and counters. Exposed for
+/// the agent tool + CLI so the agent can self-diagnose an empty/stalled wiki.
+/// Synchronous + cheap (config + queue counters + degraded flags), so no
+/// blocking-pool dispatch is needed.
+pub async fn doctor_rpc(
+    config: &Config,
+) -> Result<RpcOutcome<crate::openhuman::memory_tree::health::DoctorReport>, String> {
+    // Offload the doctor's blocking SQLite reads off the async runtime thread.
+    let report = crate::openhuman::memory_tree::health::async_run_doctor(config).await;
+    let summary = if report.healthy {
+        "memory_tree: doctor — healthy".to_string()
+    } else {
+        format!(
+            "memory_tree: doctor — first_blocking_cause={}",
+            report
+                .first_blocking_cause
+                .as_ref()
+                .map(|f| f.code.as_str())
+                .unwrap_or("unknown")
+        )
+    };
+    Ok(RpcOutcome::single_log(report, summary))
+}
+
+/// Response from `memory_tree_retry_failed` (#002 FR-011).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RetryFailedResponse {
+    /// Number of `failed` jobs flipped back to `ready` for retry.
+    pub requeued: u64,
+}
+
+/// `memory_tree_retry_failed` RPC handler (#002 FR-011). Flips every
+/// terminally-`failed` `mem_tree_jobs` row back to `ready` (fresh attempt
+/// budget, typed reason cleared) so jobs that failed under a now-fixed config
+/// re-run without re-ingesting source data. Backs the "Retry failed" button.
+pub async fn retry_failed_rpc(config: &Config) -> Result<RpcOutcome<RetryFailedResponse>, String> {
+    let cfg = config.clone();
+    let requeued = tokio::task::spawn_blocking(move || {
+        crate::openhuman::memory_queue::store::requeue_failed(&cfg)
+    })
+    .await
+    .map_err(|e| format!("retry_failed join error: {e}"))?
+    .map_err(|e| format!("retry_failed: {e:#}"))?;
+    // Wake the worker pool so the requeued jobs are picked up promptly.
+    crate::openhuman::memory_queue::wake_workers();
+    Ok(RpcOutcome::single_log(
+        RetryFailedResponse { requeued },
+        format!("memory_tree: retry_failed requeued={requeued}"),
+    ))
+}
+
+/// #002 (FR-004): the typed [`PipelineFailure`] of the most-recently-failed
+/// `mem_tree_jobs` row, when it carries a classified `failure_reason`. Returns
+/// `Ok(None)` when there is no failed job with a typed reason (older failures
+/// predating the typed-failure columns, or none at all). Best-effort: the
+/// status panel is a UI convenience, so a DB error degrades to `Ok(None)`
+/// rather than failing the whole status RPC.
+fn latest_failed_job_failure(
+    config: &Config,
+) -> Result<Option<crate::openhuman::memory_tree::health::PipelineFailure>, String> {
+    use crate::openhuman::memory_tree::health::{FailureClass, FailureCode, PipelineFailure};
+
+    let row: Option<(Option<String>, Option<String>)> =
+        chunk_store::with_connection(config, |conn| {
+            conn.query_row(
+                "SELECT failure_reason, failure_class FROM mem_tree_jobs
+              WHERE status = 'failed' AND failure_reason IS NOT NULL
+              ORDER BY completed_at_ms DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .map_err(|e| format!("latest_failed_job_failure: {e:#}"))?;
+
+    let Some((Some(reason), class)) = row else {
+        return Ok(None);
+    };
+    let Some(code) = FailureCode::from_str(&reason) else {
+        return Ok(None);
+    };
+    // Trust the persisted class when present and parseable; otherwise derive
+    // from the code (keeps a forward-compatible default if the column is NULL
+    // on an older row).
+    let mut failure = PipelineFailure::new(code);
+    if let Some(c) = class.as_deref() {
+        if c == "transient" {
+            failure.class = FailureClass::Transient;
+        } else if c == "unrecoverable" {
+            failure.class = FailureClass::Unrecoverable;
+        }
+    }
+    Ok(Some(failure))
 }
 
 /// Recursive byte-count of files under `root`. Returns `0` when the root
@@ -458,7 +651,9 @@ fn derive_pipeline_status(
     mode: crate::openhuman::config::SchedulerGateMode,
     is_syncing: bool,
     failed: u64,
+    failed_unrecoverable: u64,
     total_chunks: u64,
+    degraded: &crate::openhuman::memory_tree::health::DegradedState,
 ) -> (String, Option<String>) {
     if is_paused {
         return (
@@ -466,11 +661,46 @@ fn derive_pipeline_status(
             Some(format!("scheduler gate mode = {}", mode.as_str())),
         );
     }
-    if failed > 0 {
+    // #3365: split the failed bucket by class. Only an UNRECOVERABLE failure
+    // (budget / auth / dim-mismatch) is a hard `error` the user must act on —
+    // it stays parked and can't self-heal. Transient failures are auto-requeued
+    // by `requeue_transient_failed`, so they must NOT escalate to `error`; they
+    // fall through to `degraded` ("failed, retrying") below. This fixes the prior
+    // `failed > 0 → error` that flashed a scary error for a job about to retry.
+    if failed_unrecoverable > 0 {
         return (
             "error".to_string(),
-            Some(format!("{failed} failed job(s) in pipeline")),
+            Some(format!(
+                "{failed_unrecoverable} unrecoverable failure(s) need action"
+            )),
         );
+    }
+    // #002 (FR-005): "degraded" sits below error but above syncing/running —
+    // the pipeline is making progress, but recall/structure is reduced (or some
+    // jobs failed transiently and are retrying) and the user should be told why.
+    // Beats syncing/running so a half-working sync isn't reported as plain
+    // "running"/"syncing".
+    //
+    // Only fires when there are chunks: degraded recall/structure is only
+    // meaningful when there's actual content affected. An empty workspace with
+    // a misconfigured embedder should show "idle" (nothing to recall) rather
+    // than "degraded" (recall is broken for existing content).
+    //
+    // `failed` here is transient-only — any unrecoverable failure returned
+    // `error` above, so a non-zero `failed` at this point means jobs that will
+    // be auto-requeued.
+    if (degraded.is_degraded() || failed > 0) && total_chunks > 0 {
+        let mut parts: Vec<String> = Vec::new();
+        if degraded.semantic_recall {
+            parts.push("semantic recall disabled".to_string());
+        }
+        if degraded.structure {
+            parts.push("wiki structure incomplete".to_string());
+        }
+        if failed > 0 {
+            parts.push(format!("{failed} job(s) failed, retrying"));
+        }
+        return ("degraded".to_string(), Some(parts.join("; ")));
     }
     if is_syncing {
         return ("syncing".to_string(), None);
@@ -710,6 +940,73 @@ mod tests {
         assert_eq!(listed.len(), first.chunks_written);
     }
 
+    /// Regression #3568 / CORE-2K: chat payloads with RFC-3339 timestamps must
+    /// be accepted — not rejected with "expected unix timestamp in milliseconds".
+    #[tokio::test]
+    async fn ingest_chat_accepts_rfc3339_timestamps() {
+        let (_tmp, cfg) = test_config();
+        let outcome = ingest_rpc(
+            &cfg,
+            IngestRequest {
+                source_kind: SourceKind::Chat,
+                source_id: "slack:#rfc3339-test".into(),
+                owner: "alice".into(),
+                tags: vec![],
+                payload: json!({
+                    "platform": "slack",
+                    "channel_label": "#eng",
+                    "messages": [
+                        {
+                            "author": "alice",
+                            "timestamp": "2026-05-17T19:30:00Z",
+                            "text": "planning the launch"
+                        },
+                        {
+                            "author": "bob",
+                            "timestamp": 1779046260000_i64,
+                            "text": "confirmed"
+                        }
+                    ]
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.value.chunk_ids.is_empty());
+    }
+
+    /// Regression #3568 / CORE-2K: email payloads with RFC-3339 timestamps must
+    /// be accepted.
+    #[tokio::test]
+    async fn ingest_email_accepts_rfc3339_timestamps() {
+        let (_tmp, cfg) = test_config();
+        let outcome = ingest_rpc(
+            &cfg,
+            IngestRequest {
+                source_kind: SourceKind::Email,
+                source_id: "gmail:rfc3339-test".into(),
+                owner: "alice@example.com".into(),
+                tags: vec![],
+                payload: json!({
+                    "provider": "gmail",
+                    "thread_subject": "Launch",
+                    "messages": [
+                        {
+                            "from": "bob@example.com",
+                            "to": ["alice@example.com"],
+                            "subject": "Launch",
+                            "sent_at": "2026-05-17T19:30:00Z",
+                            "body": "Let's ship this."
+                        }
+                    ]
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.value.chunk_ids.is_empty());
+    }
+
     #[tokio::test]
     async fn ingest_rpc_rejects_invalid_document_payload() {
         let (_tmp, cfg) = test_config();
@@ -790,28 +1087,98 @@ mod tests {
     #[test]
     fn derive_pipeline_status_precedence_matches_spec() {
         use crate::openhuman::config::SchedulerGateMode;
+        use crate::openhuman::memory_tree::health::{DegradedState, FailureCode, PipelineFailure};
 
-        // paused beats everything else
-        let (s, reason) = derive_pipeline_status(true, SchedulerGateMode::Off, true, 5, 100);
+        let healthy = DegradedState::default();
+        let recall_degraded = DegradedState {
+            semantic_recall: true,
+            structure: false,
+            cause: Some(PipelineFailure::new(FailureCode::EmbeddingsUnconfigured)),
+        };
+        let structure_degraded = DegradedState {
+            semantic_recall: false,
+            structure: true,
+            cause: Some(PipelineFailure::new(FailureCode::ExtractionTimeout)),
+        };
+
+        // Args: (is_paused, mode, is_syncing, failed, failed_unrecoverable,
+        //        total_chunks, &degraded).
+
+        // paused beats everything else (even degradation)
+        let (s, reason) = derive_pipeline_status(
+            true,
+            SchedulerGateMode::Off,
+            true,
+            5,
+            5,
+            100,
+            &recall_degraded,
+        );
         assert_eq!(s, "paused");
         assert!(reason.unwrap().contains("off"));
 
-        // error beats syncing / running / idle
-        let (s, reason) = derive_pipeline_status(false, SchedulerGateMode::Auto, true, 2, 100);
+        // error beats degraded / syncing / running / idle — but ONLY for
+        // unrecoverable failures (#3365).
+        let (s, reason) = derive_pipeline_status(
+            false,
+            SchedulerGateMode::Auto,
+            true,
+            2,
+            2, // both failures unrecoverable
+            100,
+            &recall_degraded,
+        );
         assert_eq!(s, "error");
-        assert!(reason.unwrap().contains("2 failed"));
+        assert!(reason.unwrap().contains("unrecoverable"));
 
-        // syncing beats running / idle
-        let (s, reason) = derive_pipeline_status(false, SchedulerGateMode::Auto, true, 0, 100);
+        // #3365: transient-only failures (failed > 0, none unrecoverable) do NOT
+        // escalate to error — they self-heal via auto-requeue, so they surface
+        // as `degraded` ("retrying"), beating syncing/running.
+        let (s, reason) =
+            derive_pipeline_status(false, SchedulerGateMode::Auto, true, 3, 0, 100, &healthy);
+        assert_eq!(s, "degraded", "transient failures must not read as error");
+        assert!(reason.unwrap().contains("3 job(s) failed, retrying"));
+
+        // #002: degraded beats syncing / running / idle (but loses to paused/error)
+        let (s, reason) = derive_pipeline_status(
+            false,
+            SchedulerGateMode::Auto,
+            true, // syncing
+            0,
+            0,
+            100,
+            &recall_degraded,
+        );
+        assert_eq!(s, "degraded", "degraded must beat syncing");
+        assert!(reason.unwrap().contains("semantic recall disabled"));
+
+        let (s, reason) = derive_pipeline_status(
+            false,
+            SchedulerGateMode::Auto,
+            false,
+            0,
+            0,
+            100,
+            &structure_degraded,
+        );
+        assert_eq!(s, "degraded");
+        assert!(reason.unwrap().contains("wiki structure incomplete"));
+
+        // syncing beats running / idle (when healthy)
+        let (s, reason) =
+            derive_pipeline_status(false, SchedulerGateMode::Auto, true, 0, 0, 100, &healthy);
         assert_eq!(s, "syncing");
         assert!(reason.is_none());
 
         // running when chunks exist but nothing in flight
-        let (s, _) = derive_pipeline_status(false, SchedulerGateMode::Auto, false, 0, 100);
+        let (s, _) =
+            derive_pipeline_status(false, SchedulerGateMode::Auto, false, 0, 0, 100, &healthy);
         assert_eq!(s, "running");
 
-        // idle when the store is empty and nothing is in flight
-        let (s, _) = derive_pipeline_status(false, SchedulerGateMode::Auto, false, 0, 0);
+        // idle when the store is empty and nothing is in flight (transient
+        // failures with no content don't manufacture a `degraded`).
+        let (s, _) =
+            derive_pipeline_status(false, SchedulerGateMode::Auto, false, 2, 0, 0, &healthy);
         assert_eq!(s, "idle");
     }
 
@@ -820,6 +1187,10 @@ mod tests {
     /// "no memory yet" state.
     #[tokio::test]
     async fn pipeline_status_returns_idle_for_empty_store() {
+        // #002: the degraded flags are process-global; reset+serialise so a
+        // parallel test (factory None-path, extract transport-fail) can't leak
+        // a "degraded" signal into this fresh-workspace assertion.
+        let _g = crate::openhuman::memory_tree::health::test_guard();
         let (_tmp, cfg) = test_config();
         let out = pipeline_status_rpc(&cfg).await.unwrap().value;
         assert_eq!(out.status, "idle");
@@ -852,9 +1223,14 @@ mod tests {
 
     /// `pipeline_status` reflects chunks that have been ingested — total
     /// count rolls up and `last_sync_ms` picks up the most-recent
-    /// timestamp from `mem_tree_chunks`.
+    /// timestamp from `mem_tree_chunks`. Depending on test environment provider
+    /// availability, ingest may also mark semantic recall degraded; either way,
+    /// the status must be terminally healthy/degraded rather than syncing/error.
     #[tokio::test]
     async fn pipeline_status_reports_chunk_aggregates_after_ingest() {
+        // #002: reset+serialise the process-global degraded flags so this
+        // "running" assertion isn't flipped to "degraded" by a parallel test.
+        let _g = crate::openhuman::memory_tree::health::test_guard();
         let (_tmp, cfg) = test_config();
 
         // Seed one document so `mem_tree_chunks` is non-empty.
@@ -882,8 +1258,24 @@ mod tests {
             "ingest must populate last_sync_ms (got {})",
             out.last_sync_ms
         );
-        // No jobs running ⇒ running status, not syncing/error.
-        assert_eq!(out.status, "running");
+        // No jobs running. Provider availability differs between local and CI
+        // harnesses, so a completed ingest may be fully running or degraded
+        // because semantic recall or wiki structure was skipped. Both are
+        // terminal, non-syncing states and both preserve the aggregate counters
+        // asserted above.
+        match out.status.as_str() {
+            "running" => assert!(out.reason.is_none()),
+            "degraded" => {
+                let reason = out.reason.as_deref().unwrap_or_default();
+                assert!(
+                    reason.contains("semantic recall disabled")
+                        || reason.contains("wiki structure incomplete"),
+                    "degraded status should explain recall or structure loss: {:?}",
+                    out.reason
+                );
+            }
+            other => panic!("expected running or degraded after ingest, got {other}"),
+        }
         assert!(!out.is_syncing);
     }
 

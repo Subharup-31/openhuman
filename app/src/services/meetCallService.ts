@@ -128,6 +128,12 @@ export interface MeetCallRecord {
   listened_seconds: number;
   spoken_seconds: number;
   turn_count: number;
+  /**
+   * Distinct human participant display names mined from the transcript
+   * (backend-meet flow). Older records and local meet-agent calls omit this,
+   * so it is optional and defaults to an empty list at the UI.
+   */
+  participants?: string[];
 }
 
 interface CoreListCallsResponse {
@@ -154,20 +160,109 @@ export async function listMeetCalls(limit = 20): Promise<MeetCallRecord[]> {
   return result.calls ?? [];
 }
 
+// ---------------------------------------------------------------------------
+// Backend Meet Bot via Core Socket.IO bridge
+// ---------------------------------------------------------------------------
+
+export type MeetingPlatform = 'gmeet' | 'zoom' | 'teams' | 'webex';
+
+export type BackendMeetJoinInput = {
+  meetUrl: string;
+  displayName?: string;
+  platform?: MeetingPlatform;
+  agentName?: string;
+  systemPrompt?: string;
+  mascotId?: string;
+  riveColors?: { primaryColor?: string; secondaryColor?: string };
+  /** Only respond to messages from this participant name (empty = respond to all). */
+  respondToParticipant?: string;
+  /** Wake phrase the participant must say before the bot responds (empty = no wake phrase). */
+  wakePhrase?: string;
+  /** Opaque correlation id echoed on all `bot:*` events for this session. */
+  correlationId?: string;
+  /** When true, the bot joins in listen-only mode (no microphone, no replies). */
+  listenOnly?: boolean;
+};
+
+type CoreBackendMeetJoinResponse = { ok: boolean; meet_url: string; platform: string };
+
 /**
- * Backend-driven meet bot join (PR tinyhumansai/backend#773).
+ * Join a meeting via the backend's Recall.ai bot. Supports Google Meet,
+ * Zoom, Microsoft Teams, and Webex.
+ *
+ * Calls the core RPC `openhuman.agent_meetings_join`, which emits `bot:join`
+ * over the core's persistent Socket.IO connection to the backend. The backend
+ * streams events back (`bot:reply`, `bot:harness`, `bot:transcript`, `bot:left`)
+ * which the core bridges to the frontend as `agent_meetings:*` socket events.
+ */
+export async function joinMeetViaBackendBot(
+  input: BackendMeetJoinInput
+): Promise<{ meetUrl: string; platform: string }> {
+  const meetUrl = input.meetUrl.trim();
+  if (!meetUrl) throw new Error('Please paste a meeting link.');
+
+  const result = await callCoreRpc<CoreBackendMeetJoinResponse>({
+    method: 'openhuman.agent_meetings_join',
+    params: {
+      meet_url: meetUrl,
+      display_name: input.displayName?.trim() || undefined,
+      platform: input.platform || undefined,
+      agent_name: input.agentName?.trim() || undefined,
+      system_prompt: input.systemPrompt?.trim() || undefined,
+      mascot_id: input.mascotId?.trim() || undefined,
+      respond_to_participant: input.respondToParticipant?.trim() || undefined,
+      wake_phrase: input.wakePhrase?.trim() || undefined,
+      correlation_id: input.correlationId?.trim() || undefined,
+      listen_only: input.listenOnly ?? undefined,
+      rive_colors: (() => {
+        if (!input.riveColors) return undefined;
+        const primary = input.riveColors.primaryColor?.trim() || undefined;
+        const secondary = input.riveColors.secondaryColor?.trim() || undefined;
+        if (!primary && !secondary) return undefined;
+        return { primary_color: primary, secondary_color: secondary };
+      })(),
+    },
+  });
+
+  if (!result?.ok) {
+    throw new Error('Core rejected the agent_meetings_join request.');
+  }
+
+  return { meetUrl: result.meet_url, platform: result.platform };
+}
+
+/**
+ * Ask the backend bot to leave the current meeting.
+ */
+export async function leaveBackendMeetBot(reason?: string): Promise<void> {
+  await callCoreRpc<{ ok: boolean }>({
+    method: 'openhuman.agent_meetings_leave',
+    params: { reason: reason || 'requested' },
+  });
+}
+
+/**
+ * Send a tool execution result back to the backend's meeting LLM.
+ */
+export async function sendHarnessResponse(result: string): Promise<void> {
+  await callCoreRpc<{ ok: boolean }>({
+    method: 'openhuman.agent_meetings_harness_response',
+    params: { result },
+  });
+}
+
+/**
+ * Direct backend-driven meet bot join.
  *
  * Hits `POST /mascots/join-meeting` which:
  *  - gates free users with a 429 (SERVER_OVERLOADED) — surfaced verbatim
  *    so callers can show the user-facing capacity message;
- *  - launches the Camoufox mascot bot for `gmeet`;
- *  - 400s on `zoom` / `teams` with "not yet supported".
+ *  - launches the Recall.ai mascot bot for supported meeting platforms.
  *
- * Distinct from `joinMeetCall` (which opens a CEF webview locally) —
- * this is a fire-and-forget request that runs the mascot bot in the
- * backend and streams events over Socket.IO.
+ * The app normally uses `joinMeetViaBackendBot`, which routes through the
+ * core Socket.IO bridge so backend bot events can be handled locally too.
  */
-export type MascotMeetPlatform = 'gmeet' | 'zoom' | 'teams';
+export type MascotMeetPlatform = 'gmeet' | 'zoom' | 'teams' | 'webex';
 
 export interface MascotJoinMeetingInput {
   platform: MascotMeetPlatform;

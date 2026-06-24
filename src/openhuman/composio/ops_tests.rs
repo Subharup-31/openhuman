@@ -1,4 +1,5 @@
 use super::*;
+use crate::openhuman::context::prompt::IntegrationConnection;
 
 #[test]
 fn parse_sync_reason_accepts_known_values() {
@@ -136,7 +137,7 @@ async fn composio_list_tools_errors_without_session() {
 async fn composio_execute_errors_without_session() {
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(&tmp);
-    let err = composio_execute(&config, "GMAIL_SEND_EMAIL", None)
+    let err = composio_execute(&config, "GMAIL_SEND_EMAIL", None, None)
         .await
         .unwrap_err();
     assert!(
@@ -522,6 +523,248 @@ async fn composio_delete_connection_clear_memory_deletes_slack_source() {
     assert_eq!(remaining[0].metadata.source_id, "slack:c2");
 }
 
+/// #4: full path through the REAL `composio_delete_connection` handler
+/// (clear_memory=true, mock backend) — deleting a connection's last chunk must
+/// cascade away its source summary tree AND the summary's on-disk content file,
+/// not just the chunk rows. The tree is a real `get_or_create_source_tree`; the
+/// content file sits at the production `content_path` location.
+#[tokio::test]
+async fn composio_delete_connection_clear_memory_cascades_source_tree_and_content_file() {
+    use crate::openhuman::memory::tree_source::registry::get_or_create_source_tree;
+    use crate::openhuman::memory_store::trees::store as tree_store;
+    use crate::openhuman::memory_store::trees::types::{SummaryNode, TreeKind};
+    use rusqlite::params;
+
+    let app = Router::new()
+        .route(
+            "/agent-integrations/composio/connections",
+            get(|| async {
+                Json(json!({
+                    "success": true,
+                    "data": {"connections": [
+                        {"id":"c1","toolkit":"slack","status":"ACTIVE"}
+                    ]}
+                }))
+            }),
+        )
+        .route(
+            "/agent-integrations/composio/connections/{id}",
+            axum::routing::delete(|Path(_id): Path<String>| async move {
+                Json(json!({"success": true, "data": {"deleted": true}}))
+            }),
+        );
+    let base = start_mock_backend(app).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config_with_backend(&tmp, base);
+
+    // One slack chunk for connection c1 → source_id `slack:c1`.
+    let chunk = sample_memory_chunk(SourceKind::Chat, "slack:c1", 0);
+    memory_tree_store::upsert_chunks(&config, &[chunk.clone()]).expect("seed chunk");
+
+    // Real source tree for that source + a summary whose content file lives at
+    // the production content-root location.
+    let tree = get_or_create_source_tree(&config, "slack:c1").expect("source tree");
+    let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+    let rel = "summaries/slack_c1/L1/sum-1.md";
+    let abs = config.memory_tree_content_root().join(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(&abs, "summarised slack body").unwrap();
+
+    memory_tree_store::with_connection(&config, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        tree_store::insert_summary_tx(
+            &tx,
+            &SummaryNode {
+                id: "sum-1".into(),
+                tree_id: tree.id.clone(),
+                tree_kind: TreeKind::Source,
+                level: 1,
+                parent_id: None,
+                child_ids: vec![chunk.id.clone()],
+                content: "preview".into(),
+                token_count: 3,
+                entities: vec![],
+                topics: vec![],
+                time_range_start: ts,
+                time_range_end: ts,
+                score: 0.5,
+                sealed_at: ts,
+                deleted: false,
+                embedding: None,
+                doc_id: None,
+                version_ms: None,
+            },
+            None,
+            "test/model@3",
+        )?;
+        tx.execute(
+            "UPDATE mem_tree_summaries SET content_path = ?1 WHERE id = 'sum-1'",
+            params![rel],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .expect("seed summary + content file pointer");
+
+    // sanity: tree + on-disk file exist before the disconnect.
+    assert!(
+        tree_store::get_tree_by_scope(&config, TreeKind::Source, "slack:c1")
+            .unwrap()
+            .is_some()
+    );
+    assert!(abs.exists());
+
+    // ---- act: the REAL handler, clear_memory=true ----
+    let outcome = composio_delete_connection(&config, "c1", true)
+        .await
+        .unwrap();
+    assert!(outcome.value.deleted);
+    assert_eq!(outcome.value.memory_chunks_deleted, 1);
+
+    // chunk, source tree, summary row, AND on-disk content file are all gone.
+    assert!(memory_tree_store::get_chunk(&config, &chunk.id)
+        .unwrap()
+        .is_none());
+    assert!(
+        tree_store::get_tree_by_scope(&config, TreeKind::Source, "slack:c1")
+            .unwrap()
+            .is_none()
+    );
+    memory_tree_store::with_connection(&config, |conn| {
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM mem_tree_summaries", [], |r| r.get(0))?;
+        assert_eq!(n, 0);
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        !abs.exists(),
+        "summary content file must be removed via the real handler cascade"
+    );
+}
+
+/// #4 (full live seal): like the above, but the summary + on-disk file are
+/// produced by the REAL `seal_one_level` pipeline (staged chunk body →
+/// summarise → `stage_summary`), not hand-written. Then the REAL
+/// `composio_delete_connection(clear_memory=true)` handler must cascade the
+/// tree, the summary row, AND the seal-produced content file away.
+#[tokio::test]
+async fn composio_delete_connection_clear_memory_cascades_live_sealed_tree_and_file() {
+    use crate::openhuman::memory::tree_source::registry::get_or_create_source_tree;
+    use crate::openhuman::memory_store::chunks::store::{
+        get_summary_content_pointers, upsert_staged_chunks_tx,
+    };
+    use crate::openhuman::memory_store::content::stage_chunks;
+    use crate::openhuman::memory_store::trees::store as tree_store;
+    use crate::openhuman::memory_store::trees::types::{Buffer, TreeKind};
+    use crate::openhuman::memory_tree::tree::bucket_seal::{seal_one_level, LabelStrategy};
+
+    let app = Router::new()
+        .route(
+            "/agent-integrations/composio/connections",
+            get(|| async {
+                Json(json!({
+                    "success": true,
+                    "data": {"connections": [
+                        {"id":"c1","toolkit":"slack","status":"ACTIVE"}
+                    ]}
+                }))
+            }),
+        )
+        .route(
+            "/agent-integrations/composio/connections/{id}",
+            axum::routing::delete(|Path(_id): Path<String>| async move {
+                Json(json!({"success": true, "data": {"deleted": true}}))
+            }),
+        );
+    let base = start_mock_backend(app).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config_with_backend(&tmp, base);
+    // Force the inert embedder so the real seal's summary-embed step doesn't
+    // reach a live endpoint. `config_with_backend` stores a cloud session +
+    // api_url, so the factory would otherwise build a *cloud* embedder against
+    // the mock (no embeddings route). `embeddings_provider = "none"` is the
+    // actual switch that selects `InertEmbedder`.
+    config.embeddings_provider = Some("none".to_string());
+    config.memory_tree.embedding_endpoint = None;
+    config.memory_tree.embedding_model = None;
+    config.memory_tree.embedding_strict = false;
+
+    // Real chunk for slack:c1 WITH its body staged to disk, so the seal's
+    // `hydrate_leaf_inputs` → `read_chunk_body` can resolve it.
+    let chunk = sample_memory_chunk(SourceKind::Chat, "slack:c1", 0);
+    memory_tree_store::upsert_chunks(&config, &[chunk.clone()]).expect("seed chunk");
+    let staged = stage_chunks(
+        &config.memory_tree_content_root(),
+        std::slice::from_ref(&chunk),
+    )
+    .expect("stage chunk body");
+    memory_tree_store::with_connection(&config, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        upsert_staged_chunks_tx(&tx, &staged)?;
+        tx.commit()?;
+        Ok(())
+    })
+    .expect("record staged chunk pointer");
+
+    // Run the REAL seal — produces a genuine summary row + on-disk file.
+    let tree = get_or_create_source_tree(&config, "slack:c1").expect("source tree");
+    let buf = Buffer {
+        tree_id: tree.id.clone(),
+        level: 0,
+        item_ids: vec![chunk.id.clone()],
+        token_sum: i64::from(chunk.token_count),
+        oldest_at: Some(chunk.metadata.time_range.0),
+    };
+    let summary_id = seal_one_level(&config, &tree, &buf, &LabelStrategy::Empty, false)
+        .await
+        .expect("real seal produces a summary");
+
+    // The seal wrote a real on-disk content file for the summary.
+    let (rel, _sha) = get_summary_content_pointers(&config, &summary_id)
+        .unwrap()
+        .expect("seal staged a summary content file");
+    let abs = {
+        let mut p = config.memory_tree_content_root();
+        for c in rel.split('/') {
+            p.push(c);
+        }
+        p
+    };
+    assert!(
+        abs.exists(),
+        "seal must have written a summary file on disk"
+    );
+    assert!(
+        tree_store::get_tree_by_scope(&config, TreeKind::Source, "slack:c1")
+            .unwrap()
+            .is_some()
+    );
+
+    // ---- act: REAL handler, clear_memory=true ----
+    let outcome = composio_delete_connection(&config, "c1", true)
+        .await
+        .unwrap();
+    assert!(outcome.value.deleted);
+    assert_eq!(outcome.value.memory_chunks_deleted, 1);
+
+    // chunk, tree, summary row, and the seal-produced file are all gone.
+    assert!(memory_tree_store::get_chunk(&config, &chunk.id)
+        .unwrap()
+        .is_none());
+    assert!(
+        tree_store::get_tree_by_scope(&config, TreeKind::Source, "slack:c1")
+            .unwrap()
+            .is_none()
+    );
+    assert!(tree_store::get_summary(&config, &summary_id)
+        .unwrap()
+        .is_none());
+    assert!(
+        !abs.exists(),
+        "seal-produced summary file must be removed via the real handler cascade"
+    );
+}
+
 #[tokio::test]
 async fn composio_delete_connection_clear_memory_keeps_other_gmail_connections() {
     let app = Router::new()
@@ -775,7 +1018,7 @@ async fn composio_execute_via_mock_succeeds_and_logs_elapsed() {
     let base = start_mock_backend(app).await;
     let tmp = tempfile::tempdir().unwrap();
     let config = config_with_backend(&tmp, base);
-    let outcome = composio_execute(&config, "GMAIL_SEND", Some(json!({"to": "a"})))
+    let outcome = composio_execute(&config, "GMAIL_SEND", Some(json!({"to": "a"})), None)
         .await
         .unwrap();
     assert!(outcome.value.successful);
@@ -794,7 +1037,7 @@ async fn composio_execute_via_mock_propagates_backend_error() {
     let base = start_mock_backend(app).await;
     let tmp = tempfile::tempdir().unwrap();
     let config = config_with_backend(&tmp, base);
-    let err = composio_execute(&config, "ANY_TOOL", None)
+    let err = composio_execute(&config, "ANY_TOOL", None, None)
         .await
         .unwrap_err();
     // The dispatcher (`execute_composio_action`) classifies transport
@@ -1164,6 +1407,15 @@ fn integration(toolkit: &str, connected: bool) -> ConnectedIntegration {
         tools: Vec::new(),
         gated_tools: Vec::new(),
         connected,
+        connections: if connected {
+            vec![IntegrationConnection {
+                connection_id: format!("c-1"),
+                label: None,
+                is_default: true,
+            }]
+        } else {
+            Vec::new()
+        },
         non_active_status: None,
     }
 }
@@ -1598,6 +1850,82 @@ async fn composio_list_connections_routes_through_direct_mode() {
     }
 }
 
+// ── Direct mode with no API key yet (Sentry TAURI-RUST-R4) ────────
+//
+// Direct mode selected but no key configured is a valid user *setup*
+// state, not an operation failure. `composio_list_connections` must
+// return an empty list (no key → no tenant → no connections) instead of
+// erroring, so the desktop UI's 5 s poll stops funnelling the factory's
+// "no api key is configured" error to Sentry on every tick.
+
+/// Direct mode selected, but NO key in the keychain and none in
+/// `config.toml`. The mode-aware factory would bail here with
+/// "composio direct mode selected but no api key is configured".
+fn direct_mode_no_key_config(tmp: &tempfile::TempDir) -> Config {
+    let mut c = Config::default();
+    c.workspace_dir = tmp.path().join("workspace");
+    c.config_path = tmp.path().join("config.toml");
+    c.composio.mode = crate::openhuman::config::schema::COMPOSIO_MODE_DIRECT.into();
+    c
+}
+
+#[test]
+fn direct_mode_without_key_is_false_in_backend_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Default mode is backend — the guard must never fire there, or
+    // backend users would get a silent empty list.
+    let config = test_config(&tmp);
+    assert!(!direct_mode_without_key(&config).unwrap());
+}
+
+#[test]
+fn direct_mode_without_key_is_true_when_direct_and_no_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = direct_mode_no_key_config(&tmp);
+    assert!(direct_mode_without_key(&config).unwrap());
+}
+
+#[test]
+fn direct_mode_without_key_is_false_when_key_in_config_toml() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Key supplied via config.toml (not the keychain) still counts —
+    // the factory accepts it, so the guard must NOT short-circuit and
+    // hide the user's real connections.
+    let mut config = direct_mode_no_key_config(&tmp);
+    config.composio.api_key = Some("  ck_cfg_key  ".into());
+    assert!(!direct_mode_without_key(&config).unwrap());
+}
+
+#[test]
+fn direct_mode_without_key_is_false_when_key_in_keychain() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `direct_mode_config` stores a key via the auth store — the guard
+    // must see it and report "has key".
+    let config = direct_mode_config(&tmp);
+    assert!(!direct_mode_without_key(&config).unwrap());
+}
+
+#[tokio::test]
+async fn composio_list_connections_returns_empty_when_direct_mode_no_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = direct_mode_no_key_config(&tmp);
+    // RC of TAURI-RUST-R4: this MUST be Ok(empty), not Err — no error is
+    // constructed, so nothing reaches Sentry and the 5 s poll stops
+    // churning.
+    let outcome = composio_list_connections(&config)
+        .await
+        .expect("direct mode with no key must return an empty list, not an error");
+    assert!(
+        outcome.value.connections.is_empty(),
+        "no key → no tenant → no connections"
+    );
+    assert!(
+        outcome.logs.iter().any(|l| l.contains("no api key")),
+        "log must explain the empty list is the no-key setup state, got {:?}",
+        outcome.logs
+    );
+}
+
 // ── Direct-mode authorize / list_tools / execute (commit 1, #1710) ─
 
 /// Direct-mode `composio_list_tools` now hits Composio v3 with the
@@ -1683,7 +2011,7 @@ async fn composio_execute_routes_through_direct_mode() {
     // test key.
     let tmp = tempfile::tempdir().unwrap();
     let config = direct_mode_config(&tmp);
-    let err = composio_execute(&config, "GMAIL_SEND_EMAIL", None)
+    let err = composio_execute(&config, "GMAIL_SEND_EMAIL", None, None)
         .await
         .unwrap_err();
     assert!(
@@ -1937,5 +2265,196 @@ fn composio_direct_500_does_not_demote() {
         crate::core::observability::expected_error_kind(msg),
         None,
         "composio-direct 500 with no auth body must remain an unclassified bug shape"
+    );
+}
+
+// ── enrich_connections_with_identity ──────────────────────────────────
+
+/// Helper: bind the process-global memory client to a fresh temp workspace.
+///
+/// Initialise the global memory client to an isolated temp workspace and return
+/// a serialisation lock that must be held for the duration of the test.
+///
+/// The global rebinds whenever the workspace path changes (see
+/// `memory::global::init`), so each test that passes a unique `TempDir` gets
+/// isolated profile storage. The returned guard prevents concurrent tests from
+/// rebinding the singleton while the calling test is running — hold it with
+/// `let _guard = init_memory_client(tmp.path());`.
+async fn init_memory_client(workspace: &std::path::Path) -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = crate::openhuman::memory::ops::GLOBAL_MEMORY_TEST_LOCK
+        .lock()
+        .await;
+    crate::openhuman::memory::global::init(workspace.to_path_buf())
+        .expect("global memory client should initialize for enrichment test");
+    guard
+}
+
+fn make_connections_response(
+    conns: &[(&str, &str, &str)],
+) -> super::super::types::ComposioConnectionsResponse {
+    let connections = conns
+        .iter()
+        .map(|(id, toolkit, status)| conn(id, toolkit, status))
+        .collect();
+    super::super::types::ComposioConnectionsResponse { connections }
+}
+
+#[tokio::test]
+async fn enrich_does_nothing_when_no_cached_identities() {
+    // Hold the lock so no sibling test can rebind the global to a workspace
+    // that has a profile row matching "c1".  The fresh temp workspace has no
+    // profiles, so load_connected_identities returns Vec::new() and the
+    // connection is returned unchanged.
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = init_memory_client(tmp.path()).await;
+    let resp = make_connections_response(&[("c1", "gmail", "ACTIVE")]);
+    let enriched = enrich_connections_with_identity(resp);
+    assert_eq!(enriched.connections.len(), 1);
+    assert!(enriched.connections[0].account_email.is_none());
+    assert!(enriched.connections[0].workspace.is_none());
+    assert!(enriched.connections[0].username.is_none());
+}
+
+#[tokio::test]
+async fn enrich_populates_email_from_cached_profile() {
+    use crate::openhuman::memory_sync::composio::providers::{
+        profile::persist_provider_profile, ProviderUserProfile,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = init_memory_client(tmp.path()).await;
+
+    persist_provider_profile(&ProviderUserProfile {
+        toolkit: "gmail".to_string(),
+        connection_id: Some("conn-gmail-1".to_string()),
+        email: Some("alice@example.com".to_string()),
+        display_name: Some("Alice Smith".to_string()),
+        ..Default::default()
+    });
+
+    let resp = make_connections_response(&[("conn-gmail-1", "gmail", "ACTIVE")]);
+    let enriched = enrich_connections_with_identity(resp);
+
+    assert_eq!(
+        enriched.connections[0].account_email.as_deref(),
+        Some("alice@example.com"),
+        "email should be populated from cached gmail profile"
+    );
+    assert_eq!(
+        enriched.connections[0].workspace.as_deref(),
+        Some("Alice Smith"),
+        "workspace (display_name) should be populated"
+    );
+    assert!(
+        enriched.connections[0].username.is_none(),
+        "username (handle) should be absent for gmail"
+    );
+}
+
+#[tokio::test]
+async fn enrich_populates_handle_for_github() {
+    use crate::openhuman::memory_sync::composio::providers::{
+        profile::persist_provider_profile, ProviderUserProfile,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = init_memory_client(tmp.path()).await;
+
+    persist_provider_profile(&ProviderUserProfile {
+        toolkit: "github".to_string(),
+        connection_id: Some("conn-gh-1".to_string()),
+        username: Some("octocat".to_string()),
+        ..Default::default()
+    });
+
+    let resp = make_connections_response(&[("conn-gh-1", "github", "ACTIVE")]);
+    let enriched = enrich_connections_with_identity(resp);
+
+    // GitHub uses `handle` kind (the catch-all branch in expand_identity_rows).
+    assert_eq!(
+        enriched.connections[0].username.as_deref(),
+        Some("octocat"),
+        "username (handle) should be populated for github"
+    );
+    assert!(enriched.connections[0].account_email.is_none());
+}
+
+#[tokio::test]
+async fn enrich_skips_connection_already_having_identity() {
+    // If the backend-proxied path already populated account_email, the
+    // enricher must NOT overwrite it with a potentially stale cached value.
+    let mut resp = make_connections_response(&[("c-preloaded", "gmail", "ACTIVE")]);
+    resp.connections[0].account_email = Some("preloaded@example.com".to_string());
+
+    let enriched = enrich_connections_with_identity(resp);
+    assert_eq!(
+        enriched.connections[0].account_email.as_deref(),
+        Some("preloaded@example.com"),
+        "pre-populated identity must not be overwritten"
+    );
+}
+
+#[tokio::test]
+async fn enrich_handles_multiple_connections_same_toolkit() {
+    // Two Gmail accounts — each gets its own identity label, not "Account N".
+    use crate::openhuman::memory_sync::composio::providers::{
+        profile::persist_provider_profile, ProviderUserProfile,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = init_memory_client(tmp.path()).await;
+
+    persist_provider_profile(&ProviderUserProfile {
+        toolkit: "gmail".to_string(),
+        connection_id: Some("g1".to_string()),
+        email: Some("alice@example.com".to_string()),
+        ..Default::default()
+    });
+    persist_provider_profile(&ProviderUserProfile {
+        toolkit: "gmail".to_string(),
+        connection_id: Some("g2".to_string()),
+        email: Some("bob@example.com".to_string()),
+        ..Default::default()
+    });
+
+    let resp = make_connections_response(&[("g1", "gmail", "ACTIVE"), ("g2", "gmail", "ACTIVE")]);
+    let enriched = enrich_connections_with_identity(resp);
+
+    let emails: Vec<_> = enriched
+        .connections
+        .iter()
+        .map(|c| c.account_email.as_deref())
+        .collect();
+    assert!(
+        emails.contains(&Some("alice@example.com")),
+        "first gmail account should carry alice's email"
+    );
+    assert!(
+        emails.contains(&Some("bob@example.com")),
+        "second gmail account should carry bob's email"
+    );
+}
+
+#[tokio::test]
+async fn enrich_leaves_unmatched_connection_unchanged() {
+    // Connection whose id has no cached profile row is returned with all
+    // identity fields as None — the UI falls back to "toolkit · connection_id".
+    use crate::openhuman::memory_sync::composio::providers::{
+        profile::persist_provider_profile, ProviderUserProfile,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = init_memory_client(tmp.path()).await;
+
+    // Persist a profile for a DIFFERENT connection id.
+    persist_provider_profile(&ProviderUserProfile {
+        toolkit: "gmail".to_string(),
+        connection_id: Some("other-conn".to_string()),
+        email: Some("other@example.com".to_string()),
+        ..Default::default()
+    });
+
+    let resp = make_connections_response(&[("no-profile-conn", "gmail", "ACTIVE")]);
+    let enriched = enrich_connections_with_identity(resp);
+
+    assert!(
+        enriched.connections[0].account_email.is_none(),
+        "connection with no cached profile must remain unenriched"
     );
 }

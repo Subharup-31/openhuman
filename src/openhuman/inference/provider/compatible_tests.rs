@@ -1,7 +1,7 @@
 use super::*;
 use sentry::test::TestTransport;
 use std::sync::Arc;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
@@ -65,6 +65,9 @@ fn native_request_emits_thread_id_when_present() {
         tool_choice: None,
         thread_id: Some("thread-abc".to_string()),
         stream_options: None,
+        options: None,
+        frequency_penalty: None,
+        max_tokens: None,
     };
     let json = serde_json::to_value(&req).unwrap();
     assert_eq!(
@@ -82,11 +85,257 @@ fn native_request_emits_thread_id_when_present() {
         tool_choice: None,
         thread_id: None,
         stream_options: None,
+        options: None,
+        frequency_penalty: None,
+        max_tokens: None,
     };
     let json_no_thread = serde_json::to_value(&req_no_thread).unwrap();
     assert!(
         json_no_thread.get("thread_id").is_none(),
         "absent thread_id must not be serialized so non-OpenHuman backends don't reject the field"
+    );
+}
+
+#[test]
+fn native_request_serializes_frequency_penalty_only_when_set() {
+    let base = super::NativeChatRequest {
+        model: "kimi".to_string(),
+        messages: Vec::new(),
+        temperature: Some(0.7),
+        stream: Some(false),
+        tools: None,
+        tool_choice: None,
+        thread_id: None,
+        stream_options: None,
+        options: None,
+        frequency_penalty: Some(0.3),
+        max_tokens: None,
+    };
+    let json = serde_json::to_value(&base).unwrap();
+    assert_eq!(
+        json.get("frequency_penalty")
+            .and_then(serde_json::Value::as_f64),
+        Some(0.3),
+        "a set frequency_penalty must be forwarded to damp repetition loops"
+    );
+
+    let none = super::NativeChatRequest {
+        frequency_penalty: None,
+        ..base
+    };
+    let json_none = serde_json::to_value(&none).unwrap();
+    assert!(
+        json_none.get("frequency_penalty").is_none(),
+        "absent frequency_penalty must be omitted so providers that reject it are unaffected"
+    );
+}
+
+#[test]
+fn native_request_serializes_max_tokens_only_when_set() {
+    // A set cap must reach the wire as OpenAI `max_tokens` so a credit-metered
+    // provider prices the request against a realistic output budget rather than
+    // the model's full window (TAURI-RUST-C62).
+    let with_cap = super::NativeChatRequest {
+        model: "anthropic/claude-fable-5".to_string(),
+        messages: Vec::new(),
+        temperature: Some(0.0),
+        stream: Some(false),
+        tools: None,
+        tool_choice: None,
+        thread_id: None,
+        stream_options: None,
+        options: None,
+        frequency_penalty: None,
+        max_tokens: Some(8192),
+    };
+    let json = serde_json::to_value(&with_cap).unwrap();
+    assert_eq!(
+        json.get("max_tokens").and_then(serde_json::Value::as_u64),
+        Some(8192),
+        "a set max_tokens must be forwarded so the provider's balance pre-flight is bounded"
+    );
+
+    let no_cap = super::NativeChatRequest {
+        max_tokens: None,
+        ..with_cap
+    };
+    let json_none = serde_json::to_value(&no_cap).unwrap();
+    assert!(
+        json_none.get("max_tokens").is_none(),
+        "absent max_tokens must be omitted so open-ended generations are unaffected"
+    );
+}
+
+#[test]
+fn responses_request_serializes_max_output_tokens_only_when_set() {
+    // The Responses-API branch must carry the cap as `max_output_tokens` so a
+    // capped request isn't silently uncapped when responses_api_primary is on
+    // (TAURI-RUST-C62).
+    let with_cap = super::compatible_types::ResponsesRequest {
+        model: "gpt-x".to_string(),
+        input: vec![],
+        instructions: None,
+        stream: Some(false),
+        store: Some(false),
+        max_output_tokens: Some(8192),
+    };
+    let json = serde_json::to_value(&with_cap).unwrap();
+    assert_eq!(
+        json.get("max_output_tokens")
+            .and_then(serde_json::Value::as_u64),
+        Some(8192),
+        "a set cap must reach the Responses API as max_output_tokens"
+    );
+
+    let no_cap = super::compatible_types::ResponsesRequest {
+        max_output_tokens: None,
+        ..with_cap
+    };
+    let json_none = serde_json::to_value(&no_cap).unwrap();
+    assert!(
+        json_none.get("max_output_tokens").is_none(),
+        "absent cap must be omitted"
+    );
+}
+
+#[test]
+fn detects_frequency_penalty_rejection_for_retry() {
+    use super::OpenAiCompatibleProvider as P;
+    // Strict providers that 400 on the field → retry without it.
+    assert!(P::err_indicates_frequency_penalty_unsupported(
+        "400 Bad Request: unknown parameter 'frequency_penalty'"
+    ));
+    assert!(P::err_indicates_frequency_penalty_unsupported(
+        "frequency_penalty is not supported by this model"
+    ));
+    // Unrelated errors, or the field merely mentioned, must NOT trigger a retry.
+    assert!(!P::err_indicates_frequency_penalty_unsupported(
+        "rate limit exceeded"
+    ));
+    assert!(!P::err_indicates_frequency_penalty_unsupported(
+        "applied frequency_penalty 0.3"
+    ));
+}
+
+#[test]
+fn endpoint_rejects_frequency_penalty_matches_google_gemini_host() {
+    use super::compatible_request::endpoint_rejects_frequency_penalty as rejects;
+    // The Google Gemini OpenAI-compat shim 400s on the field (TAURI-RUST-4PJ).
+    assert!(rejects(
+        "https://generativelanguage.googleapis.com/v1beta/openai"
+    ));
+    // Host match is case-insensitive and covers a registrable-domain suffix,
+    // so a BYOK provider pointed at a regional/sub-host is covered too.
+    assert!(rejects(
+        "https://GenerativeLanguage.GoogleAPIs.com/v1beta/openai"
+    ));
+    assert!(rejects(
+        "https://eu.generativelanguage.googleapis.com/v1beta/openai"
+    ));
+    // Every other provider keeps the penalty; an unparseable URL is a no-op.
+    assert!(!rejects("https://api.openai.com/v1"));
+    assert!(!rejects("https://api.venice.ai"));
+    // A look-alike host must NOT match (suffix check is dot-anchored).
+    assert!(!rejects(
+        "https://notgenerativelanguage.googleapis.com.evil.test/v1"
+    ));
+    assert!(!rejects("not a url"));
+}
+
+#[test]
+fn effective_frequency_penalty_omitted_for_google_kept_for_others() {
+    // Google Gemini endpoint → field omitted at the source (no rejected
+    // round-trip, no Sentry report).
+    let google = OpenAiCompatibleProvider::new(
+        "google",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        None,
+        AuthStyle::Bearer,
+    );
+    assert_eq!(
+        google.effective_frequency_penalty(),
+        None,
+        "Gemini shim rejects frequency_penalty — it must be omitted up front"
+    );
+
+    // Any other OpenAI-compatible provider keeps the repetition-damping value.
+    let other = make_provider("openai", "https://api.openai.com/v1", None);
+    assert_eq!(
+        other.effective_frequency_penalty(),
+        Some(super::compatible_repeat::CHAT_FREQUENCY_PENALTY),
+        "providers that accept the field must still receive it"
+    );
+}
+
+#[tokio::test]
+async fn streaming_chat_frequency_penalty_rejection_not_reported_to_sentry() {
+    // Defense-in-depth (TAURI-RUST-4PJ): an unknown strict provider — one not
+    // covered by the host allow-list, so prevention did not omit the field —
+    // 400s on frequency_penalty. The caller retries without it and succeeds, so
+    // this self-healed condition must NOT page Sentry, while still propagating
+    // as an Err so the retry path fires.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"error":{"code":400,"message":"Invalid JSON payload received. Unknown name \"frequency_penalty\": Cannot find field.","status":"INVALID_ARGUMENT"}}"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    let transport = TestTransport::new();
+    let sentry_options = sentry::ClientOptions {
+        dsn: Some("https://public@sentry.invalid/1".parse().unwrap()),
+        transport: Some(Arc::new(transport.clone())),
+        ..Default::default()
+    };
+    let sentry_hub = Arc::new(sentry::Hub::new(
+        Some(Arc::new(sentry_options.into())),
+        Arc::new(Default::default()),
+    ));
+    let _sentry_guard = sentry::HubSwitchGuard::new(sentry_hub);
+
+    // Provider URL is the mock host (not the google allow-list host), so the
+    // request DOES carry frequency_penalty and exercises the stream-error
+    // classifier arm rather than the prevent-at-source omission.
+    let provider =
+        OpenAiCompatibleProvider::new("strict_byok", &mock_server.uri(), None, AuthStyle::None);
+    let request = NativeChatRequest {
+        model: "some-model".to_string(),
+        messages: vec![NativeMessage {
+            role: "user".to_string(),
+            content: Some("hello".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        }],
+        temperature: Some(0.7),
+        stream: Some(true),
+        tools: None,
+        tool_choice: None,
+        thread_id: None,
+        stream_options: Some(super::compatible_types::OpenAiStreamOptions {
+            include_usage: true,
+        }),
+        options: None,
+        frequency_penalty: Some(super::compatible_repeat::CHAT_FREQUENCY_PENALTY),
+        max_tokens: None,
+    };
+    let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(8);
+
+    let err = provider
+        .stream_native_chat(None, &request, &delta_tx, 0)
+        .await
+        .expect_err(
+            "400 frequency_penalty rejection must still propagate as Err to drive the retry",
+        );
+    assert!(
+        err.to_string().contains("streaming API error"),
+        "err: {err}"
+    );
+    assert!(
+        transport.fetch_and_clear_events().is_empty(),
+        "a self-healed frequency_penalty rejection must not be reported to Sentry"
     );
 }
 
@@ -108,6 +357,9 @@ fn streaming_request_sets_stream_options_include_usage() {
         stream_options: Some(super::compatible_types::OpenAiStreamOptions {
             include_usage: true,
         }),
+        options: None,
+        frequency_penalty: None,
+        max_tokens: None,
     };
     let json = serde_json::to_value(&req).unwrap();
     assert_eq!(
@@ -129,11 +381,61 @@ fn non_streaming_request_omits_stream_options() {
         tool_choice: None,
         thread_id: None,
         stream_options: None,
+        options: None,
+        frequency_penalty: None,
+        max_tokens: None,
     };
     let json = serde_json::to_value(&req).unwrap();
     assert!(
         json.get("stream_options").is_none(),
         "non-streaming requests must not emit stream_options (OpenAI rejects it on stream=false)"
+    );
+}
+
+#[test]
+fn ollama_options_num_ctx_serializes_correctly() {
+    let req = super::NativeChatRequest {
+        model: "qwen3:14b".to_string(),
+        messages: Vec::new(),
+        temperature: Some(0.7),
+        stream: Some(false),
+        tools: None,
+        tool_choice: None,
+        thread_id: None,
+        stream_options: None,
+        options: Some(super::compatible_types::OllamaOptions {
+            num_ctx: Some(32768),
+        }),
+        frequency_penalty: None,
+        max_tokens: None,
+    };
+    let json = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        json.pointer("/options/num_ctx").and_then(|v| v.as_u64()),
+        Some(32768),
+        "Ollama num_ctx must appear at options.num_ctx in serialized body"
+    );
+}
+
+#[test]
+fn ollama_options_none_is_omitted() {
+    let req = super::NativeChatRequest {
+        model: "gpt-4o".to_string(),
+        messages: Vec::new(),
+        temperature: Some(0.7),
+        stream: Some(false),
+        tools: None,
+        tool_choice: None,
+        thread_id: None,
+        stream_options: None,
+        options: None,
+        frequency_penalty: None,
+        max_tokens: None,
+    };
+    let json = serde_json::to_value(&req).unwrap();
+    assert!(
+        json.get("options").is_none(),
+        "options field must be omitted when None (non-Ollama providers)"
     );
 }
 
@@ -168,11 +470,11 @@ fn request_serializes_correctly() {
         messages: vec![
             Message {
                 role: "system".to_string(),
-                content: "You are OpenHuman".to_string(),
+                content: "You are OpenHuman".into(),
             },
             Message {
                 role: "user".to_string(),
-                content: "hello".to_string(),
+                content: "hello".into(),
             },
         ],
         temperature: Some(0.4),
@@ -228,6 +530,106 @@ fn parse_responses_response_body_reports_sanitized_snippet() {
     assert!(msg.contains("body="));
     assert!(msg.contains("[REDACTED]"));
     assert!(!msg.contains("sk-another-secret"));
+}
+
+// ── aggregate_responses_sse_body (#3201) ─────────────────────────────────────
+
+/// Per-delta accumulation: the Codex/ChatGPT OAuth stream is a sequence of
+/// `response.output_text.delta` events whose `delta` fields concatenate into
+/// the final assistant text.
+#[test]
+fn aggregate_responses_sse_body_concatenates_text_deltas() {
+    let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello \"}\n\n\
+                data: {\"type\":\"response.output_text.delta\",\"delta\":\"world\"}\n\n\
+                data: [DONE]\n";
+    let text =
+        super::compatible_parse::aggregate_responses_sse_body("custom", body).expect("aggregate");
+    assert_eq!(text, "hello world");
+}
+
+/// Some providers (and the Codex endpoint when the model batches its
+/// reply) skip per-token deltas and emit the full text in
+/// `response.completed.response.output_text`. The aggregator must fall
+/// back to that terminal field when no deltas accumulated.
+#[test]
+fn aggregate_responses_sse_body_prefers_terminal_output_text_when_present() {
+    let body = "data: {\"type\":\"response.created\",\"response\":{}}\n\n\
+                data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"batched final text\"}}\n\n\
+                data: [DONE]\n";
+    let text =
+        super::compatible_parse::aggregate_responses_sse_body("custom", body).expect("aggregate");
+    assert_eq!(text, "batched final text");
+}
+
+/// #3201 CodeRabbit nit: a whitespace-only terminal `output_text` must
+/// behave like the field is absent, so accumulated deltas survive instead
+/// of being silently collapsed into blank output. Mirrors
+/// `extract_responses_text`'s `first_nonempty(...)` policy.
+#[test]
+fn aggregate_responses_sse_body_ignores_whitespace_only_terminal_output_text() {
+    let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"good \"}\n\n\
+                data: {\"type\":\"response.output_text.delta\",\"delta\":\"reply\"}\n\n\
+                data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"   \\n\\t\"}}\n\n\
+                data: [DONE]\n";
+    let text =
+        super::compatible_parse::aggregate_responses_sse_body("custom", body).expect("aggregate");
+    assert_eq!(text, "good reply");
+}
+
+/// Carriage-return line endings (CRLF, common in HTTP/1.1 SSE) parse the
+/// same as LF-only — the trimming is just `\r` stripping.
+#[test]
+fn aggregate_responses_sse_body_tolerates_crlf_line_endings() {
+    let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"crlf\"}\r\n\r\n\
+                data: [DONE]\r\n";
+    let text =
+        super::compatible_parse::aggregate_responses_sse_body("custom", body).expect("aggregate");
+    assert_eq!(text, "crlf");
+}
+
+/// `response.failed` / `response.error` / `error` event shapes are
+/// terminal failures — bubble them up so the caller surfaces the upstream
+/// reason instead of returning empty text.
+#[test]
+fn aggregate_responses_sse_body_surfaces_failure_events() {
+    let body = "data: {\"type\":\"response.created\",\"response\":{}}\n\n\
+                data: {\"type\":\"response.failed\",\"error\":\"upstream model unavailable\"}\n\n";
+    let err = super::compatible_parse::aggregate_responses_sse_body("custom", body)
+        .expect_err("failure event should propagate");
+    assert!(
+        err.to_string()
+            .contains("custom Responses API stream reported a failure event"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A stream that produced no usable text events returns a sanitised
+/// "no text events" error so the caller sees something actionable
+/// instead of an empty string.
+#[test]
+fn aggregate_responses_sse_body_errors_when_no_text_events_present() {
+    let body = "data: {\"type\":\"response.created\",\"response\":{}}\n\n\
+                data: [DONE]\n";
+    let err = super::compatible_parse::aggregate_responses_sse_body("custom", body)
+        .expect_err("empty stream should fail");
+    assert!(
+        err.to_string()
+            .contains("custom Responses API SSE stream produced no text events"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Malformed individual events (provider keepalive comments, etc.) must
+/// not abort the whole turn — they're skipped and the good deltas still
+/// aggregate.
+#[test]
+fn aggregate_responses_sse_body_skips_unparseable_events() {
+    let body = "data: {malformed-keepalive\n\n\
+                data: {\"type\":\"response.output_text.delta\",\"delta\":\"good\"}\n\n\
+                data: [DONE]\n";
+    let text =
+        super::compatible_parse::aggregate_responses_sse_body("custom", body).expect("aggregate");
+    assert_eq!(text, "good");
 }
 
 #[test]
@@ -319,6 +721,60 @@ fn extra_headers_are_applied_with_auth_header() {
 }
 
 #[test]
+fn openrouter_requests_include_app_attribution_headers() {
+    let p = OpenAiCompatibleProvider::new(
+        "openrouter",
+        "https://openrouter.ai/api/v1",
+        Some("sk-or-test"),
+        AuthStyle::Bearer,
+    );
+
+    let req = p
+        .apply_auth_header(
+            p.http_client()
+                .post("https://openrouter.ai/api/v1/chat/completions"),
+            Some("sk-or-test"),
+        )
+        .build()
+        .unwrap();
+
+    assert_eq!(
+        req.headers()
+            .get("HTTP-Referer")
+            .and_then(|value| value.to_str().ok()),
+        Some("https://openhuman.ai")
+    );
+    assert_eq!(
+        req.headers()
+            .get("X-OpenRouter-Title")
+            .and_then(|value| value.to_str().ok()),
+        Some("OpenHuman")
+    );
+}
+
+#[test]
+fn non_openrouter_requests_do_not_include_openrouter_attribution_headers() {
+    let p = OpenAiCompatibleProvider::new(
+        "custom",
+        "https://api.example.com/v1",
+        Some("test-key"),
+        AuthStyle::Bearer,
+    );
+
+    let req = p
+        .apply_auth_header(
+            p.http_client()
+                .post("https://api.example.com/v1/chat/completions"),
+            Some("test-key"),
+        )
+        .build()
+        .unwrap();
+
+    assert!(req.headers().get("HTTP-Referer").is_none());
+    assert!(req.headers().get("X-OpenRouter-Title").is_none());
+}
+
+#[test]
 fn extra_query_params_are_applied_to_codex_urls() {
     let p = OpenAiCompatibleProvider::new(
         "openai",
@@ -349,15 +805,34 @@ fn extra_query_params_are_applied_to_codex_urls() {
     );
 }
 
+/// #3201: the Codex/ChatGPT OAuth Responses endpoint rejects
+/// `stream: false` with `{"detail":"Stream must be set to true"}` and
+/// only emits SSE bodies. The non-streaming `chat_via_responses` wrapper
+/// must therefore (a) flip the `stream` flag for `/backend-api/codex`
+/// URLs and (b) aggregate the SSE body back into the same `String`
+/// the caller expects. PR #3192 fixed the sibling `store: false`
+/// requirement; this test pins both wire-shape requirements together.
 #[tokio::test]
 async fn responses_api_primary_posts_directly_to_responses() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/backend-api/codex/responses"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "output_text": "hello from responses",
-            "output": []
+        .and(body_json(serde_json::json!({
+            "model": "gpt-5.5",
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }],
+            "stream": true,
+            "store": false
         })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello \"}\n\n\
+             data: {\"type\":\"response.output_text.delta\",\"delta\":\"from \"}\n\n\
+             data: {\"type\":\"response.output_text.delta\",\"delta\":\"responses\"}\n\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"hello from responses\"}}\n\n\
+             data: [DONE]\n\n",
+        ))
         .mount(&server)
         .await;
 
@@ -463,12 +938,45 @@ fn build_responses_prompt_preserves_multi_turn_history() {
     assert_eq!(input[1].role, "assistant");
     assert_eq!(input[1].content[0].kind, "output_text");
     assert_eq!(input[1].content[0].text, "ack 1");
+    // A `tool` turn normalizes to the `assistant` role, so its content part
+    // MUST be `output_text` — the Responses API rejects `input_text` on an
+    // assistant item (Sentry TAURI-RUST-8FQ / GH #3624).
     assert_eq!(input[2].role, "assistant");
-    assert_eq!(input[2].content[0].kind, "input_text");
+    assert_eq!(input[2].content[0].kind, "output_text");
     assert_eq!(input[2].content[0].text, "{\"result\":\"ok\"}");
     assert_eq!(input[3].role, "user");
     assert_eq!(input[3].content[0].kind, "input_text");
     assert_eq!(input[3].content[0].text, "step 2");
+}
+
+/// Regression for Sentry TAURI-RUST-8FQ / GH #3624: the Responses API only
+/// accepts `output_text`/`refusal` for assistant items. `normalize_responses_role`
+/// folds `tool` into `assistant`, so the content kind must follow the normalized
+/// role — never the raw one. No assistant-role item may carry `input_text`.
+#[test]
+fn build_responses_prompt_tool_role_uses_output_text() {
+    let messages = vec![
+        ChatMessage::assistant("calling a tool"),
+        ChatMessage::tool("{\"result\":\"ok\"}"),
+        ChatMessage::user("thanks"),
+    ];
+
+    let (_instructions, input) = build_responses_prompt(&messages);
+
+    // The tool turn folds to assistant and must carry output_text.
+    assert_eq!(input[1].role, "assistant");
+    assert_eq!(input[1].content[0].kind, "output_text");
+
+    // Invariant: an assistant-role item never carries input_text.
+    for item in &input {
+        if item.role == "assistant" {
+            assert_eq!(
+                item.content[0].kind, "output_text",
+                "assistant-role item must use output_text, got {}",
+                item.content[0].kind
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -479,6 +987,7 @@ async fn chat_via_responses_requires_non_system_message() {
             Some("test-key"),
             &[ChatMessage::system("policy")],
             "gpt-test",
+            None,
         )
         .await
         .expect_err("system-only fallback payload should fail");
@@ -522,7 +1031,7 @@ async fn streaming_chat_config_rejection_propagates_error_without_sentry_report(
         model: "kimi-k2".to_string(),
         messages: vec![NativeMessage {
             role: "user".to_string(),
-            content: Some("hello".to_string()),
+            content: Some("hello".into()),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
@@ -535,6 +1044,9 @@ async fn streaming_chat_config_rejection_propagates_error_without_sentry_report(
         stream_options: Some(super::compatible_types::OpenAiStreamOptions {
             include_usage: true,
         }),
+        options: None,
+        frequency_penalty: None,
+        max_tokens: None,
     };
     let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(8);
 
@@ -549,6 +1061,73 @@ async fn streaming_chat_config_rejection_propagates_error_without_sentry_report(
     assert!(
         transport.fetch_and_clear_events().is_empty(),
         "provider config-rejection must not be reported to Sentry"
+    );
+}
+
+#[tokio::test]
+async fn streaming_chat_byo_auth_failure_propagates_error_without_sentry_report() {
+    // Guardrail for #3671 (TAURI-RUST-DHM): a missing/invalid BYO API key on a
+    // non-backend custom provider returns 401 with an auth-error body. The
+    // error must still propagate to the caller, but it must NOT page Sentry —
+    // memory-tree extraction + memory jobs retry through the broken credential
+    // and previously flooded Sentry with thousands of identical events.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(
+            r#"{"error":{"message":"Invalid or missing API key","type":"authentication_error"}}"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    let transport = TestTransport::new();
+    let sentry_options = sentry::ClientOptions {
+        dsn: Some("https://public@sentry.invalid/1".parse().unwrap()),
+        transport: Some(Arc::new(transport.clone())),
+        ..Default::default()
+    };
+    let sentry_hub = Arc::new(sentry::Hub::new(
+        Some(Arc::new(sentry_options.into())),
+        Arc::new(Default::default()),
+    ));
+    let _sentry_guard = sentry::HubSwitchGuard::new(sentry_hub);
+
+    // `kiro` is the exact (user-named) custom provider from the Sentry report.
+    let provider = OpenAiCompatibleProvider::new("kiro", &mock_server.uri(), None, AuthStyle::None);
+    let request = NativeChatRequest {
+        model: "claude-sonnet-4.5".to_string(),
+        messages: vec![NativeMessage {
+            role: "user".to_string(),
+            content: Some("hello".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        }],
+        temperature: Some(0.7),
+        stream: Some(true),
+        tools: None,
+        tool_choice: None,
+        thread_id: None,
+        stream_options: Some(super::compatible_types::OpenAiStreamOptions {
+            include_usage: true,
+        }),
+        options: None,
+        frequency_penalty: None,
+        max_tokens: None,
+    };
+    let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(8);
+
+    let err = provider
+        .stream_native_chat(None, &request, &delta_tx, 0)
+        .await
+        .expect_err("401 BYO auth failure must still propagate as Err");
+    assert!(
+        err.to_string().contains("streaming API error"),
+        "err: {err}"
+    );
+    assert!(
+        transport.fetch_and_clear_events().is_empty(),
+        "BYO provider auth failure must not be reported to Sentry"
     );
 }
 
@@ -756,6 +1335,7 @@ fn parse_native_response_preserves_tool_call_id() {
                     r#"{"command":"pwd"}"#.to_string(),
                 )),
             }),
+            extra_content: None,
         }]),
         function_call: None,
         reasoning_content: None,
@@ -782,6 +1362,7 @@ fn parse_native_response_captures_reasoning_content() {
                 name: Some("shell".to_string()),
                 arguments: Some(serde_json::Value::String("{}".to_string())),
             }),
+            extra_content: None,
         }]),
         function_call: None,
         reasoning_content: Some("  weighing the options  ".to_string()),
@@ -827,7 +1408,411 @@ fn convert_messages_for_native_maps_tool_result_payload() {
     assert_eq!(converted.len(), 2);
     assert_eq!(converted[1].role, "tool");
     assert_eq!(converted[1].tool_call_id.as_deref(), Some("call_abc"));
-    assert_eq!(converted[1].content.as_deref(), Some("done"));
+    assert_eq!(
+        serde_json::to_value(&converted[1].content).unwrap(),
+        serde_json::json!("done")
+    );
+}
+
+// ── TAURI-RUST-4PK: Gemini thought_signature round-trip ──────────────────────
+
+/// The wire `ToolCall` must capture Gemini's `extra_content` from the response
+/// and re-emit it verbatim on the request, so the thought_signature survives the
+/// round-trip. A tool call without it omits the field entirely (non-Gemini
+/// providers stay byte-identical on the wire).
+#[test]
+fn tool_call_wire_round_trips_extra_content() {
+    let json = r#"{"id":"call_g","type":"function","function":{"name":"shell","arguments":"{}"},"extra_content":{"google":{"thought_signature":"SIG123"}}}"#;
+    let tc: ToolCall = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        tc.extra_content
+            .as_ref()
+            .and_then(|v| v.pointer("/google/thought_signature"))
+            .and_then(|v| v.as_str()),
+        Some("SIG123"),
+        "extra_content must be captured from the Gemini response"
+    );
+    let reemitted = serde_json::to_value(&tc).unwrap();
+    assert_eq!(
+        reemitted
+            .pointer("/extra_content/google/thought_signature")
+            .and_then(|v| v.as_str()),
+        Some("SIG123"),
+        "extra_content must be echoed verbatim on the request body"
+    );
+
+    let bare: ToolCall = serde_json::from_str(
+        r#"{"id":"c","type":"function","function":{"name":"x","arguments":"{}"}}"#,
+    )
+    .unwrap();
+    assert!(bare.extra_content.is_none());
+    assert!(
+        serde_json::to_value(&bare)
+            .unwrap()
+            .get("extra_content")
+            .is_none(),
+        "providers that don't send extra_content keep a byte-identical wire body"
+    );
+}
+
+/// `parse_native_response` lifts the tool-call `extra_content` onto the harness
+/// ToolCall so it can be persisted and echoed (TAURI-RUST-4PK).
+#[test]
+fn parse_native_response_captures_tool_call_extra_content() {
+    let message = ResponseMessage {
+        content: None,
+        tool_calls: Some(vec![ToolCall {
+            id: Some("call_g".to_string()),
+            kind: Some("function".to_string()),
+            function: Some(Function {
+                name: Some("shell".to_string()),
+                arguments: Some(serde_json::Value::String("{}".to_string())),
+            }),
+            extra_content: Some(serde_json::json!({"google":{"thought_signature":"SIG_RESP"}})),
+        }]),
+        function_call: None,
+        reasoning_content: None,
+    };
+    let parsed =
+        OpenAiCompatibleProvider::parse_native_response(wrap_message(message), "google").unwrap();
+    assert_eq!(parsed.tool_calls.len(), 1);
+    assert_eq!(
+        parsed.tool_calls[0]
+            .extra_content
+            .as_ref()
+            .and_then(|v| v.pointer("/google/thought_signature"))
+            .and_then(|v| v.as_str()),
+        Some("SIG_RESP"),
+        "the signature must land on the harness ToolCall"
+    );
+}
+
+/// On rebuild, a persisted assistant tool-call message whose stored JSON carries
+/// `extra_content` must re-emit it on the wire tool_calls, so Gemini sees the
+/// signature on the follow-up turn (TAURI-RUST-4PK).
+#[test]
+fn convert_messages_for_native_echoes_tool_call_extra_content() {
+    let input = vec![
+        ChatMessage::assistant(
+            r#"{"content":"on it","tool_calls":[{"id":"call_g","name":"shell","arguments":"{}","extra_content":{"google":{"thought_signature":"SIG_ECHO"}}}]}"#,
+        ),
+        ChatMessage::tool(r#"{"tool_call_id":"call_g","content":"done"}"#),
+    ];
+    let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
+    let tool_calls = converted[0]
+        .tool_calls
+        .as_ref()
+        .expect("assistant tool_calls present");
+    assert_eq!(
+        tool_calls[0]
+            .extra_content
+            .as_ref()
+            .and_then(|v| v.pointer("/google/thought_signature"))
+            .and_then(|v| v.as_str()),
+        Some("SIG_ECHO"),
+        "stored extra_content must be echoed back on the rebuilt request"
+    );
+    assert_eq!(
+        serde_json::to_value(tool_calls)
+            .unwrap()
+            .pointer("/0/extra_content/google/thought_signature")
+            .and_then(|v| v.as_str()),
+        Some("SIG_ECHO"),
+        "echoed signature must appear on the serialized wire body"
+    );
+}
+
+/// A non-Gemini stored tool call (no `extra_content`) rebuilds with the field
+/// omitted — every other provider's wire body stays byte-identical.
+#[test]
+fn convert_messages_for_native_tool_call_without_extra_content_stays_none() {
+    let input = vec![
+        ChatMessage::assistant(
+            r#"{"content":"on it","tool_calls":[{"id":"call_x","name":"shell","arguments":"{}"}]}"#,
+        ),
+        ChatMessage::tool(r#"{"tool_call_id":"call_x","content":"done"}"#),
+    ];
+    let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
+    let tool_calls = converted[0]
+        .tool_calls
+        .as_ref()
+        .expect("assistant tool_calls present");
+    assert!(tool_calls[0].extra_content.is_none());
+    assert!(serde_json::to_value(&tool_calls[0])
+        .unwrap()
+        .get("extra_content")
+        .is_none());
+}
+
+/// INVARIANT (TAURI-RUST-4PK / 4PJ): a PARALLEL multi-`functionCall` assistant
+/// turn reloaded from history must echo a non-empty `thought_signature` on
+/// EVERY part of the rebuilt outbound payload — not just the first. The stored
+/// JSON here is the exact shape `build_native_assistant_history` now emits (per
+/// the writer-side test in `agent::harness::parse_tests`). Before the fix the
+/// writer dropped `extra_content`, so a reloaded multi-call turn went out with
+/// missing signatures and Gemini 400'd ("Function call is missing a
+/// thought_signature in functionCall parts"). Covers both the non-stream and
+/// streaming paths since both persist through the single native history writer.
+#[test]
+fn convert_messages_for_native_echoes_signature_on_every_parallel_call() {
+    let stored = r#"{"content":"on it","tool_calls":[
+        {"id":"call_a","name":"shell","arguments":"{}","extra_content":{"google":{"thought_signature":"SIG_A"}}},
+        {"id":"call_b","name":"read","arguments":"{}","extra_content":{"google":{"thought_signature":"SIG_B"}}}
+    ]}"#;
+    let input = vec![
+        ChatMessage::assistant(stored),
+        ChatMessage::tool(r#"{"tool_call_id":"call_a","content":"done"}"#),
+        ChatMessage::tool(r#"{"tool_call_id":"call_b","content":"done"}"#),
+    ];
+    let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
+    let tool_calls = converted[0]
+        .tool_calls
+        .as_ref()
+        .expect("assistant tool_calls survive the reload");
+    assert_eq!(tool_calls.len(), 2, "both parallel calls survive");
+
+    let wire = serde_json::to_value(tool_calls).unwrap();
+    for (idx, expected) in ["SIG_A", "SIG_B"].iter().enumerate() {
+        let sig = wire
+            .pointer(&format!("/{idx}/extra_content/google/thought_signature"))
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            sig,
+            Some(*expected),
+            "functionCall part {idx} must echo its own thought_signature on the wire"
+        );
+        assert!(
+            sig.is_some_and(|s| !s.is_empty()),
+            "functionCall part {idx} thought_signature must be non-empty"
+        );
+    }
+}
+
+/// Streaming: Gemini sends the thought_signature in the tool-call delta's
+/// `extra_content` on the first chunk. The accumulator must preserve it onto the
+/// aggregated tool call so it reaches history (TAURI-RUST-4PK).
+#[tokio::test]
+async fn streaming_tool_call_captures_extra_content() {
+    let mock_server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_g\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"},\"extra_content\":{\"google\":{\"thought_signature\":\"SIG_STREAM\"}}}]}}]}\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&mock_server)
+        .await;
+
+    let provider =
+        OpenAiCompatibleProvider::new("google", &mock_server.uri(), None, AuthStyle::None);
+    let request = NativeChatRequest {
+        model: "models/gemini-3.5-flash".to_string(),
+        messages: vec![NativeMessage {
+            role: "user".to_string(),
+            content: Some("hi".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        }],
+        temperature: Some(0.7),
+        stream: Some(true),
+        tools: None,
+        tool_choice: None,
+        thread_id: None,
+        stream_options: Some(super::compatible_types::OpenAiStreamOptions {
+            include_usage: true,
+        }),
+        options: None,
+        frequency_penalty: None,
+        max_tokens: None,
+    };
+    let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(64);
+    let resp = provider
+        .stream_native_chat(None, &request, &delta_tx, 0)
+        .await
+        .unwrap();
+    assert_eq!(resp.tool_calls.len(), 1);
+    assert_eq!(
+        resp.tool_calls[0]
+            .extra_content
+            .as_ref()
+            .and_then(|v| v.pointer("/google/thought_signature"))
+            .and_then(|v| v.as_str()),
+        Some("SIG_STREAM"),
+        "streaming must preserve the thought_signature onto the aggregated tool call"
+    );
+}
+
+/// Regression: some providers (DashScope/Qwen, GMI) emit the tool-call `id`
+/// ONLY on the first delta for an index, then send `"id": ""` (empty string,
+/// not omitted) on every argument-continuation delta. The streaming accumulator
+/// must not let those empty continuation ids clobber the resolved id down to
+/// `""` — an empty `tool_call_id` is rejected by the upstream tool-message
+/// ordering check on the next turn (400), dead-ending the conversation.
+#[tokio::test]
+async fn streaming_empty_continuation_id_does_not_clobber_tool_call_id() {
+    let mock_server = MockServer::start().await;
+    // Delta 1 carries the real id + name; deltas 2-3 are arg continuations that
+    // repeat index 0 with an EMPTY id (the DashScope/GMI wire shape).
+    let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_real\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]}}]}\n\n\
+                data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"function\":{\"arguments\":\"\"}}]}}]}\n\n\
+                data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\"}]}}]}\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&mock_server)
+        .await;
+
+    let provider =
+        OpenAiCompatibleProvider::new("dashscope", &mock_server.uri(), None, AuthStyle::None);
+    let request = NativeChatRequest {
+        model: "qwen3.7-plus".to_string(),
+        messages: vec![NativeMessage {
+            role: "user".to_string(),
+            content: Some("weather in paris?".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        }],
+        temperature: Some(0.7),
+        stream: Some(true),
+        tools: None,
+        tool_choice: None,
+        thread_id: None,
+        stream_options: Some(super::compatible_types::OpenAiStreamOptions {
+            include_usage: true,
+        }),
+        options: None,
+        frequency_penalty: None,
+        max_tokens: None,
+    };
+    let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(64);
+    let resp = provider
+        .stream_native_chat(None, &request, &delta_tx, 0)
+        .await
+        .unwrap();
+    assert_eq!(resp.tool_calls.len(), 1);
+    assert_eq!(
+        resp.tool_calls[0].id.as_str(),
+        "call_real",
+        "empty-string id on continuation deltas must not clobber the resolved tool_call id"
+    );
+}
+
+/// Regression: a single turn can emit MULTIPLE parallel tool calls. The
+/// per-`index` accumulator must keep each call's first-delta id even when the
+/// empty-id continuation deltas for both indices arrive together — neither may
+/// clobber the other (or itself) to `""`.
+#[tokio::test]
+async fn streaming_parallel_tool_calls_preserve_ids_against_empty_continuations() {
+    let mock_server = MockServer::start().await;
+    // Two parallel calls (index 0 + 1), then one continuation delta carrying
+    // BOTH indices with empty ids.
+    let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]}}]}\n\n\
+                data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]}}]}\n\n\
+                data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\"},{\"index\":1,\"id\":\"\"}]}}]}\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&mock_server)
+        .await;
+
+    let provider =
+        OpenAiCompatibleProvider::new("dashscope", &mock_server.uri(), None, AuthStyle::None);
+    let request = NativeChatRequest {
+        model: "qwen3.7-plus".to_string(),
+        messages: vec![NativeMessage {
+            role: "user".to_string(),
+            content: Some("weather and time?".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        }],
+        temperature: Some(0.7),
+        stream: Some(true),
+        tools: None,
+        tool_choice: None,
+        thread_id: None,
+        stream_options: Some(super::compatible_types::OpenAiStreamOptions {
+            include_usage: true,
+        }),
+        options: None,
+        frequency_penalty: None,
+        max_tokens: None,
+    };
+    let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(64);
+    let resp = provider
+        .stream_native_chat(None, &request, &delta_tx, 0)
+        .await
+        .unwrap();
+    assert_eq!(resp.tool_calls.len(), 2, "both parallel tool calls survive");
+    // Order-independent: each id must be preserved AND mapped to the right tool
+    // (no cross-index contamination).
+    let by_id: std::collections::HashMap<&str, (&str, &str)> = resp
+        .tool_calls
+        .iter()
+        .map(|t| (t.id.as_str(), (t.name.as_str(), t.arguments.as_str())))
+        .collect();
+    assert_eq!(by_id.get("call_a"), Some(&("get_weather", "{}")));
+    assert_eq!(by_id.get("call_b"), Some(&("get_time", "{}")));
+}
+
+/// Counterpart to the DashScope cases: DeepSeek OMITS the `id` key on
+/// argument-continuation deltas (rather than sending `""`). That deserializes
+/// to `None`, so the accumulator already leaves the resolved id alone — assert
+/// the contract holds for the key-absent shape too, and that args still
+/// accumulate across the continuation.
+#[tokio::test]
+async fn streaming_omitted_continuation_id_preserves_tool_call_id() {
+    let mock_server = MockServer::start().await;
+    // Delta 2 has NO `id` key at all (DeepSeek shape) and carries the rest of
+    // the arguments.
+    let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_ds\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\"}}]}}]}\n\n\
+                data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]}}]}\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&mock_server)
+        .await;
+
+    let provider =
+        OpenAiCompatibleProvider::new("deepseek", &mock_server.uri(), None, AuthStyle::None);
+    let request = NativeChatRequest {
+        model: "deepseek-v4-flash".to_string(),
+        messages: vec![NativeMessage {
+            role: "user".to_string(),
+            content: Some("weather?".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        }],
+        temperature: Some(0.7),
+        stream: Some(true),
+        tools: None,
+        tool_choice: None,
+        thread_id: None,
+        stream_options: Some(super::compatible_types::OpenAiStreamOptions {
+            include_usage: true,
+        }),
+        options: None,
+        frequency_penalty: None,
+        max_tokens: None,
+    };
+    let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(64);
+    let resp = provider
+        .stream_native_chat(None, &request, &delta_tx, 0)
+        .await
+        .unwrap();
+    assert_eq!(resp.tool_calls.len(), 1);
+    assert_eq!(resp.tool_calls[0].id.as_str(), "call_ds");
+    assert_eq!(resp.tool_calls[0].name.as_str(), "get_weather");
+    assert_eq!(
+        resp.tool_calls[0].arguments.as_str(),
+        "{}",
+        "arguments must accumulate across the id-omitted continuation delta"
+    );
 }
 
 /// Helper: roles in serialized order.
@@ -932,7 +1917,10 @@ fn tool_invariants_collapse_fully_unanswered_assistant_call() {
         converted[0].tool_calls.is_none(),
         "fully-unanswered tool_calls must be dropped"
     );
-    assert_eq!(converted[0].content.as_deref(), Some("on it"));
+    assert_eq!(
+        serde_json::to_value(&converted[0].content).unwrap(),
+        serde_json::json!("on it")
+    );
 }
 
 /// Regression guard: a well-formed tool cycle is passed through untouched —
@@ -1134,7 +2122,7 @@ fn enforce_invariants_clears_reasoning_when_assistant_collapses_to_text() {
     let messages = vec![
         NativeMessage {
             role: "assistant".to_string(),
-            content: Some("partial thought".to_string()),
+            content: Some("partial thought".into()),
             tool_call_id: None,
             tool_calls: Some(vec![ToolCall {
                 id: Some("orphan_call".to_string()),
@@ -1143,13 +2131,14 @@ fn enforce_invariants_clears_reasoning_when_assistant_collapses_to_text() {
                     name: Some("web_fetch".to_string()),
                     arguments: Some(serde_json::Value::String("{}".to_string())),
                 }),
+                extra_content: None,
             }]),
             reasoning_content: Some("deep reasoning".to_string()),
         },
         // No tool result follows — the tool_calls are orphaned.
         NativeMessage {
             role: "user".to_string(),
-            content: Some("next question".to_string()),
+            content: Some("next question".into()),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
@@ -1292,6 +2281,78 @@ fn capabilities_reports_native_tool_calling() {
     let p = make_provider("test", "https://example.com", None);
     let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
     assert!(caps.native_tool_calling);
+    assert!(caps.vision);
+}
+
+// Sub-issue 3 of #3098: Ollama's OpenAI-compat endpoint silently rejects the
+// `tools` parameter for many models, so we must let the factory opt the
+// Ollama provider out of native tool calling. The agent harness then falls
+// back to prompt-guided tool specs (embedded in the system prompt) which
+// any chat model can follow. The builder defaults to enabled so cloud
+// providers (OpenAI, BYOK slugs, OpenHuman backend) are unaffected.
+
+#[test]
+fn with_native_tool_calling_false_disables_capability() {
+    let p = make_provider("test", "https://example.com", None).with_native_tool_calling(false);
+    let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+    assert!(
+        !caps.native_tool_calling,
+        "capabilities() must mirror the builder override; this is the gate the agent harness uses to decide between native vs prompt-guided tool specs"
+    );
+}
+
+#[test]
+fn with_native_tool_calling_true_preserves_default() {
+    let p = make_provider("test", "https://example.com", None).with_native_tool_calling(true);
+    let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+    assert!(caps.native_tool_calling);
+}
+
+#[test]
+fn with_native_tool_calling_is_idempotent() {
+    let p = make_provider("test", "https://example.com", None)
+        .with_native_tool_calling(false)
+        .with_native_tool_calling(false);
+    let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+    assert!(!caps.native_tool_calling);
+}
+
+#[test]
+fn with_vision_false_disables_capability() {
+    let p = make_provider("test", "https://example.com", None).with_vision(false);
+    let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+    assert!(!caps.vision);
+    assert!(!p.supports_vision());
+}
+
+/// `supports_native_tools()` is the gate the agent harness reads
+/// (`traits.rs:415`) when deciding whether to send tools natively or
+/// inject them into the prompt. It MUST agree with
+/// `capabilities().native_tool_calling`; otherwise
+/// `with_native_tool_calling(false)` silently fails to switch to
+/// prompt-guided and Ollama still receives a `tools` array (the exact
+/// regression sub-issue 3 of #3098 was meant to fix).
+#[test]
+fn supports_native_tools_mirrors_capabilities_flag() {
+    let default = make_provider("test", "https://example.com", None);
+    assert_eq!(
+        default.supports_native_tools(),
+        <OpenAiCompatibleProvider as Provider>::capabilities(&default).native_tool_calling,
+        "default provider: the two capability signals must match"
+    );
+    assert!(default.supports_native_tools(), "default must remain true");
+
+    let opted_out =
+        make_provider("test", "https://example.com", None).with_native_tool_calling(false);
+    assert_eq!(
+        opted_out.supports_native_tools(),
+        <OpenAiCompatibleProvider as Provider>::capabilities(&opted_out).native_tool_calling,
+        "after with_native_tool_calling(false): the two capability signals must match"
+    );
+    assert!(
+        !opted_out.supports_native_tools(),
+        "after with_native_tool_calling(false), supports_native_tools must report false so the harness picks the prompt-guided fallback"
+    );
 }
 
 #[test]
@@ -1334,7 +2395,7 @@ fn request_serializes_with_tools() {
         model: "test-model".to_string(),
         messages: vec![Message {
             role: "user".to_string(),
-            content: "What is the weather?".to_string(),
+            content: "What is the weather?".into(),
         }],
         temperature: Some(0.7),
         stream: Some(false),
@@ -1418,6 +2479,7 @@ fn response_with_tool_call_object_arguments_deserializes() {
                     name: Some("get_weather".to_string()),
                     arguments: Some(serde_json::json!({"location":"London","unit":"c"})),
                 }),
+                extra_content: None,
             }]),
             function_call: None,
         }),
@@ -1717,6 +2779,36 @@ fn reasoning_alias_captured_in_stream_delta() {
     );
 }
 
+/// Regression for Sentry TAURI-RUST-A5N: a provider that emits BOTH `reasoning`
+/// and `reasoning_content` in the same message object must not fail with
+/// `duplicate field \`reasoning_content\``. Both keys deserialize and fold into
+/// the canonical field, which wins when both are present.
+#[test]
+fn reasoning_and_reasoning_content_both_present_does_not_error() {
+    let json = r#"{"choices":[{"message":{"content":null,"reasoning":"alias cot","reasoning_content":"canonical cot"}}]}"#;
+    let resp: ApiChatResponse = serde_json::from_str(json)
+        .expect("both reasoning keys must parse without a duplicate-field error");
+    assert_eq!(
+        resp.choices[0].message.reasoning_content.as_deref(),
+        Some("canonical cot"),
+        "canonical reasoning_content wins when both keys are present"
+    );
+}
+
+/// Same regression on the streaming delta path (TAURI-RUST-A5N also hits the
+/// native stream parser at `compatible_stream_native.rs`).
+#[test]
+fn reasoning_and_reasoning_content_both_present_in_stream_delta_does_not_error() {
+    let json = r#"{"choices":[{"delta":{"reasoning":"alias cot","reasoning_content":"canonical cot"},"finish_reason":null}]}"#;
+    let chunk: StreamChunkResponse = serde_json::from_str(json)
+        .expect("both reasoning keys must parse without a duplicate-field error");
+    assert_eq!(
+        chunk.choices[0].delta.reasoning_content.as_deref(),
+        Some("canonical cot"),
+        "canonical reasoning_content wins when both keys are present"
+    );
+}
+
 /// End-to-end: a tool-call turn whose reasoning arrived under the `reasoning`
 /// alias must still be surfaced by `parse_native_response` so the agent loop
 /// can replay it on the follow-up request (the issue #3094 failure path).
@@ -2000,7 +3092,7 @@ fn convert_messages_for_native_no_reasoning_content_stays_none() {
 fn native_message_reasoning_content_omitted_when_none() {
     let msg = NativeMessage {
         role: "assistant".to_string(),
-        content: Some("hello".to_string()),
+        content: Some("hello".into()),
         tool_call_id: None,
         tool_calls: None,
         reasoning_content: None,
@@ -2018,7 +3110,7 @@ fn native_message_reasoning_content_omitted_when_none() {
 fn native_message_reasoning_content_present_when_some() {
     let msg = NativeMessage {
         role: "assistant".to_string(),
-        content: Some("hello".to_string()),
+        content: Some("hello".into()),
         tool_call_id: None,
         tool_calls: None,
         reasoning_content: Some("I thought carefully.".to_string()),
@@ -2108,4 +3200,587 @@ fn convert_tool_specs_dedups_many_duplicates() {
         .map(|t| t["function"]["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, vec!["x", "y", "z"]);
+}
+
+// ── #3193: completion-only model 404 detection + actionable message ──────────
+
+#[test]
+fn completion_only_model_404_detected_from_openai_signature() {
+    // The exact body OpenAI returns when a completion-only/base model is sent
+    // to /v1/chat/completions.
+    let body = "This is not a chat model and thus not supported in the \
+                v1/chat/completions endpoint. Did you mean to use v1/completions?";
+    assert!(OpenAiCompatibleProvider::is_completion_only_model_404(
+        reqwest::StatusCode::NOT_FOUND,
+        body
+    ));
+}
+
+#[test]
+fn completion_only_model_404_ignores_ordinary_not_found() {
+    // A "model does not exist" 404 must NOT be misclassified — it should keep
+    // its existing fallback / enrich behaviour, not get the completion-only
+    // message.
+    let body = "The model `gpt-9o` does not exist or you do not have access to it.";
+    assert!(!OpenAiCompatibleProvider::is_completion_only_model_404(
+        reqwest::StatusCode::NOT_FOUND,
+        body
+    ));
+}
+
+#[test]
+fn completion_only_model_404_requires_404_status() {
+    // Same phrasing under a non-404 status is not the completion-only case.
+    let body = "not a chat model";
+    assert!(!OpenAiCompatibleProvider::is_completion_only_model_404(
+        reqwest::StatusCode::BAD_REQUEST,
+        body
+    ));
+}
+
+#[test]
+fn completion_only_message_names_model_and_remediation() {
+    let p = make_provider("openhuman", "https://api.example.com/v1", Some("k"));
+    let msg = p.completion_only_model_message(
+        "davinci-002",
+        "This is not a chat model ... Did you mean to use v1/completions?",
+    );
+    assert!(
+        msg.contains("davinci-002"),
+        "names the offending model: {msg}"
+    );
+    assert!(
+        msg.contains("completion-only") && msg.contains("chat-completions"),
+        "explains the capability mismatch: {msg}"
+    );
+    assert!(
+        msg.contains("chat-capable model"),
+        "states the remediation: {msg}"
+    );
+}
+
+#[test]
+fn completion_only_404_guard_fires_only_on_signature() {
+    let p = make_provider("openhuman", "https://api.example.com/v1", Some("k"));
+    // Matches → Some(actionable error).
+    let hit = p.completion_only_404_guard(
+        reqwest::StatusCode::NOT_FOUND,
+        "This is not a chat model. Did you mean to use v1/completions?",
+        "davinci-002",
+    );
+    let err = hit.expect("guard should fire on the completion-only signature");
+    assert!(err.to_string().contains("davinci-002"));
+    // Ordinary not-found → None (normal fallback/enrich path is preserved).
+    assert!(p
+        .completion_only_404_guard(
+            reqwest::StatusCode::NOT_FOUND,
+            "The model `gpt-9o` does not exist.",
+            "gpt-9o"
+        )
+        .is_none());
+}
+
+#[tokio::test]
+async fn completion_only_404_fails_fast_without_responses_fallback() {
+    // End-to-end over the wire: a completion-only 404 must short-circuit with
+    // the actionable message and NOT attempt /v1/responses (not mounted here —
+    // if the guard regressed, the error would instead read "responses fallback
+    // failed"). Provider has the fallback ENABLED (default `new`), proving the
+    // guard pre-empts it. #3193.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": {
+                "message": "This is not a chat model and thus not supported in the \
+                            v1/chat/completions endpoint. Did you mean to use v1/completions?",
+                "type": "invalid_request_error"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(
+        "openhuman",
+        &format!("{}/v1", server.uri()),
+        Some("key"),
+        AuthStyle::Bearer,
+    );
+
+    let err = provider
+        .chat_with_history(&[ChatMessage::user("write a file")], "davinci-002", 0.0)
+        .await
+        .expect_err("completion-only model must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("davinci-002") && msg.contains("chat-capable model"),
+        "expected actionable completion-only message, got: {msg}"
+    );
+    assert!(
+        !msg.contains("responses fallback failed"),
+        "guard must pre-empt the responses fallback, got: {msg}"
+    );
+}
+
+// ── TAURI-RUST-4P6: embedding model picked as chat model → 400 ───────────────
+
+#[test]
+fn not_chat_capable_detected_from_ollama_400() {
+    // Verbatim Ollama wire body when an embedding model (bge-m3) is used as
+    // the chat model. Sentry issue 5338.
+    let body = r#"{"error":{"message":"\"bge-m3:latest\" does not support chat","type":"invalid_request_error","param":null,"code":null}}"#;
+    assert!(OpenAiCompatibleProvider::is_not_chat_capable_model(
+        reqwest::StatusCode::BAD_REQUEST,
+        body
+    ));
+    // Some compatible backends use 422 for the same class.
+    assert!(OpenAiCompatibleProvider::is_not_chat_capable_model(
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        body
+    ));
+}
+
+#[test]
+fn not_chat_capable_requires_4xx_status() {
+    // The exact phrase under a non-4xx status is not this case — let other
+    // handling deal with 404/5xx so we don't shadow real failures.
+    let body = "\"bge-m3:latest\" does not support chat";
+    assert!(!OpenAiCompatibleProvider::is_not_chat_capable_model(
+        reqwest::StatusCode::NOT_FOUND,
+        body
+    ));
+    assert!(!OpenAiCompatibleProvider::is_not_chat_capable_model(
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        body
+    ));
+}
+
+#[test]
+fn not_chat_capable_ignores_unrelated_400() {
+    // An ordinary 400 with no "does not support chat" phrase must keep its
+    // normal enrich/handling path.
+    assert!(!OpenAiCompatibleProvider::is_not_chat_capable_model(
+        reqwest::StatusCode::BAD_REQUEST,
+        "invalid temperature: only 1 is allowed for this model"
+    ));
+}
+
+#[test]
+fn not_chat_capable_message_names_model_remediation_and_keeps_phrase() {
+    let p = make_provider("ollama", "http://127.0.0.1:11434/v1", None);
+    let msg = p.not_chat_capable_model_message(
+        "bge-m3:latest",
+        r#"{"error":{"message":"\"bge-m3:latest\" does not support chat"}}"#,
+    );
+    assert!(msg.contains("bge-m3:latest"), "names the model: {msg}");
+    assert!(
+        msg.contains("chat-capable model"),
+        "states the remediation: {msg}"
+    );
+    // CRITICAL: the actionable rewrite must still carry the upstream phrase so
+    // the re-reported error stays demoted by the config-rejection classifier
+    // (otherwise the 36.6k Sentry events come back). See TAURI-RUST-4P6.
+    assert!(
+        msg.to_lowercase().contains("does not support chat"),
+        "must preserve the classifier anchor phrase: {msg}"
+    );
+    assert!(
+        super::super::is_provider_config_rejection_message(&msg),
+        "enriched message must classify as a provider config-rejection: {msg}"
+    );
+}
+
+#[test]
+fn not_chat_capable_guard_fires_only_on_signature() {
+    let p = make_provider("ollama", "http://127.0.0.1:11434/v1", None);
+    let hit = p.not_chat_capable_guard(
+        reqwest::StatusCode::BAD_REQUEST,
+        "\"bge-m3:latest\" does not support chat",
+        "bge-m3:latest",
+    );
+    assert!(hit
+        .expect("guard should fire on the does-not-support-chat 400")
+        .to_string()
+        .contains("bge-m3:latest"));
+    // Unrelated 400 → None (normal handling preserved).
+    assert!(p
+        .not_chat_capable_guard(
+            reqwest::StatusCode::BAD_REQUEST,
+            "rate limit exceeded",
+            "bge-m3:latest"
+        )
+        .is_none());
+}
+
+#[tokio::test]
+async fn not_chat_capable_400_fails_fast_with_actionable_message() {
+    // End-to-end over the wire: an embedding model used as chat 400s, and the
+    // guard must short-circuit with the actionable message rather than the
+    // opaque upstream JSON. TAURI-RUST-4P6.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {
+                "message": "\"bge-m3:latest\" does not support chat",
+                "type": "invalid_request_error",
+                "param": null,
+                "code": null
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new(
+        "ollama",
+        &format!("{}/v1", server.uri()),
+        // Dummy key only to clear the pre-flight credential gate; the mock
+        // ignores auth. Real Ollama is keyless, but the provider requires a
+        // non-empty credential before dispatching.
+        Some("x"),
+        AuthStyle::Bearer,
+    );
+
+    let err = provider
+        .chat_with_history(&[ChatMessage::user("hello")], "bge-m3:latest", 0.0)
+        .await
+        .expect_err("embedding-model-as-chat must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bge-m3:latest") && msg.contains("chat-capable model"),
+        "expected actionable does-not-support-chat message, got: {msg}"
+    );
+    // And it must remain demotable — Sentry suppression depends on it.
+    assert!(
+        super::super::is_provider_config_rejection_message(&msg),
+        "bubbled error must classify as config-rejection, got: {msg}"
+    );
+}
+
+// ── #3205: multimodal [IMAGE:] markers → OpenAI image_url content parts ─────────
+
+const TEST_PNG_DATA_URI: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+/// Text with no markers stays the plain-string `content` arm — byte-identical
+/// to the legacy wire shape so every non-attachment turn is unaffected.
+#[test]
+fn message_content_text_only_serializes_as_string() {
+    let content = MessageContent::from_chat_text("just a normal message");
+    let json = serde_json::to_value(&content).unwrap();
+    assert_eq!(json, serde_json::json!("just a normal message"));
+}
+
+/// A user message carrying one `[IMAGE:data-uri]` marker is promoted to the
+/// OpenAI `content` array: a `text` part followed by an `image_url` part.
+#[test]
+fn message_content_text_plus_image_serializes_as_parts() {
+    let raw = format!("what is in this picture? [IMAGE:{TEST_PNG_DATA_URI}]");
+    let json = serde_json::to_value(MessageContent::from_chat_text(&raw)).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!([
+            { "type": "text", "text": "what is in this picture?" },
+            { "type": "image_url", "image_url": { "url": TEST_PNG_DATA_URI } },
+        ])
+    );
+}
+
+/// An image with no accompanying text emits only the `image_url` part.
+#[test]
+fn message_content_image_only_omits_empty_text_part() {
+    let raw = format!("[IMAGE:{TEST_PNG_DATA_URI}]");
+    let json = serde_json::to_value(MessageContent::from_chat_text(&raw)).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!([
+            { "type": "image_url", "image_url": { "url": TEST_PNG_DATA_URI } },
+        ])
+    );
+}
+
+/// Multiple markers become multiple `image_url` parts, with the text between
+/// them preserved in authored order (not collapsed before the images).
+#[test]
+fn message_content_multiple_images_serialize_in_order() {
+    let raw = format!("compare [IMAGE:{TEST_PNG_DATA_URI}] and [IMAGE:https://example.com/b.jpg]");
+    let json = serde_json::to_value(MessageContent::from_chat_text(&raw)).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!([
+            { "type": "text", "text": "compare" },
+            { "type": "image_url", "image_url": { "url": TEST_PNG_DATA_URI } },
+            { "type": "text", "text": "and" },
+            { "type": "image_url", "image_url": { "url": "https://example.com/b.jpg" } },
+        ])
+    );
+}
+
+/// Interleaved order is preserved exactly — an image-first prompt keeps the
+/// image before the trailing text (CodeRabbit #3268).
+#[test]
+fn message_content_preserves_image_first_then_text_order() {
+    let raw = format!("[IMAGE:{TEST_PNG_DATA_URI}] then explain");
+    let json = serde_json::to_value(MessageContent::from_chat_text(&raw)).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!([
+            { "type": "image_url", "image_url": { "url": TEST_PNG_DATA_URI } },
+            { "type": "text", "text": "then explain" },
+        ])
+    );
+}
+
+/// Request-level: a chat history with an image-bearing user turn serialises the
+/// full body with a string `system` content and an array `user` content.
+#[test]
+fn api_chat_request_mixes_string_and_array_content() {
+    let req = ApiChatRequest {
+        model: "gpt-4o".to_string(),
+        messages: vec![
+            Message {
+                role: "system".to_string(),
+                content: "You are helpful.".into(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::from_chat_text(&format!(
+                    "describe this [IMAGE:{TEST_PNG_DATA_URI}]"
+                )),
+            },
+        ],
+        temperature: None,
+        stream: None,
+        tools: None,
+        tool_choice: None,
+    };
+    let json = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        json["messages"][0]["content"],
+        serde_json::json!("You are helpful.")
+    );
+    assert_eq!(
+        json["messages"][1]["content"],
+        serde_json::json!([
+            { "type": "text", "text": "describe this" },
+            { "type": "image_url", "image_url": { "url": TEST_PNG_DATA_URI } },
+        ])
+    );
+}
+
+/// The agent streaming path runs history through `convert_messages_for_native`;
+/// an image marker must survive into the `NativeMessage` array content while
+/// plain turns stay strings.
+#[test]
+fn convert_messages_for_native_promotes_image_marker() {
+    let history = vec![
+        ChatMessage::system("be brief"),
+        ChatMessage::user(&format!("look [IMAGE:{TEST_PNG_DATA_URI}]")),
+    ];
+    let native = OpenAiCompatibleProvider::convert_messages_for_native(&history);
+    assert_eq!(
+        serde_json::to_value(&native[0]).unwrap()["content"],
+        serde_json::json!("be brief")
+    );
+    assert_eq!(
+        serde_json::to_value(&native[1]).unwrap()["content"],
+        serde_json::json!([
+            { "type": "text", "text": "look" },
+            { "type": "image_url", "image_url": { "url": TEST_PNG_DATA_URI } },
+        ])
+    );
+}
+
+#[test]
+fn stream_repeat_detector_trips_at_threshold() {
+    let mut d = StreamRepeatDetector::new();
+    // The degenerate pattern: one substantial sentence emitted with blank
+    // separators, over and over (exactly what we observed, 234×).
+    let chunk =
+        "Now I have a complete understanding. Let me also check the llm.rs extraction logic.\n\n";
+    let mut tripped_at = 0;
+    for i in 1..=(STREAM_REPEAT_THRESHOLD + 3) {
+        if d.observe(chunk) {
+            tripped_at = i;
+            break;
+        }
+    }
+    assert_eq!(
+        tripped_at, STREAM_REPEAT_THRESHOLD,
+        "should trip exactly at the threshold, ignoring blank separators"
+    );
+}
+
+#[test]
+fn stream_repeat_detector_ignores_varied_and_short_lines() {
+    let mut d = StreamRepeatDetector::new();
+    // Distinct substantial lines never trip (real, progressing output).
+    for i in 0..20 {
+        assert!(
+            !d.observe(&format!(
+                "This is distinct analysis step number {i} of the task.\n"
+            )),
+            "varied lines must not trip"
+        );
+    }
+    // Short identical lines (e.g. code braces) are below the min length → no trip.
+    for _ in 0..20 {
+        assert!(!d.observe("}\n"), "short repeated lines must not trip");
+    }
+}
+
+// ── effective_context_window (#3550 / Sentry TAURI-RUST-6V0) ───────────────
+
+#[tokio::test]
+async fn effective_context_window_cloud_uses_static_table() {
+    // No local provider kind → static trained-max table, unchanged behavior.
+    let p = make_provider("openai", "https://api.openai.com/v1", Some("k"));
+    assert_eq!(p.effective_context_window("gpt-4o").await, Some(128_000));
+    // Unknown cloud model → None (skip trimming), as before.
+    assert_eq!(p.effective_context_window("totally-unknown").await, None);
+}
+
+#[tokio::test]
+async fn effective_context_window_lmstudio_uses_loaded_window() {
+    use crate::openhuman::inference::local::profile::LocalProviderKind;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v0/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"data":[{"id":"qwen2.5-7b","loaded_context_length":4096,"max_context_length":32768}]}"#,
+            "application/json",
+        ))
+        .mount(&server)
+        .await;
+    let p = OpenAiCompatibleProvider::new("lmstudio", &server.uri(), None, AuthStyle::None)
+        .with_local_provider_kind(LocalProviderKind::LmStudio);
+    // Trim to the runtime-loaded n_ctx (4096), NOT the model's trained max.
+    assert_eq!(p.effective_context_window("qwen2.5-7b").await, Some(4096));
+}
+
+#[tokio::test]
+async fn effective_context_window_lmstudio_falls_back_when_native_unavailable() {
+    use crate::openhuman::inference::local::profile::LocalProviderKind;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v0/models"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let p = OpenAiCompatibleProvider::new("lmstudio", &server.uri(), None, AuthStyle::None)
+        .with_local_provider_kind(LocalProviderKind::LmStudio);
+    // Native probe fails → fall back to the LM Studio profile default (8192),
+    // so unknown local models still get trimmed instead of skipped.
+    assert_eq!(
+        p.effective_context_window("unknown-local-model").await,
+        Some(8_192)
+    );
+}
+
+// ----------------------------------------------------------
+// Prompt-cache capability model (#3939)
+// ----------------------------------------------------------
+
+#[test]
+fn prompt_cache_caps_openai_style_for_known_slugs() {
+    for slug in ["openai", "openrouter", "gmi"] {
+        let caps = super::prompt_cache_for_compatible_slug(slug);
+        assert!(
+            caps.automatic_prefix_cache,
+            "{slug} should advertise automatic prefix cache"
+        );
+        assert!(
+            caps.usage_reports_cached_input,
+            "{slug} should report cached input tokens"
+        );
+        assert!(
+            !caps.explicit_cache_control,
+            "OpenAI-compatible chat API has no cache-control field"
+        );
+        assert!(
+            !caps.cache_key_grouping,
+            "thread/session grouping is OpenHuman-backend-only"
+        );
+    }
+}
+
+#[test]
+fn prompt_cache_caps_match_slug_family_variants() {
+    // Case-insensitive, leading-segment family match so renamed/suffixed slugs
+    // still resolve to the verified family.
+    for slug in ["OpenAI", "openai:gpt-5.1", "openai/responses", "openai-eu"] {
+        let caps = super::prompt_cache_for_compatible_slug(slug);
+        assert!(
+            caps.automatic_prefix_cache && caps.usage_reports_cached_input,
+            "{slug} should resolve to the openai family"
+        );
+    }
+}
+
+#[test]
+fn prompt_cache_caps_conservative_for_unknown_or_custom_slugs() {
+    // Custom / local / unverified providers must not advertise caching — they
+    // get the all-false default so we never send or assume unsupported behaviour.
+    let conservative =
+        crate::openhuman::inference::provider::traits::PromptCacheCapabilities::default();
+    for slug in ["custom_openai", "lmstudio", "deepseek", "mystery-proxy", ""] {
+        assert_eq!(
+            super::prompt_cache_for_compatible_slug(slug),
+            conservative,
+            "{slug} must stay conservative"
+        );
+    }
+}
+
+#[test]
+fn compatible_provider_declares_prompt_cache_from_its_slug() {
+    let conservative =
+        crate::openhuman::inference::provider::traits::PromptCacheCapabilities::default();
+
+    let openai = make_provider("openai", "https://api.openai.com", Some("k"));
+    let caps = openai.prompt_cache_capabilities();
+    assert!(
+        caps.automatic_prefix_cache && caps.usage_reports_cached_input,
+        "openai provider must advertise OpenAI-style caching"
+    );
+
+    let custom = make_provider("custom_openai", "https://proxy.example", Some("k"));
+    assert_eq!(
+        custom.prompt_cache_capabilities(),
+        conservative,
+        "unknown custom provider must stay conservative"
+    );
+}
+
+#[test]
+fn extract_usage_normalizes_openai_cached_prompt_tokens() {
+    // Regression: an OpenAI-compatible usage block carrying cached prefix tokens
+    // (`prompt_tokens_details.cached_tokens`) must normalize into
+    // `UsageInfo.cached_input_tokens` so cached-prefix cost accounting is exact.
+    let json = r#"{
+        "choices":[{"message":{"role":"assistant","content":"hi"}}],
+        "usage":{"prompt_tokens":1000,"completion_tokens":20,"total_tokens":1020,
+                 "prompt_tokens_details":{"cached_tokens":768}}
+    }"#;
+    let resp: ApiChatResponse = serde_json::from_str(json).expect("parse api response");
+    let usage = OpenAiCompatibleProvider::extract_usage(&resp).expect("usage present");
+    assert_eq!(usage.input_tokens, 1000);
+    assert_eq!(usage.output_tokens, 20);
+    assert_eq!(
+        usage.cached_input_tokens, 768,
+        "cached prefix tokens must be normalized into cached_input_tokens"
+    );
+}
+
+#[test]
+fn extract_usage_defaults_cached_tokens_to_zero_when_absent() {
+    // A provider that omits cache details must yield cached_input_tokens = 0,
+    // keeping cost accounting coherent (full prompt charged at the input rate).
+    let json = r#"{
+        "choices":[{"message":{"role":"assistant","content":"hi"}}],
+        "usage":{"prompt_tokens":500,"completion_tokens":10,"total_tokens":510}
+    }"#;
+    let resp: ApiChatResponse = serde_json::from_str(json).expect("parse api response");
+    let usage = OpenAiCompatibleProvider::extract_usage(&resp).expect("usage present");
+    assert_eq!(usage.cached_input_tokens, 0);
+    assert_eq!(usage.input_tokens, 500);
 }

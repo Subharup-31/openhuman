@@ -19,9 +19,9 @@ use openhuman_core::openhuman::inference::provider::{
 use openhuman_core::openhuman::memory::{
     Memory, MemoryCategory, MemoryEntry, NamespaceSummary, RecallOpts,
 };
-use openhuman_core::openhuman::skills::Skill;
 use openhuman_core::openhuman::subconscious::SourceChunk;
 use openhuman_core::openhuman::tools::{PermissionLevel, Tool, ToolResult};
+use openhuman_core::openhuman::workflows::ops_types::Workflow;
 use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::{HashSet, VecDeque};
@@ -240,7 +240,7 @@ fn prompt_context<'a>(
         model_name: "round26-model",
         agent_id: "round26-agent",
         tools,
-        skills: &[] as &[Skill],
+        workflows: &[] as &[Workflow],
         dispatcher_instructions: "round26 dispatcher instructions",
         learned: LearnedContextData {
             reflections: vec![
@@ -284,7 +284,6 @@ fn prompt_context<'a>(
             description: "Checks cold prompt paths".to_string(),
             memory_summary: Some("x".repeat(240)),
         }],
-        workflows: &[],
     }
 }
 
@@ -467,11 +466,15 @@ async fn builder_dedupes_visible_native_tools_and_seed_resume_bounds_history() -
         .messages
         .iter()
         .any(|msg| msg.role == "user" && msg.content == "falls back to user"));
+    // The live turn's user message is stamped with the per-turn
+    // `Current Date & Time:` line (#3602), so match by suffix rather than
+    // exact equality — the dedup contract (exactly one "current message"
+    // user turn after resume) still holds.
     assert_eq!(
         requests[0]
             .messages
             .iter()
-            .filter(|msg| msg.role == "user" && msg.content == "current message")
+            .filter(|msg| msg.role == "user" && msg.content.ends_with("current message"))
             .count(),
         1
     );

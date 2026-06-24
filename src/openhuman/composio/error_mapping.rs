@@ -14,6 +14,13 @@ pub enum ComposioErrorClass {
     /// matches it). Distinct so the user gets reconnect guidance. See #2913.
     TriggerPermission,
     RateLimited,
+    /// Composio answered the execute call with an HTTP 404/410 — the action
+    /// endpoint or slug is unknown (or the endpoint is deprecated/Gone), NOT a
+    /// broken connection. Distinct so the user is told their integration is
+    /// still connected and is **not** advised to re-authenticate a healthy
+    /// account. See #3219 (direct-mode sent the lowercase toolkit slug to the
+    /// wrong execute path → 404/410 → misclassified as [`Self::ComposioPlatform`]).
+    ActionNotFound,
     UpstreamProvider,
     ComposioPlatform,
     Gateway,
@@ -27,6 +34,7 @@ impl ComposioErrorClass {
             Self::InsufficientScope => "insufficient_scope",
             Self::TriggerPermission => "trigger_permission",
             Self::RateLimited => "rate_limited",
+            Self::ActionNotFound => "action_not_found",
             Self::UpstreamProvider => "upstream_provider",
             Self::ComposioPlatform => "composio_platform",
             Self::Gateway => "gateway",
@@ -37,7 +45,15 @@ impl ComposioErrorClass {
 
 pub fn classify_composio_error(tool: &str, message: &str) -> ComposioErrorClass {
     let lower = message.to_ascii_lowercase();
-    let class = if is_validation_shape(&lower) {
+    // EARLY status arm (#3219): a Composio HTTP 404/410 means the action
+    // endpoint/slug is unknown or deprecated — NOT a broken connection. It must
+    // win over the substring arms below, because the 404 body frequently carries
+    // the phrase "connection error, try to authenticate" that
+    // `is_composio_platform_shape` would otherwise match, telling the user to
+    // re-authenticate a perfectly healthy connection.
+    let class = if is_action_not_found_shape(&lower) {
+        ComposioErrorClass::ActionNotFound
+    } else if is_validation_shape(&lower) {
         ComposioErrorClass::Validation
     } else if is_insufficient_scope_shape(&lower) {
         ComposioErrorClass::InsufficientScope
@@ -74,6 +90,7 @@ pub fn format_provider_error(tool: &str, raw: &str) -> String {
         ComposioErrorClass::InsufficientScope => format_insufficient_scope_message(tool, detail),
         ComposioErrorClass::TriggerPermission => format_trigger_permission_message(tool),
         ComposioErrorClass::RateLimited => format_rate_limited_message(tool, detail),
+        ComposioErrorClass::ActionNotFound => format_action_not_found_message(tool),
         ComposioErrorClass::UpstreamProvider => {
             format!("`{tool}` failed at the connected provider: {detail}")
         }
@@ -101,6 +118,7 @@ pub fn remap_transport_error(tool: &str, raw: &str) -> String {
         ComposioErrorClass::InsufficientScope => format_insufficient_scope_message(tool, &detail),
         ComposioErrorClass::TriggerPermission => format_trigger_permission_message(tool),
         ComposioErrorClass::RateLimited => format_rate_limited_message(tool, &detail),
+        ComposioErrorClass::ActionNotFound => format_action_not_found_message(tool),
         ComposioErrorClass::Gateway => format!(
             "Temporary gateway error while calling `{tool}`: {}",
             summarize_gateway(raw)
@@ -121,12 +139,21 @@ fn prefix_class(class: ComposioErrorClass, body: &str) -> String {
     format!("[composio:error:{}] {}", class.as_str(), body)
 }
 
-fn format_insufficient_scope_message(tool: &str, detail: &str) -> String {
-    let toolkit = tool
-        .split('_')
+/// Derive the lowercase toolkit slug from a Composio tool/trigger identifier.
+///
+/// Identifiers are upper-snake-case (e.g. `GMAIL_NEW_GMAIL_MESSAGE`); the leading
+/// segment names the toolkit, so this returns e.g. `gmail`. `str::split('_').next()`
+/// always yields `Some(_)` for `&str` input (empty input yields `Some("")`), so
+/// `unwrap_or_default()` is a safe, equivalent terminator.
+fn derive_toolkit_slug(tool: &str) -> String {
+    tool.split('_')
         .next()
-        .unwrap_or("integration")
-        .to_ascii_lowercase();
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn format_insufficient_scope_message(tool: &str, detail: &str) -> String {
+    let toolkit = derive_toolkit_slug(tool);
     format!(
         "`{tool}` was rejected because the connected {toolkit} account is missing required \
          permissions ({detail}). Reconnect the integration in Settings → Connections → \
@@ -140,15 +167,28 @@ fn format_insufficient_scope_message(tool: &str, detail: &str) -> String {
 /// [`format_insufficient_scope_message`] does (e.g. `GMAIL_NEW_GMAIL_MESSAGE`
 /// → `gmail`), so the copy is branded and points the user at reconnecting.
 fn format_trigger_permission_message(tool: &str) -> String {
-    let toolkit = tool
-        .split('_')
-        .next()
-        .unwrap_or("integration")
-        .to_ascii_lowercase();
+    let toolkit = derive_toolkit_slug(tool);
     format!(
         "Couldn't enable this trigger: the connected {toolkit} account doesn't have \
          permission to manage triggers. Reconnect {toolkit} in Settings → Connections → \
          {toolkit} and grant the permissions requested during OAuth, then try again."
+    )
+}
+
+/// Build the action-not-found guidance (issue #3219).
+///
+/// Deliberately does **not** echo the raw provider `detail`: a Composio 404
+/// body often literally reads "connection error, try to authenticate", and
+/// surfacing that verbatim would re-introduce the exact misleading re-auth
+/// nudge this class exists to suppress. The raw text is still captured in the
+/// `tracing::debug!` line in [`classify_composio_error`] for diagnosis.
+fn format_action_not_found_message(tool: &str) -> String {
+    let toolkit = derive_toolkit_slug(tool);
+    format!(
+        "`{tool}` couldn't run: Composio reported this action as not found. Your {toolkit} \
+         integration is still connected and working — this is not a sign-in problem. The action \
+         name is likely out of date or Composio's API changed; try again with the current action \
+         name, or report this if it keeps happening."
     )
 }
 
@@ -205,6 +245,17 @@ fn is_rate_limited_shape(lower: &str) -> bool {
         || lower.contains("429")
 }
 
+/// True when the message carries a Composio HTTP 404 or 410 status (#3219).
+///
+/// Both `response_error` shapes (`HTTP 404` and `HTTP 404: <body>`) and the
+/// wrapped v3/v2 fallback string keep the literal `HTTP <code>` token, so a
+/// substring scan is reliable. Scoped to 404 (action/endpoint unknown) and 410
+/// (endpoint Gone/deprecated) on purpose — other 4xx/5xx keep their existing
+/// validation / scope / rate-limit / gateway classifications.
+fn is_action_not_found_shape(lower: &str) -> bool {
+    lower.contains("http 404") || lower.contains("http 410")
+}
+
 fn is_composio_platform_shape(lower: &str) -> bool {
     lower.contains("connection error, try to authenticate")
         || lower.contains("not enabled")
@@ -227,6 +278,7 @@ fn is_embedded_provider_failure(lower: &str) -> bool {
         || is_insufficient_scope_shape(lower)
         || is_trigger_permission_shape(lower)
         || is_rate_limited_shape(lower)
+        || is_action_not_found_shape(lower)
         || is_composio_platform_shape(lower)
         || lower.contains("composio")
         || lower.contains("google")

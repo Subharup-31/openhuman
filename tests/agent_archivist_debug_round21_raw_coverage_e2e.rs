@@ -223,6 +223,7 @@ fn tool_response(name: &str, arguments: serde_json::Value) -> ChatResponse {
             id: "round21-call".to_string(),
             name: name.to_string(),
             arguments: arguments.to_string(),
+            extra_content: None,
         }],
         usage: None,
         reasoning_content: Some("scripted tool use".to_string()),
@@ -241,6 +242,7 @@ fn definition(max_iterations: usize) -> AgentDefinition {
         omit_skills_catalog: true,
         omit_profile: true,
         omit_memory_md: true,
+        trigger_memory_agent: Default::default(),
         model: ModelSpec::Inherit,
         temperature: 0.0,
         tools: ToolScope::Named(vec!["echo".to_string()]),
@@ -264,15 +266,24 @@ fn parent_context(workspace: &Path, provider: Arc<ScriptedProvider>) -> ParentEx
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
     let specs = tools.iter().map(|tool| tool.spec()).collect();
     ParentExecutionContext {
+        agent_definition_id: "orchestrator".into(),
+        allowed_subagent_ids: [
+            "test".to_string(),
+            "archivist".to_string(),
+            "summarizer".to_string(),
+        ]
+        .into_iter()
+        .collect(),
         provider,
         all_tools: Arc::new(tools),
         all_tool_specs: Arc::new(specs),
+        visible_tool_names: std::collections::HashSet::new(),
         model_name: "round21-parent-model".to_string(),
         temperature: 0.0,
         workspace_dir: workspace.to_path_buf(),
         memory: Arc::new(StubMemory),
         agent_config: AgentConfig::default(),
-        skills: Arc::new(Vec::new()),
+        workflows: Arc::new(Vec::new()),
         memory_context: Arc::new(Some("parent memory".to_string())),
         session_id: "round21-parent-session".to_string(),
         channel: "round21-channel".to_string(),
@@ -281,6 +292,7 @@ fn parent_context(workspace: &Path, provider: Arc<ScriptedProvider>) -> ParentEx
         session_key: "1700000000_round21_parent".to_string(),
         session_parent_prefix: None,
         on_progress: None,
+        run_queue: None,
     }
 }
 

@@ -91,6 +91,18 @@ pub enum AgentProgress {
         iterations: u32,
         /// Character length of the sub-agent's final assistant text.
         output_chars: usize,
+        /// Absolute path to the worker's isolated `git worktree` checkout,
+        /// when it ran with `isolation = "worktree"` (#3376). `None` for
+        /// non-isolated (read-only / shared-workspace) workers.
+        worktree_path: Option<String>,
+        /// Files (relative to the worktree root) the worker changed, snapshot
+        /// from `git status` after the run. Empty for non-isolated workers or
+        /// a clean worktree.
+        changed_files: Vec<String>,
+        /// Whether the worker's worktree had uncommitted changes after the
+        /// run. A dirty worktree must not be auto-removed — surfaced so the UI
+        /// can require an explicit user decision. `None` for non-isolated.
+        dirty_status: Option<bool>,
     },
 
     /// A sub-agent failed.
@@ -137,6 +149,10 @@ pub enum AgentProgress {
         task_id: String,
         call_id: String,
         tool_name: String,
+        /// Full arguments the child invoked the tool with, so the parent
+        /// thread's UI can show *what exactly* the sub-agent did (not just
+        /// the tool name). Mirrors the top-level `ToolCallStarted.arguments`.
+        arguments: serde_json::Value,
         /// 1-based child iteration index this call belongs to.
         iteration: u32,
     },
@@ -149,6 +165,10 @@ pub enum AgentProgress {
         tool_name: String,
         success: bool,
         output_chars: usize,
+        /// Full text the tool returned, so the UI can show the sub-agent's
+        /// actual result/output. `output_chars` is kept as a cheap size hint
+        /// for consumers that only want the length.
+        output: String,
         elapsed_ms: u64,
         /// 1-based child iteration index.
         iteration: u32,

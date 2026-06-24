@@ -190,6 +190,7 @@ impl Memory for StaticMemory {
             timestamp: "2026-05-29T00:00:00Z".to_string(),
             session_id: session_id.map(str::to_string),
             score: Some(0.95),
+            taint: Default::default(),
         });
         Ok(())
     }
@@ -486,6 +487,7 @@ fn native_tool_response(id: &str, name: &str, args: serde_json::Value) -> ChatRe
             id: id.to_string(),
             name: name.to_string(),
             arguments: args.to_string(),
+            extra_content: None,
         }],
         usage: Some(UsageInfo {
             input_tokens: 21,
@@ -755,6 +757,7 @@ async fn turn_xml_failures_checkpoint_policy_visibility_and_hooks_are_publicly_e
                 timestamp: "2026-05-29T00:00:00Z".to_string(),
                 session_id: None,
                 score: Some(0.9),
+                taint: Default::default(),
             }]),
             fail_recall: true,
         }))
@@ -887,9 +890,17 @@ async fn subagent_runner_parent_context_filters_tools_caps_output_and_reports_er
     ];
     let all_specs = all_tools.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
     let parent = ParentExecutionContext {
+        agent_definition_id: "orchestrator".into(),
+        allowed_subagent_ids: [
+            "round17_child".to_string(),
+            "round17_provider_error".to_string(),
+        ]
+        .into_iter()
+        .collect(),
         provider: provider.clone(),
         all_tools: Arc::new(all_tools),
         all_tool_specs: Arc::new(all_specs),
+        visible_tool_names: std::collections::HashSet::new(),
         model_name: "parent-model".to_string(),
         temperature: 0.22,
         workspace_dir: workspace_path.clone(),
@@ -898,7 +909,7 @@ async fn subagent_runner_parent_context_filters_tools_caps_output_and_reports_er
             max_tool_iterations: 5,
             ..AgentConfig::default()
         },
-        skills: Arc::new(Vec::new()),
+        workflows: Arc::new(Vec::new()),
         memory_context: Arc::new(Some("parent memory context".to_string())),
         session_id: "round17-parent-session".to_string(),
         channel: "round17-parent-channel".to_string(),
@@ -907,6 +918,7 @@ async fn subagent_runner_parent_context_filters_tools_caps_output_and_reports_er
         session_key: "123_parent".to_string(),
         session_parent_prefix: Some("root_ancestor".to_string()),
         on_progress: None,
+        run_queue: None,
     };
 
     let outcome = with_parent_context(parent.clone(), async {
@@ -1007,6 +1019,7 @@ fn definition(
         timeout_secs: None,
         sandbox_mode: SandboxMode::None,
         background: false,
+        trigger_memory_agent: Default::default(),
         subagents: Vec::new(),
         delegate_name: None,
         agent_tier: AgentTier::Worker,

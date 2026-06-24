@@ -34,7 +34,61 @@ pub(crate) async fn dispatch_subagent(
         }
     };
 
-    let parent_session = current_parent()
+    let parent_ctx = current_parent();
+    if let Some(ctx) = &parent_ctx {
+        if !ctx.allowed_subagent_ids.contains(&definition.id) {
+            log::warn!(
+                "[agent] blocked delegation via {}: parent={} requested={} allowed={:?}",
+                tool_name,
+                ctx.agent_definition_id,
+                definition.id,
+                ctx.allowed_subagent_ids
+            );
+            return Ok(ToolResult::error(format!(
+                "{tool_name}: agent '{}' is not in parent agent '{}' subagents.allowlist",
+                definition.id, ctx.agent_definition_id
+            )));
+        }
+    }
+
+    // ── Forward the current turn's attached image(s) to a vision sub-agent ──
+    // The orchestrator runs on a non-vision tier and keeps the user's image as a
+    // text placeholder (`[Image: … #att:<id>]`), so a delegated sub-agent would
+    // otherwise get a text-only task and report "no image". When the target
+    // sub-agent's model is vision-capable, prepend the placeholder(s) to its
+    // prompt so its own turn rehydrates the image from the on-disk sidecar.
+    let forwarded_prompt;
+    let prompt: &str = {
+        let images = crate::openhuman::agent::harness::turn_attachments_context::current_turn_image_placeholders();
+        let subagent_model = match model_override {
+            Some(m) => m.to_string(),
+            None => {
+                let parent_model = parent_ctx
+                    .as_ref()
+                    .map(|p| p.model_name.as_str())
+                    .unwrap_or("");
+                definition.model.resolve(parent_model)
+            }
+        };
+        if !images.is_empty()
+            && crate::openhuman::inference::provider::factory::oh_tier_supports_vision(
+                &subagent_model,
+            )
+        {
+            log::info!(
+                "[agent] forwarding {} image placeholder(s) to vision sub-agent '{}'",
+                images.len(),
+                agent_id
+            );
+            forwarded_prompt = format!("{}\n\n{}", images.join("\n"), prompt);
+            &forwarded_prompt
+        } else {
+            prompt
+        }
+    };
+
+    let parent_session = parent_ctx
+        .as_ref()
         .map(|p| p.session_id.clone())
         .unwrap_or_else(|| "standalone".into());
     let task_id = format!("sub-{}", uuid::Uuid::new_v4());
@@ -90,6 +144,8 @@ pub(crate) async fn dispatch_subagent(
         worker_thread_id: None,
         initial_history: None,
         checkpoint_dir: None,
+        worktree_action_dir: None,
+        run_queue: None,
     };
 
     match run_subagent(definition, prompt, options).await {
@@ -119,9 +175,28 @@ pub(crate) async fn dispatch_subagent(
                 agent_id: definition.id.clone(),
                 error: message.clone(),
             });
-            Ok(ToolResult::error(format!("{tool_name} failed: {message}")))
+            // Make the failure unmistakable to the orchestrator: the delegated
+            // task did NOT run, so it must not be reported as success or have
+            // its output fabricated. Without this guardrail a weak orchestrator
+            // can narrate a plausible success from the bare error text — the
+            // "hallucinated success" half of #3193 (e.g. claiming `run_code`
+            // wrote a file when the coding model 404'd and nothing executed).
+            Ok(ToolResult::error(format_subagent_failure(
+                tool_name, &message,
+            )))
         }
     }
+}
+
+/// Format a subagent-delegation failure so the orchestrator cannot mistake it
+/// for success. Kept as a standalone, side-effect-free fn so the exact wording
+/// is unit-testable without standing up a registry + failing model (#3193).
+fn format_subagent_failure(tool_name: &str, message: &str) -> String {
+    format!(
+        "{tool_name} failed and did not complete — no work was performed and no \
+         results were produced. Do NOT treat this as success or fabricate an \
+         output; report the failure to the user. Error: {message}"
+    )
 }
 
 #[cfg(test)]
@@ -160,6 +235,33 @@ mod tests {
         assert!(
             out.contains("registry not initialised") || out.contains("not found in registry"),
             "unexpected graceful-failure message: {out}"
+        );
+    }
+
+    #[test]
+    fn subagent_failure_envelope_forbids_fabricated_success() {
+        // #3193: a hard delegation failure (e.g. run_code's coding model
+        // 404ing) must be surfaced so the orchestrator cannot narrate a
+        // plausible success. The envelope states the task did not run, tells
+        // the model not to fabricate output, and preserves the root error.
+        let msg = format_subagent_failure(
+            "run_code",
+            "openhuman API error (404): model 'davinci-002' does not support \
+             the chat-completions API",
+        );
+        assert!(msg.contains("run_code failed"), "names the tool: {msg}");
+        assert!(
+            msg.contains("did not complete"),
+            "states no completion: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("do not treat this as success")
+                && msg.contains("fabricate"),
+            "warns against fabricated success: {msg}"
+        );
+        assert!(
+            msg.contains("davinci-002") && msg.contains("404"),
+            "preserves the root error: {msg}"
         );
     }
 }

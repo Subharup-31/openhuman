@@ -10,7 +10,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::api::models::socket::ConnectionStatus;
-use crate::core::event_bus::{publish_global, DomainEvent};
+use crate::core::event_bus::{publish_global, BackendMeetTurn, DomainEvent};
 use crate::openhuman::webhooks::WebhookRequest;
 
 use super::manager::{emit_server_event, emit_state_change, SharedState};
@@ -246,6 +246,180 @@ pub(super) fn handle_sio_event(
             if !channel_id.is_empty() {
                 publish_global(DomainEvent::DevicePeerOffline { channel_id });
             }
+        }
+
+        // ── Backend Meet Bot events ──────────────────────────────────────
+        "bot:joined" => {
+            let meet_url = data
+                .get("meetUrl")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let correlation_id = data
+                .get("correlationId")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            log::info!("[socket] bot:joined meet_url_len={}", meet_url.len());
+            publish_global(DomainEvent::BackendMeetJoined {
+                meet_url,
+                correlation_id,
+            });
+        }
+        "bot:left" => {
+            let reason = data
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let correlation_id = data
+                .get("correlationId")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            log::info!("[socket] bot:left reason={}", reason);
+            publish_global(DomainEvent::BackendMeetLeft {
+                reason,
+                correlation_id,
+            });
+        }
+        "bot:reply" => {
+            let transcript = data
+                .get("transcript")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let reply = data
+                .get("reply")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let emotion = data
+                .get("emotion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("neutral")
+                .to_string();
+            let correlation_id = data
+                .get("correlationId")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            log::info!(
+                "[socket] bot:reply reply_len={} emotion={}",
+                reply.len(),
+                emotion
+            );
+            publish_global(DomainEvent::BackendMeetReply {
+                transcript,
+                reply,
+                emotion,
+                correlation_id,
+            });
+        }
+        "bot:harness" => {
+            let transcript = data
+                .get("transcript")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let instruction = data
+                .get("instruction")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let emotion = data
+                .get("emotion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("neutral")
+                .to_string();
+            let correlation_id = data
+                .get("correlationId")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            log::info!(
+                "[socket] bot:harness instruction_len={} emotion={}",
+                instruction.len(),
+                emotion
+            );
+            publish_global(DomainEvent::BackendMeetHarness {
+                transcript,
+                instruction,
+                emotion,
+                correlation_id,
+            });
+        }
+        "bot:transcript" => {
+            let turns: Vec<BackendMeetTurn> = data
+                .get("turns")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let duration_ms = data.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0);
+            let correlation_id = data
+                .get("correlationId")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            log::info!(
+                "[socket] bot:transcript turns={} duration_ms={}",
+                turns.len(),
+                duration_ms
+            );
+            // Thread creation + memory ingest are handled by the
+            // MeetingEventSubscriber (agent_meetings/bus.rs) reacting to
+            // this event — no inline spawn needed.
+            publish_global(DomainEvent::BackendMeetTranscript {
+                turns,
+                duration_ms,
+                correlation_id,
+            });
+        }
+        "bot:in_call_request" => {
+            let correlation_id = data
+                .get("correlationId")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let speaker = data
+                .get("speaker")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown")
+                .to_string();
+            let command_text = data
+                .get("commandText")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let recent_transcript: Vec<BackendMeetTurn> = data
+                .get("recentTranscript")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let timestamp_ms = data
+                .get("timestampMs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            log::info!(
+                "[socket] bot:in_call_request speaker={} cmd_len={}",
+                speaker,
+                command_text.len()
+            );
+            publish_global(DomainEvent::BackendMeetInCallRequest {
+                correlation_id,
+                speaker,
+                command_text,
+                recent_transcript,
+                timestamp_ms,
+            });
+        }
+        "bot:error" => {
+            let error = data
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error")
+                .to_string();
+            let correlation_id = data
+                .get("correlationId")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            log::error!("[socket] bot:error: {}", error);
+            publish_global(DomainEvent::BackendMeetError {
+                error,
+                correlation_id,
+            });
         }
 
         // Channel inbound message — publish to event bus for ChannelInboundSubscriber

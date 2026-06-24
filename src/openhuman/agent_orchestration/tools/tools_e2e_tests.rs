@@ -36,7 +36,8 @@ async fn spawn_subagent_tool_runs_child_agent_e2e() {
                     "agent_id": "researcher",
                     "prompt": format!("Investigate {SPAWN_SUBAGENT_CANARY}"),
                     "context": "parent supplied context",
-                    "model": "test-model"
+                    "model": "test-model",
+                    "blocking": true
                 }))
                 .await
         },
@@ -106,6 +107,7 @@ async fn skill_delegation_tool_runs_integrations_agent_e2e() {
                 tools: Vec::new(),
                 gated_tools: Vec::new(),
                 connected: true,
+                connections: Vec::new(),
                 non_active_status: None,
             }],
         ),
@@ -161,7 +163,7 @@ async fn spawn_worker_thread_tool_persists_worker_thread_e2e() {
         conversations::list_threads(workspace.path().to_path_buf()).expect("worker threads");
     let worker = threads
         .iter()
-        .find(|thread| thread.labels.contains(&"worker".to_string()))
+        .find(|thread| thread.labels.contains(&"tasks".to_string()))
         .expect("worker thread was persisted");
     assert_eq!(worker.title, "Long delegated task");
 
@@ -180,15 +182,20 @@ fn parent_context(
     connected_integrations: Vec<ConnectedIntegration>,
 ) -> ParentExecutionContext {
     ParentExecutionContext {
+        agent_definition_id: "orchestrator".into(),
+        allowed_subagent_ids: ["researcher".to_string(), "integrations_agent".to_string()]
+            .into_iter()
+            .collect(),
         provider,
         all_tools: Arc::new(Vec::new()),
         all_tool_specs: Arc::new(Vec::new()),
+        visible_tool_names: std::collections::HashSet::new(),
         model_name: "test-model".into(),
         temperature: 0.2,
         workspace_dir: workspace_dir.to_path_buf(),
         memory: Arc::new(NoopMemory),
         agent_config: Default::default(),
-        skills: Arc::new(Vec::new()),
+        workflows: Arc::new(Vec::new()),
         memory_context: Arc::new(None),
         session_id: "tools-e2e-session".into(),
         channel: "test".into(),
@@ -197,6 +204,7 @@ fn parent_context(
         session_key: "tools-e2e".into(),
         session_parent_prefix: None,
         on_progress: None,
+        run_queue: None,
     }
 }
 

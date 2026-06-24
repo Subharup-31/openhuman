@@ -57,6 +57,37 @@ fn all_variants_have_correct_domain() {
             },
             "agent",
         ),
+        // Run Queue
+        (
+            DomainEvent::RunQueueMessageQueued {
+                thread_id: "t".into(),
+                mode: "steer".into(),
+                queue_depth: 1,
+            },
+            "agent",
+        ),
+        (
+            DomainEvent::RunQueueMessageDelivered {
+                thread_id: "t".into(),
+                mode: "steer".into(),
+                iteration: 2,
+            },
+            "agent",
+        ),
+        (
+            DomainEvent::RunQueueFollowupDispatched {
+                thread_id: "t".into(),
+                followup_count: 1,
+            },
+            "agent",
+        ),
+        (
+            DomainEvent::RunQueueInterrupted {
+                thread_id: "t".into(),
+                cancelled_request_id: "req-1".into(),
+            },
+            "agent",
+        ),
         // Memory
         (
             DomainEvent::MemoryStored {
@@ -178,29 +209,29 @@ fn all_variants_have_correct_domain() {
             },
             "cron",
         ),
-        // Skill
+        // Workflow
         (
-            DomainEvent::SkillLoaded {
+            DomainEvent::WorkflowLoaded {
                 skill_id: "s".into(),
                 runtime: "nodejs".into(),
             },
-            "skill",
+            "workflow",
         ),
         (
-            DomainEvent::SkillStopped {
+            DomainEvent::WorkflowStopped {
                 skill_id: "s".into(),
             },
-            "skill",
+            "workflow",
         ),
         (
-            DomainEvent::SkillStartFailed {
+            DomainEvent::WorkflowStartFailed {
                 skill_id: "s".into(),
                 error: "e".into(),
             },
-            "skill",
+            "workflow",
         ),
         (
-            DomainEvent::SkillExecuted {
+            DomainEvent::WorkflowExecuted {
                 skill_id: "s".into(),
                 tool_name: "t".into(),
                 arguments: serde_json::Value::Null,
@@ -208,7 +239,7 @@ fn all_variants_have_correct_domain() {
                 success: true,
                 elapsed_ms: 0,
             },
-            "skill",
+            "workflow",
         ),
         // Tool
         (
@@ -464,6 +495,25 @@ fn all_variants_have_correct_domain() {
             },
             "auth",
         ),
+        // Agent meetings (issue #3507 contract events)
+        (
+            DomainEvent::MeetingSessionCreated {
+                meeting_id: "m-1".into(),
+                meet_url: "https://meet.google.com/abc-defg-hij".into(),
+                title: "Standup".into(),
+                source: "calendar".into(),
+            },
+            "agent_meetings",
+        ),
+        (
+            DomainEvent::MeetingAutoJoinTriggered {
+                meeting_id: "m-1".into(),
+                meet_url: "https://meet.google.com/abc-defg-hij".into(),
+                listen_only: true,
+                correlation_id: "corr-1".into(),
+            },
+            "agent_meetings",
+        ),
     ];
 
     for (event, expected_domain) in cases {
@@ -474,6 +524,32 @@ fn all_variants_have_correct_domain() {
             std::mem::discriminant(&event)
         );
     }
+}
+
+/// The two issue #3507 contract events expose stable variant names that
+/// downstream audit/tracing relies on — guard them against silent renames.
+#[test]
+fn meeting_contract_events_have_stable_variant_names() {
+    assert_eq!(
+        DomainEvent::MeetingSessionCreated {
+            meeting_id: "m-1".into(),
+            meet_url: "https://meet.google.com/abc-defg-hij".into(),
+            title: "Standup".into(),
+            source: "calendar".into(),
+        }
+        .variant_name(),
+        "MeetingSessionCreated"
+    );
+    assert_eq!(
+        DomainEvent::MeetingAutoJoinTriggered {
+            meeting_id: "m-1".into(),
+            meet_url: "https://meet.google.com/abc-defg-hij".into(),
+            listen_only: true,
+            correlation_id: "corr-1".into(),
+        }
+        .variant_name(),
+        "MeetingAutoJoinTriggered"
+    );
 }
 
 /// Regression guard. An earlier revision of
@@ -500,4 +576,13 @@ fn approval_requested_does_not_surface_session_id() {
         !dbg.contains("session_id"),
         "ApprovalRequested Debug must not surface session_id: {dbg}"
     );
+}
+
+#[test]
+fn workflows_changed_domain_and_name() {
+    let event = DomainEvent::WorkflowsChanged {
+        reason: "install".into(),
+    };
+    assert_eq!(event.domain(), "workflow");
+    assert_eq!(event.variant_name(), "WorkflowsChanged");
 }

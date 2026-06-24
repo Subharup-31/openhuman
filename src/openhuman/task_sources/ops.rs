@@ -11,14 +11,14 @@ use serde_json::{json, Value};
 
 use crate::openhuman::config::Config;
 use crate::openhuman::memory_sync::composio::providers::{
-    get_provider, NormalizedTask, ProviderContext,
+    get_provider, NormalizedTask, ProviderContext, TaskContainer,
 };
 use crate::rpc::RpcOutcome;
 
 use super::types::{
     FetchReason, FilterSpec, ProviderSlug, SourceTarget, TaskSource, TaskSourcePatch,
 };
-use super::{filter, pipeline, store};
+use super::{filter, pipeline, route, store};
 
 /// List all configured task sources.
 pub async fn list(config: &Config) -> Result<RpcOutcome<Vec<TaskSource>>, String> {
@@ -104,10 +104,20 @@ pub async fn update(
 
 /// Remove a source by id.
 pub async fn remove(config: &Config, id: &str) -> Result<RpcOutcome<Value>, String> {
+    let ingested = store::list_ingested_refs(config, id).map_err(|e| e.to_string())?;
+    let mut pruned = 0usize;
+    for item in ingested {
+        if let Some(card_id) = item.card_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            route::remove_card(config, card_id)?;
+        }
+        if store::remove_ingested(config, id, &item.external_id).map_err(|e| e.to_string())? {
+            pruned += 1;
+        }
+    }
     store::remove_source(config, id).map_err(|e| e.to_string())?;
-    tracing::debug!(source_id = %id, "[task_sources:ops] removed");
+    tracing::debug!(source_id = %id, pruned, "[task_sources:ops] removed");
     Ok(RpcOutcome::new(
-        json!({ "id": id, "removed": true }),
+        json!({ "id": id, "removed": true, "pruned": pruned }),
         vec![],
     ))
 }
@@ -117,6 +127,26 @@ pub async fn fetch(config: &Config, id: &str) -> Result<RpcOutcome<super::FetchO
     let source = store::get_source(config, id).map_err(|e| e.to_string())?;
     let outcome = pipeline::run_source_once(config, &source, FetchReason::Manual).await;
     Ok(RpcOutcome::new(outcome, vec![]))
+}
+
+/// Manually sync all enabled task sources now.
+pub async fn sync(config: &Config) -> Result<RpcOutcome<Vec<super::FetchOutcome>>, String> {
+    let sources = store::list_sources(config).map_err(|e| e.to_string())?;
+    let mut outcomes = Vec::new();
+    for source in sources.into_iter().filter(|source| source.enabled) {
+        outcomes.push(pipeline::run_source_once(config, &source, FetchReason::Manual).await);
+    }
+    tracing::info!(
+        source_count = outcomes.len(),
+        fetched = outcomes
+            .iter()
+            .map(|outcome| outcome.fetched)
+            .sum::<usize>(),
+        routed = outcomes.iter().map(|outcome| outcome.routed).sum::<usize>(),
+        pruned = outcomes.iter().map(|outcome| outcome.pruned).sum::<usize>(),
+        "[task_sources:ops] sync completed"
+    );
+    Ok(RpcOutcome::new(outcomes, vec![]))
 }
 
 /// Recently ingested tasks for a source (newest first).
@@ -152,6 +182,9 @@ pub async fn preview_filter(
         config: Arc::new(config.clone()),
         toolkit: provider.as_str().to_string(),
         connection_id: connection_id.filter(|s| !s.trim().is_empty()),
+        usage: Default::default(),
+        max_items: None,
+        sync_depth_days: None,
     };
     let max = max.unwrap_or(config.task_sources.max_tasks_per_fetch);
     let fetch_filter = filter::to_fetch_filter(&filter_spec, max);
@@ -161,6 +194,36 @@ pub async fn preview_filter(
         .map_err(|e| format!("preview fetch failed: {e}"))?;
     tracing::debug!(count = tasks.len(), "[task_sources:ops] preview_filter");
     Ok(RpcOutcome::new(tasks, vec![]))
+}
+
+/// List the selectable containers (today: Notion databases) a connected
+/// provider exposes, so the UI can offer a picker instead of a raw-id text
+/// field. Mirrors [`preview_filter`]'s context setup.
+pub async fn list_databases(
+    config: &Config,
+    provider: ProviderSlug,
+    connection_id: Option<String>,
+) -> Result<RpcOutcome<Vec<TaskContainer>>, String> {
+    let provider_impl = get_provider(provider.as_str())
+        .ok_or_else(|| format!("no native provider registered for '{}'", provider.as_str()))?;
+    let ctx = ProviderContext {
+        config: Arc::new(config.clone()),
+        toolkit: provider.as_str().to_string(),
+        connection_id: connection_id.filter(|s| !s.trim().is_empty()),
+        usage: Default::default(),
+        max_items: None,
+        sync_depth_days: None,
+    };
+    let databases = provider_impl
+        .list_databases(&ctx)
+        .await
+        .map_err(|e| format!("list databases failed: {e}"))?;
+    tracing::debug!(
+        count = databases.len(),
+        provider = provider.as_str(),
+        "[task_sources:ops] list_databases"
+    );
+    Ok(RpcOutcome::new(databases, vec![]))
 }
 
 /// Domain status: enabled flag + source counts.

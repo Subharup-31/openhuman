@@ -4,6 +4,14 @@ import { type Socket } from 'socket.io-client';
 import { getCoreStateSnapshot } from '../lib/coreState/store';
 import { SocketIOMCPTransportImpl } from '../lib/mcp';
 import { store } from '../store';
+import {
+  setBackendMeetError,
+  setBackendMeetHarness,
+  setBackendMeetJoined,
+  setBackendMeetLeft,
+  setBackendMeetReply,
+  setBackendMeetTranscript,
+} from '../store/backendMeetSlice';
 import { upsertChannelConnection } from '../store/channelConnectionsSlice';
 import { type CompanionStateChangedEvent, setCompanionState } from '../store/companionSlice';
 import { setBackend } from '../store/connectivitySlice';
@@ -258,10 +266,16 @@ class SocketService {
       // room and a per-thread room (see socketio.rs `emit_web_channel_event`);
       // because a reconnect produces a NEW client_id, the new socket must
       // re-subscribe to the thread room to keep receiving the stream.
+      // With parallel inference several threads may be streaming at once, so
+      // re-subscribe to every active thread room (plus the selected thread) —
+      // not just a single "active" thread — to keep all in-flight streams alive.
       const threadState = store.getState().thread;
-      const activeThreadId = threadState?.selectedThreadId ?? threadState?.activeThreadId;
-      if (activeThreadId) {
-        this.socket?.emit('thread:subscribe', { thread_id: activeThreadId });
+      const roomThreadIds = new Set<string>(Object.keys(threadState?.activeThreadIds ?? {}));
+      if (threadState?.selectedThreadId) {
+        roomThreadIds.add(threadState.selectedThreadId);
+      }
+      for (const threadId of roomThreadIds) {
+        this.socket?.emit('thread:subscribe', { thread_id: threadId });
       }
     });
 
@@ -414,6 +428,77 @@ class SocketService {
       }
       socketLog('companion:state_changed → %s', event.state);
       store.dispatch(setCompanionState(event));
+    });
+
+    // Backend Meet bot events — forwarded from core's DomainEvent bus
+    this.socket.on('agent_meetings:joined', (data: unknown) => {
+      const obj = data as Record<string, unknown> | null;
+      const meetUrl = typeof obj?.meet_url === 'string' ? obj.meet_url : '';
+      const correlationId =
+        typeof obj?.correlation_id === 'string' ? obj.correlation_id : undefined;
+      socketLog(
+        'agent_meetings:joined meet_url_len=%d correlation_id=%s',
+        meetUrl.length,
+        correlationId ?? 'none'
+      );
+      store.dispatch(setBackendMeetJoined({ meetUrl, meetingId: correlationId }));
+    });
+    this.socket.on('agent_meetings:left', (data: unknown) => {
+      const obj = data as Record<string, unknown> | null;
+      const reason = typeof obj?.reason === 'string' ? obj.reason : 'unknown';
+      const correlationId =
+        typeof obj?.correlation_id === 'string' ? obj.correlation_id : undefined;
+      socketLog('agent_meetings:left reason=%s correlation_id=%s', reason, correlationId ?? 'none');
+      store.dispatch(setBackendMeetLeft({ reason, correlationId }));
+    });
+    this.socket.on('agent_meetings:reply', (data: unknown) => {
+      const obj = data as Record<string, unknown> | null;
+      if (!obj) return;
+      const correlationId = typeof obj.correlation_id === 'string' ? obj.correlation_id : undefined;
+      socketLog('agent_meetings:reply correlation_id=%s', correlationId ?? 'none');
+      store.dispatch(
+        setBackendMeetReply({
+          transcript: typeof obj.transcript === 'string' ? obj.transcript : '',
+          reply: typeof obj.reply === 'string' ? obj.reply : '',
+          emotion: typeof obj.emotion === 'string' ? obj.emotion : 'neutral',
+          correlationId,
+        })
+      );
+    });
+    this.socket.on('agent_meetings:harness', (data: unknown) => {
+      const obj = data as Record<string, unknown> | null;
+      if (!obj) return;
+      const correlationId = typeof obj.correlation_id === 'string' ? obj.correlation_id : undefined;
+      socketLog('agent_meetings:harness correlation_id=%s', correlationId ?? 'none');
+      store.dispatch(
+        setBackendMeetHarness({
+          transcript: typeof obj.transcript === 'string' ? obj.transcript : '',
+          instruction: typeof obj.instruction === 'string' ? obj.instruction : '',
+          emotion: typeof obj.emotion === 'string' ? obj.emotion : 'neutral',
+          correlationId,
+        })
+      );
+    });
+    this.socket.on('agent_meetings:transcript', (data: unknown) => {
+      const obj = data as Record<string, unknown> | null;
+      if (!obj) return;
+      const correlationId = typeof obj.correlation_id === 'string' ? obj.correlation_id : undefined;
+      socketLog('agent_meetings:transcript correlation_id=%s', correlationId ?? 'none');
+      store.dispatch(
+        setBackendMeetTranscript({
+          turns: Array.isArray(obj.turns) ? obj.turns : [],
+          duration_ms: typeof obj.duration_ms === 'number' ? obj.duration_ms : 0,
+          correlationId,
+        })
+      );
+    });
+    this.socket.on('agent_meetings:error', (data: unknown) => {
+      const obj = data as Record<string, unknown> | null;
+      const error = typeof obj?.error === 'string' ? obj.error : 'Unknown error';
+      const correlationId =
+        typeof obj?.correlation_id === 'string' ? obj.correlation_id : undefined;
+      socketError('agent_meetings:error %s correlation_id=%s', error, correlationId ?? 'none');
+      store.dispatch(setBackendMeetError({ error, correlationId }));
     });
 
     this.socket.connect();

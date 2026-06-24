@@ -20,9 +20,17 @@ use crate::openhuman::todos::ops::{
 use crate::openhuman::{scheduler_gate, todos};
 
 use super::types::{EnrichedTask, FilterSpec, SourceTarget, TaskSource};
+use super::TaskKind;
 
 /// Stable thread id whose board collects every ingested task.
 pub const TASK_SOURCES_THREAD_ID: &str = "task-sources";
+
+fn task_sources_location(config: &Config) -> BoardLocation {
+    BoardLocation::Thread {
+        workspace_dir: config.workspace_dir.clone(),
+        thread_id: TASK_SOURCES_THREAD_ID.to_string(),
+    }
+}
 
 /// Route an enriched task: append a todo card, then (for proactive
 /// sources) dispatch a triage turn. Returns the new card id on success.
@@ -64,16 +72,13 @@ fn add_card(
     enriched: &EnrichedTask,
     stale_card_id: Option<&str>,
 ) -> Result<String, String> {
-    let location = BoardLocation::Thread {
-        workspace_dir: config.workspace_dir.clone(),
-        thread_id: TASK_SOURCES_THREAD_ID.to_string(),
-    };
+    let location = task_sources_location(config);
 
     // Remove stale card from the previous ingestion of this task (if any)
     // before creating the replacement, so the board never accumulates
     // duplicate cards for the same upstream item.
     if let Some(old_id) = stale_card_id {
-        match todo_remove(&location, old_id) {
+        match remove_card(config, old_id) {
             Ok(_) => {
                 tracing::debug!(
                     source_id = %source.id,
@@ -112,13 +117,12 @@ fn add_card(
         Some(notes_parts.join("\n"))
     };
 
-    // Objective: the bare upstream title (the card `content`/title is the
-    // `[provider] title` display form; the objective is the clean goal the
-    // executing agent works toward).
-    let objective = {
-        let t = task.title.trim();
-        (!t.is_empty()).then(|| t.to_string())
-    };
+    // Objective: the intent-framed goal from enrichment ("Review pull
+    // request: …" / "Resolve issue: …" / bare title for generic tasks). The
+    // card `content`/title is the `[provider] title` display form; the
+    // objective is the clean goal the executing agent — and the triage LLM —
+    // works toward, so it must state *what kind of job* this is.
+    let objective = enriched.objective.clone();
 
     // Stamp the source identifiers the downstream dispatcher / write-back
     // needs (provider + repo + issue id + url) plus the enrichment urgency
@@ -177,6 +181,11 @@ fn build_source_metadata(source: &TaskSource, enriched: &EnrichedTask) -> serde_
         "external_id": task.external_id,
         "urgency": enriched.urgency,
     });
+    // Only stamp `kind` when the provider differentiated it (issue vs PR), so
+    // the FE card and triage can tell "review this" from "solve this".
+    if task.kind != TaskKind::Generic {
+        meta["kind"] = json!(task.kind.as_str());
+    }
     if let Some(url) = task.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         meta["url"] = json!(url);
     }
@@ -225,10 +234,7 @@ async fn dispatch_triage(
     // Link the envelope to the board card so triage's escalation arm routes
     // it through the deterministic dispatcher (claim → autonomous run →
     // write-back) instead of the one-shot triage sub-agent.
-    let location = BoardLocation::Thread {
-        workspace_dir: config.workspace_dir.clone(),
-        thread_id: TASK_SOURCES_THREAD_ID.to_string(),
-    };
+    let location = task_sources_location(config);
     let envelope = TriggerEnvelope::from_external(
         &format!("task_sources:{}", source.id),
         "external task ingested",
@@ -284,11 +290,26 @@ fn provider_label(provider: &str) -> String {
 pub fn board_cards(
     config: &Config,
 ) -> Result<Vec<crate::openhuman::agent::task_board::TaskBoardCard>, String> {
-    let location = BoardLocation::Thread {
-        workspace_dir: config.workspace_dir.clone(),
-        thread_id: TASK_SOURCES_THREAD_ID.to_string(),
-    };
+    let location = task_sources_location(config);
     todos::ops::list(&location).map(|snap| snap.cards)
+}
+
+/// Remove a task-source board card. Missing cards are treated as already
+/// reconciled so ledger cleanup can still proceed.
+pub fn remove_card(config: &Config, card_id: &str) -> Result<bool, String> {
+    let location = task_sources_location(config);
+    match todo_remove(&location, card_id) {
+        Ok(_) => Ok(true),
+        Err(e) if e.contains("not found") => {
+            tracing::debug!(
+                card_id,
+                error = %e,
+                "[task_sources:route] card already absent during reconciliation"
+            );
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -318,6 +339,7 @@ mod tests {
                 labels: vec![],
                 assignee_is_me: true,
                 state: None,
+                fetch_mode: Default::default(),
                 extra: json!({}),
             },
             interval_secs: 1800,
@@ -338,6 +360,9 @@ mod tests {
             url: url.map(str::to_string),
             ..Default::default()
         };
+        // Objective is derived in enrichment — mirror that here so the helper
+        // stays truthful (generic kind → bare title).
+        let objective = crate::openhuman::task_sources::enrich::derive_objective(&task);
         EnrichedTask {
             task,
             summary: "Fix the bug".into(),
@@ -345,6 +370,7 @@ mod tests {
             linked_people: vec![],
             linked_memory_ids: vec![],
             agent_prompt: "do it".into(),
+            objective,
             enriched_at: Utc::now(),
         }
     }
@@ -413,6 +439,47 @@ mod tests {
             .expect("source_metadata present");
         assert_eq!(meta["external_id"], json!("123"));
         assert_eq!(meta["repo"], json!("octo/repo"));
+        // Generic kind is not stamped onto metadata.
+        assert!(meta.get("kind").is_none());
+    }
+
+    #[test]
+    fn pull_request_card_carries_review_objective_and_kind_metadata() {
+        let (_tmp, config) = temp_config();
+        let src = github_source(Some("octo/repo"));
+        let mut task = NormalizedTask {
+            external_id: "55".into(),
+            provider: "github".into(),
+            title: "Add retry".into(),
+            ..Default::default()
+        };
+        task.kind = TaskKind::PullRequest;
+        let objective = crate::openhuman::task_sources::enrich::derive_objective(&task);
+        let e = EnrichedTask {
+            task,
+            summary: "Add retry".into(),
+            urgency: 0.5,
+            linked_people: vec![],
+            linked_memory_ids: vec![],
+            agent_prompt: "review it".into(),
+            objective,
+            enriched_at: Utc::now(),
+        };
+
+        add_card(&config, &src, &e, None).expect("add_card succeeds");
+
+        let cards = board_cards(&config).expect("board_cards");
+        let card = &cards[0];
+        // The objective tells the picking agent (and triage) the job is a review.
+        assert_eq!(
+            card.objective.as_deref(),
+            Some("Review pull request: Add retry")
+        );
+        let meta = card
+            .source_metadata
+            .as_ref()
+            .expect("source_metadata present");
+        assert_eq!(meta["kind"], json!("pull_request"));
     }
 
     #[test]

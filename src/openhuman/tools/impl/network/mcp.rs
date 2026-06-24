@@ -79,6 +79,7 @@ impl Tool for McpListServersTool {
                             "bearer_token",
                         crate::openhuman::config::McpAuthConfig::Basic { .. } => "basic",
                         crate::openhuman::config::McpAuthConfig::Header { .. } => "header",
+                        crate::openhuman::config::McpAuthConfig::Headers { .. } => "headers",
                         crate::openhuman::config::McpAuthConfig::QueryParam { .. } => "query_param",
                     }
                 ));
@@ -162,8 +163,8 @@ impl Tool for McpListToolsTool {
             .map(|tool| {
                 json!({
                     "name": tool.name,
-                    "title": tool.title,
-                    "description": tool.description,
+                    "title": tool.display_title(),
+                    "description": tool.display_description(),
                     "input_schema": tool.input_schema,
                 })
             })
@@ -174,10 +175,13 @@ impl Tool for McpListToolsTool {
             markdown.push_str("\nNo tools were returned by the remote server.");
         } else {
             for tool in &tools {
+                let desc = tool
+                    .display_description()
+                    .unwrap_or_else(|| "No description.".to_string());
                 markdown.push_str(&format!(
                     "\n- **{}**: {}\n  - schema: `{}`",
                     tool.name,
-                    tool.description.as_deref().unwrap_or("No description."),
+                    desc,
                     serde_json::to_string(&tool.input_schema).unwrap_or_else(|_| "{}".into())
                 ));
             }

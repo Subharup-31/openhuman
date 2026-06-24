@@ -211,6 +211,59 @@ fn ollama_prefix() {
 }
 
 #[test]
+fn ollama_provider_opts_out_of_native_tool_calling() {
+    // Sub-issue 3 of #3098: Ollama's OpenAI-compat endpoint returns HTTP 400
+    // for many models when a `tools` array is sent (the existing detection
+    // path matches "unsupported parameter: tools"). The retry logic strips
+    // tools entirely, which silently breaks any skill or workflow that
+    // depends on tool calls. The factory must build the Ollama provider
+    // with native tool calling disabled so the agent harness uses the
+    // prompt-guided text format from the first request.
+    let config = Config::default();
+    let (provider, _model) = create_chat_provider_from_string("chat", "ollama:llama3.2", &config)
+        .expect("ollama:<model> must build");
+    let caps = provider.capabilities();
+    assert!(
+        !caps.native_tool_calling,
+        "ollama provider must report native_tool_calling=false so the agent harness emits prompt-guided tool specs instead of an OpenAI-style `tools` array"
+    );
+    assert!(
+        !caps.vision,
+        "local Ollama-compatible providers stay fail-closed for vision until the configured model proves image support"
+    );
+}
+
+#[test]
+fn lmstudio_provider_defaults_to_prompt_guided_tools() {
+    // All local providers (Ollama, LM Studio, MLX, local-openai) default to
+    // prompt-guided tool dispatch (#3246). This prevents HTTP 400 errors
+    // from models that don't support the native `tools` parameter. Users
+    // can override via `config.agent.tool_dispatcher = "native"` if their
+    // model supports it.
+    let mut config = Config::default();
+    config.local_ai.base_url = Some("http://127.0.0.1:1234".to_string());
+    let (provider, _model) =
+        create_chat_provider_from_string("chat", "lmstudio:google/gemma-4-e4b", &config)
+            .expect("lmstudio:<model> must build");
+    let caps = provider.capabilities();
+    assert!(
+        !caps.native_tool_calling,
+        "lmstudio provider must default to native_tool_calling=false (conservative local dispatch)"
+    );
+    assert!(
+        !caps.vision,
+        "local LM Studio-compatible providers stay fail-closed for vision until the configured model proves image support"
+    );
+}
+
+// Note: a BYOK-cloud regression test (e.g. `openai:gpt-4o` keeps
+// native_tool_calling=true) would need an `AuthService` with the slug's API
+// key seeded. The unit test
+// `with_native_tool_calling_true_preserves_default` in compatible_tests.rs
+// already pins that the builder leaves the default in place when not
+// called, which is what every non-Ollama factory path relies on.
+
+#[test]
 fn lmstudio_prefix() {
     let mut config = Config::default();
     config.local_ai.base_url = Some("http://127.0.0.1:1234".to_string());
@@ -400,6 +453,23 @@ fn cloud_provider_with_no_model_and_no_default_rejected() {
         msg.contains("nvidia-nim"),
         "error must name the slug; got: {msg}"
     );
+
+    // TAURI-RUST-GKV coupling — the SAME bail body that floods Sentry must:
+    //   (a) still contain the classifier anchor const, and
+    //   (b) be recognised by the shared config-rejection classifier
+    //       (which both demotes the Sentry event AND drives the actionable
+    //       user-facing copy in `classify_inference_error`).
+    // If the bail wording drifts off the anchor, (a) fails; if the
+    // classifier phrase drifts, (b) fails — CI catches either direction, so
+    // the demotion can never silently regress into an error flood.
+    assert!(
+        msg.contains(super::NO_MODEL_CONFIGURED_ANCHOR),
+        "bail body must contain NO_MODEL_CONFIGURED_ANCHOR; got: {msg}"
+    );
+    assert!(
+        crate::openhuman::inference::provider::is_provider_config_rejection_message(&msg),
+        "empty-model bail must classify as provider config-rejection: {msg}"
+    );
 }
 
 #[test]
@@ -441,6 +511,10 @@ async fn cloud_provider_without_stored_key_fails_with_actionable_error() {
     let config = config_with_providers_in_tempdir(&tmp, vec![openai_entry("p_oai", "openai")]);
     let (provider, model) = create_chat_provider_from_string("reasoning", "openai:gpt-4o", &config)
         .expect("provider should build without eagerly requiring credentials");
+    assert!(
+        provider.capabilities().vision,
+        "cloud OpenAI-compatible providers must advertise vision so reasoning attachment turns reach the provider"
+    );
 
     let err = provider
         .chat_with_system(None, "hello", &model, 0.0)
@@ -778,6 +852,7 @@ fn known_tiers_pass() {
         "coding-v1",
         "reasoning-quick-v1",
         "summarization-v1",
+        "vision-v1",
     ] {
         assert!(
             is_known_openhuman_tier(tier),
@@ -793,6 +868,7 @@ fn known_hints_pass() {
     assert!(is_known_openhuman_tier("hint:agentic"));
     assert!(is_known_openhuman_tier("hint:coding"));
     assert!(is_known_openhuman_tier("hint:summarization"));
+    assert!(is_known_openhuman_tier("hint:vision"));
 }
 
 #[test]
@@ -810,6 +886,51 @@ fn invalid_models_fail() {
     assert!(!is_known_openhuman_tier("hint:"));
 }
 
+// ── oh_tier_supports_vision ──────────────────────────────────────────────────────
+
+#[test]
+fn reasoning_is_the_vision_capable_managed_tier() {
+    // `reasoning-v1` (and its hint form) is the one vision-capable managed tier.
+    assert!(oh_tier_supports_vision("reasoning-v1"));
+    assert!(oh_tier_supports_vision("hint:reasoning"));
+
+    // Every other managed tier (and its hint form) is non-vision until confirmed
+    // multimodal on the backend. Flip the corresponding arm in
+    // `oh_tier_supports_vision` to enable one.
+    for model in [
+        "chat-v1",
+        "agentic-v1",
+        "coding-v1",
+        "reasoning-quick-v1",
+        "summarization-v1",
+        "hint:chat",
+        "hint:agentic",
+        "hint:coding",
+        "hint:summarization",
+    ] {
+        assert!(
+            !oh_tier_supports_vision(model),
+            "expected managed tier '{model}' to be non-vision"
+        );
+    }
+}
+
+#[test]
+fn unknown_models_are_not_vision_capable() {
+    assert!(!oh_tier_supports_vision("gpt-5"));
+    assert!(!oh_tier_supports_vision("claude-opus-4-7"));
+    assert!(!oh_tier_supports_vision(""));
+}
+
+#[test]
+fn vision_tier_is_vision_capable() {
+    // The dedicated multimodal tier (and its hint form) reports vision support,
+    // so the turn engine's image gate accepts image turns for the vision
+    // sub-agent — managed or BYOK (which resolves via this same alias).
+    assert!(oh_tier_supports_vision("vision-v1"));
+    assert!(oh_tier_supports_vision("hint:vision"));
+}
+
 #[test]
 fn make_openhuman_backend_forwards_unknown_hint_verbatim() {
     // Unrecognised hint:* strings (e.g. hint:reaction for lightweight models)
@@ -821,7 +942,7 @@ fn make_openhuman_backend_forwards_unknown_hint_verbatim() {
     for hint in ["hint:reaction", "hint:garbage", "hint:lightweight"] {
         let mut config = Config::default();
         config.default_model = Some(hint.to_string());
-        let (_, model) = make_openhuman_backend(&config).expect("factory should succeed");
+        let (_, model) = make_openhuman_backend("chat", &config).expect("factory should succeed");
         assert_eq!(model, hint, "hint '{hint}' should pass through unchanged");
     }
 }
@@ -830,8 +951,20 @@ fn make_openhuman_backend_forwards_unknown_hint_verbatim() {
 fn make_openhuman_backend_translates_summarization_hint() {
     let mut config = Config::default();
     config.default_model = Some("hint:summarization".to_string());
-    let (_, model) = make_openhuman_backend(&config).expect("factory should succeed");
+    let (_, model) = make_openhuman_backend("chat", &config).expect("factory should succeed");
     assert_eq!(model, crate::openhuman::config::MODEL_SUMMARIZATION_V1);
+}
+
+#[test]
+fn make_openhuman_backend_reports_vision_capability() {
+    let config = Config::default();
+    let (provider, _) = make_openhuman_backend("chat", &config).expect("factory should succeed");
+    let caps = provider.capabilities();
+    assert!(caps.native_tool_calling);
+    assert!(
+        caps.vision,
+        "OpenHuman backend must report vision so attachment-driven reasoning turns clear the harness gate"
+    );
 }
 
 #[test]
@@ -840,7 +973,7 @@ fn make_openhuman_backend_falls_back_for_invalid_model() {
     // The factory must silently fall back to reasoning-v1 (the platform default).
     let mut config = Config::default();
     config.default_model = Some("deepseek-v4-pro".to_string());
-    let (_, model) = make_openhuman_backend(&config).expect("factory should succeed");
+    let (_, model) = make_openhuman_backend("chat", &config).expect("factory should succeed");
     assert_eq!(
         model,
         crate::openhuman::config::MODEL_REASONING_V1,
@@ -852,7 +985,7 @@ fn make_openhuman_backend_falls_back_for_invalid_model() {
 fn make_openhuman_backend_keeps_valid_tier() {
     let mut config = Config::default();
     config.default_model = Some("chat-v1".to_string());
-    let (_, model) = make_openhuman_backend(&config).expect("factory should succeed");
+    let (_, model) = make_openhuman_backend("chat", &config).expect("factory should succeed");
     assert_eq!(model, "chat-v1");
 }
 
@@ -860,8 +993,25 @@ fn make_openhuman_backend_keeps_valid_tier() {
 fn make_openhuman_backend_keeps_reasoning_quick() {
     let mut config = Config::default();
     config.default_model = Some("reasoning-quick-v1".to_string());
-    let (_, model) = make_openhuman_backend(&config).expect("factory should succeed");
+    let (_, model) = make_openhuman_backend("chat", &config).expect("factory should succeed");
     assert_eq!(model, "reasoning-quick-v1");
+}
+
+#[test]
+fn make_openhuman_backend_pins_vision_role_to_vision_tier() {
+    // Regression (PR #3699): the managed default_model is chat-v1 (a NON-vision
+    // tier). When `vision_provider` is unset the vision workload resolves to the
+    // managed backend, so make_openhuman_backend must override the default model
+    // with `vision-v1` — otherwise `oh_tier_supports_vision` reports false and
+    // the turn engine strips every attached image, blinding the vision sub-agent.
+    let config = Config::default();
+    assert_eq!(config.default_model.as_deref(), Some("chat-v1"));
+    let (_, model) = make_openhuman_backend("vision", &config).expect("factory should succeed");
+    assert_eq!(model, crate::openhuman::config::MODEL_VISION_V1);
+    assert!(
+        oh_tier_supports_vision(&model),
+        "vision role must resolve to a vision-capable managed tier"
+    );
 }
 
 // ── BYOK fail-closed tests ────────────────────────────────────────────────────
@@ -1403,6 +1553,130 @@ async fn cloud_provider_falls_back_to_responses_on_404() {
     drop(result);
 }
 
+/// TAURI-RUST-5EN: a built-in chat-completions-only cloud provider (DeepSeek)
+/// must NOT fall back to `/v1/responses` on a chat-completions 404. DeepSeek
+/// exposes no Responses API, so the fallback is a guaranteed second 404 that
+/// floods Sentry with an empty-body "deepseek Responses API error:" event.
+/// Bearer-path counterpart to `ollama_provider_does_not_fall_back_to_responses_on_404`.
+#[tokio::test]
+async fn deepseek_builtin_does_not_fall_back_to_responses_on_404() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_string(r#"{"error":{"message":"model not found","code":404}}"#),
+        )
+        .expect(1) // exactly one attempt — no retry, no fallback
+        .mount(&mock_server)
+        .await;
+
+    // DeepSeek has no /v1/responses — the fallback must never reach it.
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(""))
+        .expect(0) // must not be called
+        .mount(&mock_server)
+        .await;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let entry = CloudProviderCreds {
+        id: "p_deepseek".to_string(),
+        slug: "deepseek".to_string(),
+        label: "DeepSeek".to_string(),
+        endpoint: format!("{}/v1", mock_server.uri()),
+        auth_style: AuthStyle::Bearer,
+        default_model: Some("deepseek-v4-flash".to_string()),
+        ..Default::default()
+    };
+    let config = config_with_providers_in_tempdir(&tmp, vec![entry]);
+    // Bearer providers fail at call time with "API key not set" before any HTTP
+    // request, so stash a key to let the chat-completions call reach the mock.
+    AuthService::from_config(&config)
+        .store_provider_token(
+            "provider:deepseek",
+            "default",
+            "sk-test",
+            Default::default(),
+            true,
+        )
+        .expect("store provider token");
+
+    let (provider, model) =
+        create_chat_provider_from_string("chat", "deepseek:deepseek-v4-flash", &config)
+            .expect("deepseek provider must build");
+
+    let result = provider.chat_with_system(None, "hello", &model, 0.0).await;
+    assert!(
+        result.is_err(),
+        "chat-completions 404 should surface as an error, not a success"
+    );
+
+    // wiremock verifies expect(0) on /v1/responses when the server is dropped.
+}
+
+/// Counterpart guard: a custom (non-built-in) Bearer slug KEEPS the responses
+/// fallback — its endpoint may be a genuine OpenAI proxy that serves
+/// `/v1/responses`. Ensures the 5EN slug-gate only disables the fallback for
+/// known chat-completions-only built-ins, not for unknown providers.
+#[tokio::test]
+async fn custom_bearer_provider_keeps_responses_fallback_on_404() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_string(r#"{"error":{"message":"model not found","code":404}}"#),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Unknown slug → fallback retained → /v1/responses MUST be called.
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                r#"{"output":[{"content":[{"type":"output_text","text":"ok"}]}]}"#,
+            ),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let entry = CloudProviderCreds {
+        id: "p_custom".to_string(),
+        slug: "my-openai-proxy".to_string(),
+        label: "My Proxy".to_string(),
+        endpoint: format!("{}/v1", mock_server.uri()),
+        auth_style: AuthStyle::Bearer,
+        default_model: Some("proxy-model".to_string()),
+        ..Default::default()
+    };
+    let config = config_with_providers_in_tempdir(&tmp, vec![entry]);
+    AuthService::from_config(&config)
+        .store_provider_token(
+            "provider:my-openai-proxy",
+            "default",
+            "sk-test",
+            Default::default(),
+            true,
+        )
+        .expect("store provider token");
+
+    let (provider, model) =
+        create_chat_provider_from_string("chat", "my-openai-proxy:proxy-model", &config)
+            .expect("custom bearer provider must build");
+
+    let result = provider.chat_with_system(None, "hello", &model, 0.0).await;
+    drop(result);
+
+    // wiremock verifies expect(1) on /v1/responses when the server is dropped.
+}
+
 #[tokio::test]
 #[ignore = "requires live LM Studio on localhost:1234"]
 async fn live_lmstudio_provider_streams_thinking_and_text() {
@@ -1426,6 +1700,7 @@ async fn live_lmstudio_provider_streams_thinking_and_text() {
                 messages: &messages,
                 tools: None,
                 stream: Some(&tx),
+                max_tokens: None,
             },
             &resolved_model,
             0.0,
@@ -1484,6 +1759,7 @@ async fn live_ollama_provider_streams_text() {
                 messages: &messages,
                 tools: None,
                 stream: Some(&tx),
+                max_tokens: None,
             },
             &resolved_model,
             0.0,
@@ -1643,4 +1919,371 @@ fn config_api_key_fallback_inert_without_inference_url() {
         "",
         "without inference_url there is no legacy slug — fallback must stay inert",
     );
+}
+
+// ── Local provider profile tests ─────────────────────────────────────────────
+
+#[test]
+fn mlx_provider_string_resolves() {
+    let config = Config::default();
+    let result = create_chat_provider_from_string("chat", "mlx:llama-3.1-8b", &config);
+    assert!(result.is_ok(), "mlx provider must resolve");
+    let (_, model) = result.unwrap();
+    assert_eq!(model, "llama-3.1-8b");
+}
+
+#[test]
+fn local_openai_provider_string_resolves() {
+    let config = Config::default();
+    let result = create_chat_provider_from_string("chat", "local-openai:phi3", &config);
+    assert!(result.is_ok(), "local-openai provider must resolve");
+    let (_, model) = result.unwrap();
+    assert_eq!(model, "phi3");
+}
+
+#[test]
+fn mlx_provider_empty_model_errors() {
+    let config = Config::default();
+    let result = create_chat_provider_from_string("chat", "mlx:", &config);
+    let err = result.err().expect("mlx: with empty model must error");
+    assert!(err.to_string().contains("empty model"));
+}
+
+#[test]
+fn local_openai_provider_empty_model_errors() {
+    let config = Config::default();
+    let result = create_chat_provider_from_string("chat", "local-openai:", &config);
+    let err = result
+        .err()
+        .expect("local-openai: with empty model must error");
+    assert!(err.to_string().contains("empty model"));
+}
+
+#[test]
+fn ollama_provider_passes_num_ctx() {
+    let mut config = Config::default();
+    config.local_ai.num_ctx = Some(32768);
+    let result = create_chat_provider_from_string("chat", "ollama:qwen3:14b", &config);
+    assert!(result.is_ok());
+    // The provider is constructed — num_ctx is set on the provider instance.
+    // Full integration test verifying the serialized body is in the JSON-RPC
+    // E2E suite; here we just confirm the factory doesn't reject it.
+}
+
+#[test]
+fn byok_fallback_skips_mlx_and_local_openai() {
+    let mut config = Config::default();
+    config.chat_provider = Some("mlx:llama3".to_string());
+    config.reasoning_provider = Some("local-openai:phi3".to_string());
+    // Neither should be picked up as a BYOK fallback
+    let result = resolve_byok_fallback_provider_string(&config);
+    assert!(
+        result.is_none(),
+        "local providers must not be BYOK fallbacks"
+    );
+}
+
+#[test]
+fn byok_fallback_skips_omlx() {
+    let mut config = Config::default();
+    config.chat_provider = Some("omlx:llama3".to_string());
+
+    assert!(
+        resolve_byok_fallback_provider_string(&config).is_none(),
+        "OMLX is a local provider and must not be treated as a BYOK cloud fallback"
+    );
+    assert_eq!(
+        provider_for_role("coding", &config),
+        "openhuman",
+        "unset coding must not inherit chat OMLX as a BYOK fallback"
+    );
+}
+
+#[test]
+fn local_provider_string_detection() {
+    use crate::openhuman::inference::local::profile::is_local_provider_string;
+    assert!(is_local_provider_string("ollama:phi3"));
+    assert!(is_local_provider_string("lmstudio:model"));
+    assert!(is_local_provider_string("mlx:llama"));
+    assert!(is_local_provider_string("omlx:llama"));
+    assert!(is_local_provider_string("local-openai:qwen2"));
+    assert!(!is_local_provider_string("openai:gpt-4o"));
+    assert!(!is_local_provider_string("openhuman"));
+    assert!(!is_local_provider_string("cloud"));
+}
+
+// ── resolve_model_for_hint ──────────────────────────────────────────────
+
+#[test]
+fn resolve_model_for_hint_maps_known_hints_to_tiers() {
+    let config = Config::default();
+    assert_eq!(
+        resolve_model_for_hint("hint:reasoning", &config),
+        "reasoning-v1"
+    );
+    assert_eq!(resolve_model_for_hint("hint:chat", &config), "chat-v1");
+    assert_eq!(
+        resolve_model_for_hint("hint:agentic", &config),
+        "agentic-v1"
+    );
+    assert_eq!(resolve_model_for_hint("hint:coding", &config), "coding-v1");
+    assert_eq!(
+        resolve_model_for_hint("hint:summarization", &config),
+        "summarization-v1"
+    );
+}
+
+#[test]
+fn resolve_model_for_hint_passes_through_tier_names() {
+    let config = Config::default();
+    assert_eq!(
+        resolve_model_for_hint("reasoning-v1", &config),
+        "reasoning-v1"
+    );
+    assert_eq!(resolve_model_for_hint("agentic-v1", &config), "agentic-v1");
+    assert_eq!(resolve_model_for_hint("coding-v1", &config), "coding-v1");
+}
+
+#[test]
+fn resolve_model_for_hint_extracts_model_from_byok_provider() {
+    let mut config = Config::default();
+    config.reasoning_provider = Some("openai:gpt-4o".to_string());
+    assert_eq!(resolve_model_for_hint("hint:reasoning", &config), "gpt-4o");
+
+    config.chat_provider = Some("anthropic:claude-sonnet-4-20250514".to_string());
+    assert_eq!(
+        resolve_model_for_hint("hint:chat", &config),
+        "claude-sonnet-4-20250514"
+    );
+}
+
+#[test]
+fn resolve_model_for_hint_falls_through_openhuman_and_cloud_sentinels() {
+    let mut config = Config::default();
+    config.reasoning_provider = Some("openhuman".to_string());
+    assert_eq!(
+        resolve_model_for_hint("hint:reasoning", &config),
+        "reasoning-v1"
+    );
+
+    config.reasoning_provider = Some("cloud".to_string());
+    assert_eq!(
+        resolve_model_for_hint("hint:reasoning", &config),
+        "reasoning-v1"
+    );
+
+    config.reasoning_provider = Some("".to_string());
+    assert_eq!(
+        resolve_model_for_hint("hint:reasoning", &config),
+        "reasoning-v1"
+    );
+}
+
+#[test]
+fn resolve_model_for_hint_handles_unknown_hint_passthrough() {
+    let config = Config::default();
+    let result = resolve_model_for_hint("hint:unknown_tier", &config);
+    assert_eq!(result, "hint:unknown_tier");
+}
+
+#[test]
+fn omlx_provider_builds_with_bearer_key() {
+    let mut config = crate::openhuman::config::Config::default();
+    config.local_ai.api_key = Some("sk-omlx-test".to_string());
+    config.local_ai.base_url = Some("http://127.0.0.1:8000/v1".to_string());
+    let (_provider, model) =
+        super::make_omlx_provider("my-model", None, &config).expect("omlx provider builds");
+    assert_eq!(model, "my-model");
+}
+
+#[test]
+fn omlx_dispatch_empty_model_errors() {
+    // Covers the empty-model bail! arms in create_chat_provider_from_string
+    // and create_local_chat_provider_from_string for the "omlx:" prefix.
+    let config = crate::openhuman::config::Config::default();
+
+    let err = create_chat_provider_from_string("chat", "omlx:", &config)
+        .err()
+        .expect("omlx: with empty model must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("empty model") || msg.contains("omlx:<model"),
+        "expected empty-model diagnostic, got: {msg}"
+    );
+
+    let err_local = create_local_chat_provider_from_string("omlx:", &config)
+        .err()
+        .expect("omlx: with empty model must fail via local dispatch");
+    let msg_local = err_local.to_string();
+    assert!(
+        msg_local.contains("empty model") || msg_local.contains("omlx:<model"),
+        "expected empty-model diagnostic from local dispatch, got: {msg_local}"
+    );
+}
+
+#[test]
+fn omlx_provider_builds_without_key_uses_no_auth() {
+    // Covers the no-api_key warn branch in make_omlx_provider — must not panic,
+    // must return Ok with the correct model name.
+    let mut config = crate::openhuman::config::Config::default();
+    config.local_ai.api_key = None;
+    config.local_ai.base_url = Some("http://127.0.0.1:8000/v1".to_string());
+    let (_provider, model) =
+        super::make_omlx_provider("m", None, &config).expect("omlx provider builds without key");
+    assert_eq!(model, "m");
+}
+
+#[test]
+fn omlx_dispatch_success_builds_provider() {
+    // Covers the success arms (non-empty model -> make_omlx_provider) in both
+    // create_chat_provider_from_string and create_local_chat_provider_from_string.
+    let mut config = crate::openhuman::config::Config::default();
+    config.local_ai.api_key = Some("sk-omlx-test".to_string());
+    config.local_ai.base_url = Some("http://127.0.0.1:8000/v1".to_string());
+
+    let (_p, model) = create_chat_provider_from_string("chat", "omlx:my-model", &config)
+        .expect("omlx:<model> builds via public factory");
+    assert_eq!(model, "my-model");
+
+    let (_p_local, model_local) = create_local_chat_provider_from_string("omlx:my-model", &config)
+        .expect("omlx:<model> builds via local dispatch");
+    assert_eq!(model_local, "my-model");
+}
+
+// ── #3767: managed-credits gate bypass (gate-only, per-tier) ───────────────
+//
+// Routing is NOT changed by this fix — selecting a BYO provider already routes
+// inference correctly. The gate is evaluated PER TIER so the UI checks whichever
+// tier the user actually selected: the chat header's "Quick" mode runs on the
+// `chat` tier and "Reasoning" mode on the `reasoning` tier. `role_bypasses_
+// managed_credits(role)` is true when that role runs on the user's own funding
+// (a BYO cloud key, a local runtime, or claude-code) with usable credentials.
+// Tiers that stay managed and run anyway surface the per-call 402 error.
+
+/// Store a usable provider key under the new-style `provider:<slug>` profile so
+/// `lookup_key_for_slug` resolves it.
+fn store_byo_key(config: &Config, slug: &str, token: &str) {
+    let auth = AuthService::from_config(config);
+    auth.store_provider_token(
+        &format!("provider:{slug}"),
+        "default",
+        token,
+        Default::default(),
+        true,
+    )
+    .expect("store provider token");
+}
+
+#[test]
+fn byo_chat_tier_with_key_bypasses() {
+    let tmp = TempDir::new().expect("tempdir");
+    // Quick mode runs on `chat`; routed to the user's own OpenAI provider + key.
+    let mut config = config_with_providers_in_tempdir(&tmp, vec![openai_entry("p_oai", "openai")]);
+    config.chat_provider = Some("openai:gpt-4o".to_string());
+    store_byo_key(&config, "openai", "sk-byo-test");
+
+    assert!(role_bypasses_managed_credits("chat", &config));
+}
+
+#[test]
+fn byo_reasoning_tier_with_key_bypasses() {
+    let tmp = TempDir::new().expect("tempdir");
+    // Reasoning mode runs on `reasoning`; routed to the user's own provider + key.
+    let mut config = config_with_providers_in_tempdir(&tmp, vec![openai_entry("p_oai", "openai")]);
+    config.reasoning_provider = Some("openai:gpt-4o".to_string());
+    store_byo_key(&config, "openai", "sk-byo-test");
+
+    assert!(role_bypasses_managed_credits("reasoning", &config));
+}
+
+#[test]
+fn per_tier_diverges_chat_byo_reasoning_managed() {
+    let tmp = TempDir::new().expect("tempdir");
+    // The crux of the per-tier check: chat on BYOK, reasoning explicitly managed.
+    // Quick mode (chat) bypasses; Reasoning mode (reasoning) stays gated.
+    let mut config = config_with_providers_in_tempdir(&tmp, vec![openai_entry("p_oai", "openai")]);
+    config.chat_provider = Some("openai:gpt-4o".to_string());
+    config.reasoning_provider = Some("openhuman".to_string());
+    store_byo_key(&config, "openai", "sk-byo-test");
+
+    assert!(role_bypasses_managed_credits("chat", &config));
+    assert!(!role_bypasses_managed_credits("reasoning", &config));
+}
+
+#[test]
+fn local_tier_bypasses_without_any_key() {
+    // A tier on a local on-device runtime → bypass, no cloud key needed.
+    let mut config = Config::default();
+    config.chat_provider = Some("ollama:qwen3:8b".to_string());
+    assert!(role_bypasses_managed_credits("chat", &config));
+}
+
+#[test]
+fn managed_chat_with_byo_agentic_stays_gated() {
+    let tmp = TempDir::new().expect("tempdir");
+    // chat explicitly managed; only tool-use (agentic) is BYOK. The chat tier
+    // still bills managed credits → chat role stays gated. (agentic itself is a
+    // BYO route, but it is not a chat-mode tier and surfaces errors per-call.)
+    let mut config = config_with_providers_in_tempdir(&tmp, vec![openai_entry("p_oai", "openai")]);
+    config.chat_provider = Some("openhuman".to_string());
+    config.reasoning_provider = Some("openhuman".to_string());
+    config.agentic_provider = Some("openai:gpt-4o".to_string());
+    store_byo_key(&config, "openai", "sk-byo-test");
+
+    assert!(!role_bypasses_managed_credits("chat", &config));
+    assert!(!role_bypasses_managed_credits("reasoning", &config));
+}
+
+#[test]
+fn managed_chat_with_byo_vision_stays_gated() {
+    let tmp = TempDir::new().expect("tempdir");
+    // Vision on BYOK but the chat-mode tiers stay managed → chat/reasoning gated.
+    let mut config = config_with_providers_in_tempdir(&tmp, vec![openai_entry("p_oai", "openai")]);
+    config.chat_provider = Some("openhuman".to_string());
+    config.reasoning_provider = Some("openhuman".to_string());
+    config.vision_provider = Some("openai:gpt-4o".to_string());
+    store_byo_key(&config, "openai", "sk-byo-test");
+
+    assert!(!role_bypasses_managed_credits("chat", &config));
+    assert!(!role_bypasses_managed_credits("reasoning", &config));
+}
+
+#[test]
+fn no_byo_provider_stays_gated() {
+    let tmp = TempDir::new().expect("tempdir");
+    // OpenAI entry exists but every tier is left on the managed default and no
+    // key is stored → chat-mode tiers managed → must NOT bypass.
+    let config = config_with_providers_in_tempdir(&tmp, vec![openai_entry("p_oai", "openai")]);
+
+    assert_eq!(provider_for_role("chat", &config), "openhuman");
+    assert!(!role_bypasses_managed_credits("chat", &config));
+    assert!(!role_bypasses_managed_credits("reasoning", &config));
+}
+
+#[test]
+fn default_config_with_no_key_stays_gated() {
+    // No BYO provider at all → both chat-mode tiers gated.
+    let config = Config::default();
+    assert!(!role_bypasses_managed_credits("chat", &config));
+    assert!(!role_bypasses_managed_credits("reasoning", &config));
+}
+
+#[test]
+fn byo_route_without_usable_key_stays_gated() {
+    let tmp = TempDir::new().expect("tempdir");
+    // chat tier points at a BYO slug with NO stored key — the route would fail
+    // with an auth error, not bill managed credits, but we must not bypass for a
+    // route that cannot run on the user's dime (#3767: "BYO key present but
+    // invalid/unverified → still gated").
+    let mut config = config_with_providers_in_tempdir(&tmp, vec![openai_entry("p_oai", "openai")]);
+    config.chat_provider = Some("openai:gpt-4o".to_string());
+
+    // The explicit route is still honored verbatim by provider_for_role…
+    assert_eq!(provider_for_role("chat", &config), "openai:gpt-4o");
+    // …but with no usable key the gate stays on.
+    assert!(!role_bypasses_managed_credits("chat", &config));
+
+    // Once a key is stored, the route becomes a genuine bypass.
+    store_byo_key(&config, "openai", "sk-byo-test");
+    assert!(role_bypasses_managed_credits("chat", &config));
 }

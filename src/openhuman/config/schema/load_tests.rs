@@ -188,6 +188,57 @@ fn apply_env_overrides_reasoning_enabled_parses_truthy_falsy() {
 }
 
 #[test]
+fn apply_env_overrides_shell_hide_window_parses_truthy_falsy() {
+    let _g = env_lock();
+    clear_env(&["OPENHUMAN_SHELL_HIDE_WINDOW", "SHELL_HIDE_WINDOW"]);
+    let mut cfg = Config::default();
+    assert!(!cfg.shell.hide_window, "default should be off");
+
+    unsafe {
+        std::env::set_var("OPENHUMAN_SHELL_HIDE_WINDOW", "on");
+    }
+    cfg.apply_env_overrides();
+    assert!(cfg.shell.hide_window);
+
+    unsafe {
+        std::env::set_var("OPENHUMAN_SHELL_HIDE_WINDOW", "false");
+    }
+    cfg.apply_env_overrides();
+    assert!(!cfg.shell.hide_window);
+
+    // The unprefixed alias `SHELL_HIDE_WINDOW` is honored too.
+    unsafe {
+        std::env::remove_var("OPENHUMAN_SHELL_HIDE_WINDOW");
+        std::env::set_var("SHELL_HIDE_WINDOW", "on");
+    }
+    cfg.apply_env_overrides();
+    assert!(cfg.shell.hide_window, "alias should set hide_window");
+
+    // The namespaced var takes precedence over the alias when both are set.
+    unsafe {
+        std::env::set_var("OPENHUMAN_SHELL_HIDE_WINDOW", "off");
+        std::env::set_var("SHELL_HIDE_WINDOW", "on");
+    }
+    cfg.apply_env_overrides();
+    assert!(
+        !cfg.shell.hide_window,
+        "OPENHUMAN_-prefixed var should win over the alias"
+    );
+
+    // Unknown value leaves the field unchanged.
+    cfg.shell.hide_window = true;
+    unsafe {
+        std::env::set_var("OPENHUMAN_SHELL_HIDE_WINDOW", "maybe");
+        std::env::remove_var("SHELL_HIDE_WINDOW");
+    }
+    cfg.apply_env_overrides();
+    assert!(cfg.shell.hide_window);
+    unsafe {
+        std::env::remove_var("OPENHUMAN_SHELL_HIDE_WINDOW");
+    }
+}
+
+#[test]
 fn apply_env_overrides_web_search_limits_only() {
     let _g = env_lock();
     clear_env(&[
@@ -565,6 +616,29 @@ fn env_overlay_autonomy_max_actions_per_hour_accepts_valid_u32() {
         cfg.autonomy.max_actions_per_hour, 64,
         "invalid env value must leave the configured limit unchanged"
     );
+}
+
+#[test]
+fn env_overlay_memory_sync_interval_parses_and_honours_zero() {
+    let mut cfg = Config::default();
+    assert!(cfg.memory_sync_interval_secs.is_none());
+
+    // A positive value is stored verbatim.
+    cfg.apply_env_overlay_with(&HashMapEnv::new().with(MEMORY_SYNC_INTERVAL_SECS_ENV_VAR, "14400"));
+    assert_eq!(cfg.memory_sync_interval_secs, Some(14_400));
+
+    // `0` is honoured as the "Manual only" sentinel (unlike the per-provider
+    // override which rejects it).
+    cfg.apply_env_overlay_with(&HashMapEnv::new().with(MEMORY_SYNC_INTERVAL_SECS_ENV_VAR, "0"));
+    assert_eq!(cfg.memory_sync_interval_secs, Some(0));
+
+    // A non-numeric value is ignored, leaving the previous value intact.
+    cfg.apply_env_overlay_with(&HashMapEnv::new().with(MEMORY_SYNC_INTERVAL_SECS_ENV_VAR, "nope"));
+    assert_eq!(cfg.memory_sync_interval_secs, Some(0));
+
+    // A blank value is ignored too.
+    cfg.apply_env_overlay_with(&HashMapEnv::new().with(MEMORY_SYNC_INTERVAL_SECS_ENV_VAR, "  "));
+    assert_eq!(cfg.memory_sync_interval_secs, Some(0));
 }
 
 #[test]
@@ -959,6 +1033,30 @@ fn env_overlay_context_tool_result_budget_env_suppresses_legacy_migration() {
         cfg.context.tool_result_budget_bytes, default_budget,
         "env presence must suppress the legacy agent→context copy"
     );
+}
+
+#[test]
+fn env_overlay_compaction_default_on_and_kill_switch() {
+    // Default is on.
+    assert!(Config::default().context.compaction_enabled);
+
+    // `OPENHUMAN_COMPACTION=0` disables it.
+    let mut cfg = Config::default();
+    cfg.apply_env_overlay_with(&HashMapEnv::new().with("OPENHUMAN_COMPACTION", "0"));
+    assert!(!cfg.context.compaction_enabled);
+
+    // Truthy re-enables; the namespaced alias works too.
+    let mut cfg = Config::default();
+    cfg.context.compaction_enabled = false;
+    cfg.apply_env_overlay_with(
+        &HashMapEnv::new().with("OPENHUMAN_CONTEXT_COMPACTION_ENABLED", "on"),
+    );
+    assert!(cfg.context.compaction_enabled);
+
+    // Garbage is ignored (leaves the prior value untouched).
+    let mut cfg = Config::default();
+    cfg.apply_env_overlay_with(&HashMapEnv::new().with("OPENHUMAN_COMPACTION", "maybe"));
+    assert!(cfg.context.compaction_enabled);
 }
 
 #[test]
@@ -1496,30 +1594,38 @@ default_temperature = 0.5
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn load_or_init_read_failure_embeds_path_in_error_context() {
     // OPENHUMAN-TAURI-9R (~8k events, Windows): the read at the
     // `config_path.exists()` branch raced `Config::save`'s atomic rename
     // and surfaced the opaque "Failed to read config file" with no path
     // or underlying cause. The fix retries transient Windows locking
-    // errors AND embeds the config path in the context so any residual
-    // non-transient failure is triageable in Sentry.
+    // errors AND embeds the config path in the context; #3962 additionally
+    // surfaces the underlying io cause (`os error N`) through `{:#}`.
     //
-    // Simulate a non-transient read failure portably by placing a
-    // *directory* at the config path: `exists()` is true (so we enter the
-    // read branch), but `read_to_string` fails with EISDIR (unix) /
-    // ERROR_ACCESS_DENIED (windows) — neither is classified transient by
-    // `is_transient_fs_error`, so the retry bails immediately and returns
-    // the path-embedded context.
+    // Trigger a genuine non-transient read failure with a 0o000 (unreadable)
+    // *regular* file — not a directory, which `impl_load` now rejects with a
+    // distinct message before the read (see the directory guard / Codex P2).
+    // `exists()` is true so we enter the read branch; `read_to_string` fails
+    // with EACCES, which `is_transient_fs_error` does not retry. Skipped under
+    // root, which ignores file permissions.
+    use std::os::unix::fs::PermissionsExt;
+
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let config_path = root.join("config.toml");
-    std::fs::create_dir(&config_path).unwrap();
+    std::fs::write(&config_path, "default_temperature = 0.5\n").unwrap();
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    if std::fs::read_to_string(&config_path).is_ok() {
+        return; // running as root — permissions are ignored, assertion is moot
+    }
 
     let env = MapEnv::default().with("OPENHUMAN_WORKSPACE", root.to_str().unwrap());
     let err = Config::load_or_init_with_env_lookup(root, &root.join("workspace"), &env)
         .await
-        .expect_err("reading a directory as config.toml must fail");
+        .expect_err("reading an unreadable config.toml must fail");
 
     let msg = format!("{err:#}");
     assert!(
@@ -1529,6 +1635,10 @@ async fn load_or_init_read_failure_embeds_path_in_error_context() {
     assert!(
         msg.contains("config.toml"),
         "error context must embed the config path so Sentry titles are triageable: {msg}"
+    );
+    assert!(
+        msg.contains("os error"),
+        "error must carry the underlying io cause via {{:#}} (#3962): {msg}"
     );
 }
 
@@ -1720,6 +1830,7 @@ allowed_users = ["@admin"]
     };
     cfg.channels_config.telegram = Some(TelegramConfig {
         bot_token: known_secret.to_string(),
+        chat_id: None,
         allowed_users: vec!["@admin".to_string()],
         stream_mode: StreamMode::Off,
         draft_update_interval_ms: 1000,
@@ -1844,5 +1955,96 @@ allowed_users = ["@admin"]
         Some(known_secret),
         "backwards-compat broken: legacy plaintext bot_token did not load as cleartext \
          (got {reloaded_token:?})"
+    );
+}
+
+// ── resolve_action_dir precedence (env > override > default), issue #3240 ──────
+
+#[test]
+fn resolve_action_dir_env_beats_override_and_default() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        std::env::set_var(ACTION_DIR_ENV_VAR, "/tmp/env-action-dir");
+    }
+    let over = Some(PathBuf::from("/tmp/override-action-dir"));
+    assert_eq!(
+        resolve_action_dir(&over),
+        PathBuf::from("/tmp/env-action-dir"),
+        "env var must win over a persisted override"
+    );
+    unsafe {
+        std::env::remove_var(ACTION_DIR_ENV_VAR);
+    }
+}
+
+#[test]
+fn resolve_action_dir_override_beats_default_when_no_env() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        std::env::remove_var(ACTION_DIR_ENV_VAR);
+    }
+    let over = Some(PathBuf::from("/tmp/override-action-dir"));
+    assert_eq!(
+        resolve_action_dir(&over),
+        PathBuf::from("/tmp/override-action-dir"),
+        "override must be used when no env var is set"
+    );
+}
+
+#[test]
+fn resolve_action_dir_falls_back_to_default_when_none() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        std::env::remove_var(ACTION_DIR_ENV_VAR);
+    }
+    assert_eq!(
+        resolve_action_dir(&None),
+        default_projects_dir(),
+        "no env + no override must fall back to the default projects dir"
+    );
+}
+
+#[test]
+fn resolve_action_dir_blank_env_does_not_pin() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        std::env::set_var(ACTION_DIR_ENV_VAR, "   ");
+    }
+    let over = Some(PathBuf::from("/tmp/override-action-dir"));
+    assert_eq!(
+        resolve_action_dir(&over),
+        PathBuf::from("/tmp/override-action-dir"),
+        "blank env var must be ignored so the override still applies"
+    );
+    unsafe {
+        std::env::remove_var(ACTION_DIR_ENV_VAR);
+    }
+}
+
+#[test]
+fn resolve_action_dir_rejects_relative_override() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        std::env::remove_var(ACTION_DIR_ENV_VAR);
+    }
+    let over = Some(PathBuf::from("relative/projects"));
+    assert_eq!(
+        resolve_action_dir(&over),
+        default_projects_dir(),
+        "relative override must be ignored, falling back to default"
+    );
+}
+
+#[test]
+fn resolve_action_dir_rejects_empty_override() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        std::env::remove_var(ACTION_DIR_ENV_VAR);
+    }
+    let over = Some(PathBuf::from(""));
+    assert_eq!(
+        resolve_action_dir(&over),
+        default_projects_dir(),
+        "empty override must be ignored, falling back to default"
     );
 }

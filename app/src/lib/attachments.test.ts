@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  ALLOWED_ATTACHMENT_MIME_TYPES,
   type Attachment,
+  ATTACHMENT_MAX_FILE_SIZE_BYTES,
   ATTACHMENT_MAX_IMAGES,
   ATTACHMENT_MAX_SIZE_BYTES,
   buildMessageWithAttachments,
@@ -20,9 +22,13 @@ function makeFile(name: string, type: string, size = 1024): File {
 function makeAttachment(overrides: Partial<Attachment> = {}): Attachment {
   return {
     id: 'test-id',
+    kind: 'image',
     file: makeFile('test.png', 'image/png'),
     dataUri: 'data:image/png;base64,abc',
     mimeType: 'image/png',
+    originalSizeBytes: 1024,
+    payloadSizeBytes: 1024,
+    compressed: false,
     ...overrides,
   };
 }
@@ -41,6 +47,14 @@ describe('isAllowedMimeType', () => {
     expect(isAllowedMimeType('text/plain')).toBe(false);
     expect(isAllowedMimeType('image/svg+xml')).toBe(false);
     expect(isAllowedMimeType('')).toBe(false);
+  });
+});
+
+describe('allowed attachment MIME types', () => {
+  it('includes images and supported document files', () => {
+    expect(ALLOWED_ATTACHMENT_MIME_TYPES).toContain('image/png');
+    expect(ALLOWED_ATTACHMENT_MIME_TYPES).toContain('application/pdf');
+    expect(ALLOWED_ATTACHMENT_MIME_TYPES).toContain('text/plain');
   });
 });
 
@@ -63,11 +77,58 @@ describe('validateAndReadFile', () => {
   });
 
   it('rejects unsupported MIME types', async () => {
-    const file = makeFile('doc.pdf', 'application/pdf');
+    const file = makeFile('vector.svg', 'image/svg+xml');
     const result = await validateAndReadFile(file, 0);
     expect('error' in result).toBe(true);
     if ('error' in result) {
       expect(result.error.code).toBe('unsupported_type');
+    }
+  });
+
+  it('rejects non-extractable documents (docx/pptx/xlsx) the agent cannot read', async () => {
+    for (const mime of [
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/zip',
+    ]) {
+      const result = await validateAndReadFile(makeFile('f', mime, 8), 0);
+      expect('error' in result && result.error.code).toBe('unsupported_type');
+    }
+  });
+
+  it('accepts the text-extractable document formats (pdf/txt/markdown)', async () => {
+    for (const mime of ['application/pdf', 'text/plain', 'text/markdown']) {
+      const result = await validateAndReadFile(makeFile('f', mime, 8), 0);
+      expect('attachment' in result && result.attachment.kind === 'file').toBe(true);
+    }
+  });
+
+  it('rejects an image when allowImages is false (non-vision model)', async () => {
+    const result = await validateAndReadFile(makeFile('p.png', 'image/png', 8), 0, 0, false);
+    expect('error' in result && result.error.code).toBe('image_not_supported');
+  });
+
+  it('still accepts a document when allowImages is false', async () => {
+    const result = await validateAndReadFile(makeFile('d.pdf', 'application/pdf', 8), 0, 0, false);
+    expect('attachment' in result && result.attachment.kind === 'file').toBe(true);
+  });
+
+  it('accepts an image when allowImages is true (vision model)', async () => {
+    const result = await validateAndReadFile(makeFile('p.png', 'image/png', 8), 0, 0, true);
+    expect('attachment' in result && result.attachment.kind === 'image').toBe(true);
+  });
+
+  it('rejects files that exceed the file size limit', async () => {
+    const oversizedFile = makeFile(
+      'big.pdf',
+      'application/pdf',
+      ATTACHMENT_MAX_FILE_SIZE_BYTES + 1
+    );
+    const result = await validateAndReadFile(oversizedFile, 0);
+    expect('error' in result).toBe(true);
+    if ('error' in result) {
+      expect(result.error.code).toBe('too_large');
     }
   });
 
@@ -86,8 +147,21 @@ describe('validateAndReadFile', () => {
     expect('attachment' in result).toBe(true);
     if ('attachment' in result) {
       expect(result.attachment.mimeType).toBe('image/png');
+      expect(result.attachment.kind).toBe('image');
       expect(result.attachment.dataUri).toMatch(/^data:image\/png;base64,/);
       expect(result.attachment.file).toBe(file);
+      expect(result.attachment.compressed).toBe(false);
+    }
+  });
+
+  it('returns an attachment for a supported file', async () => {
+    const file = makeFile('doc.pdf', 'application/pdf', 512);
+    const result = await validateAndReadFile(file, 0);
+    expect('attachment' in result).toBe(true);
+    if ('attachment' in result) {
+      expect(result.attachment.mimeType).toBe('application/pdf');
+      expect(result.attachment.kind).toBe('file');
+      expect(result.attachment.dataUri).toMatch(/^data:application\/pdf;base64,/);
     }
   });
 
@@ -138,6 +212,17 @@ describe('buildMessageWithAttachments', () => {
     expect(result).toBe('look [IMAGE:data:image/png;base64,a] [IMAGE:data:image/jpeg;base64,b]');
   });
 
+  it('emits FILE markers for non-image attachments', () => {
+    const a = makeAttachment({
+      kind: 'file',
+      file: makeFile('doc.pdf', 'application/pdf'),
+      dataUri: 'data:application/pdf;base64,abc',
+      mimeType: 'application/pdf',
+    });
+    const result = buildMessageWithAttachments('read this', [a]);
+    expect(result).toBe('read this [FILE:data:application/pdf;base64,abc]');
+  });
+
   it('trims leading/trailing whitespace from text', () => {
     const a = makeAttachment({ dataUri: 'data:image/png;base64,x' });
     const result = buildMessageWithAttachments('  hi  ', [a]);
@@ -170,6 +255,41 @@ describe('parseMessageImages', () => {
     const result = parseMessageImages('[IMAGE:data:image/png;base64,xyz]');
     expect(result.text).toBe('');
     expect(result.dataUris).toHaveLength(1);
+  });
+
+  it('strips FILE markers without including them in dataUris', () => {
+    const result = parseMessageImages('read this [FILE:data:application/pdf;base64,xyz]');
+    expect(result.text).toBe('read this');
+    expect(result.dataUris).toEqual([]);
+  });
+
+  it('handles mixed IMAGE and FILE markers', () => {
+    const result = parseMessageImages(
+      'check this [IMAGE:data:image/png;base64,a] and [FILE:data:application/pdf;base64,b] thanks'
+    );
+    expect(result.text).toBe('check this and thanks');
+    expect(result.dataUris).toEqual(['data:image/png;base64,a']);
+  });
+
+  it('strips multiple FILE markers', () => {
+    const result = parseMessageImages(
+      '[FILE:data:application/pdf;base64,a] [FILE:data:text/plain;base64,b]'
+    );
+    expect(result.text).toBe('');
+    expect(result.dataUris).toEqual([]);
+  });
+
+  it('preserves paragraph breaks (double newlines) in user text', () => {
+    const result = parseMessageImages('first paragraph\n\nsecond paragraph');
+    expect(result.text).toBe('first paragraph\n\nsecond paragraph');
+  });
+
+  it('preserves newlines when stripping a marker', () => {
+    const result = parseMessageImages(
+      'first paragraph\n\n[FILE:data:application/pdf;base64,x]\n\nsecond paragraph'
+    );
+    expect(result.text).toBe('first paragraph\n\n\n\nsecond paragraph');
+    expect(result.text).toContain('\n\n');
   });
 });
 

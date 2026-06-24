@@ -20,6 +20,30 @@ use tempfile::tempdir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 fn test_config(tmp: &tempfile::TempDir) -> Config {
     Config {
         config_path: tmp.path().join("config.toml"),
@@ -290,6 +314,31 @@ fn persist_openai_oauth_token_stores_oauth_profile_with_metadata() {
 }
 
 #[test]
+fn persist_openai_oauth_token_rejects_blank_access_token() {
+    let tmp = tempdir().unwrap();
+    let config = test_config(&tmp);
+    let token = motosan_ai_oauth::Token {
+        access_token: "   ".into(),
+        refresh_token: "refresh-token".into(),
+        id_token: Some("id-token".into()),
+        expires_in: 3600,
+        issued_at: 123,
+    };
+
+    let err = persist_openai_oauth_token(&config, &token).unwrap_err();
+    assert!(
+        err.contains("access_token"),
+        "expected missing access_token error, got: {err}"
+    );
+
+    let data = AuthProfilesStore::new(tmp.path(), false).load().unwrap();
+    assert!(
+        data.profiles.is_empty(),
+        "blank-access OAuth token should not be persisted"
+    );
+}
+
+#[test]
 fn import_codex_cli_auth_file_stores_oauth_profile_with_account_metadata() {
     let tmp = tempdir().unwrap();
     let config = test_config(&tmp);
@@ -417,6 +466,67 @@ fn import_codex_cli_auth_file_reports_missing_file_with_login_hint() {
     assert!(err.contains("codex login"));
 }
 
+/// Drift-proof coupling: every user-state error the real Codex-CLI import
+/// producer emits MUST classify as `CodexCliAuthUnavailable`, so the Sentry
+/// demotion at `ops.rs` (TAURI-RUST-83A) keeps working even if the wording
+/// changes. If a future edit to `store.rs` drops the `codex cli auth` /
+/// `.codex/auth.json` anchor from a message, this test fails in CI.
+#[test]
+fn codex_import_user_state_errors_classify_as_expected() {
+    use crate::core::observability::{expected_error_kind, ExpectedErrorKind};
+
+    let tmp = tempdir().unwrap();
+    let config = test_config(&tmp);
+
+    // Missing file (no `codex login`).
+    let missing = import_codex_cli_auth_from_path(&config, &tmp.path().join("missing-auth.json"))
+        .unwrap_err();
+
+    // Unparseable file.
+    let garbage_path = tmp.path().join("garbage-auth.json");
+    std::fs::write(&garbage_path, b"not json").unwrap();
+    let garbage = import_codex_cli_auth_from_path(&config, &garbage_path).unwrap_err();
+
+    // Parses but carries no tokens.
+    let no_tokens_path = tmp.path().join("no-tokens-auth.json");
+    std::fs::write(&no_tokens_path, b"{}").unwrap();
+    let no_tokens = import_codex_cli_auth_from_path(&config, &no_tokens_path).unwrap_err();
+
+    // Parses with a tokens object but no access token.
+    let no_access_path = tmp.path().join("no-access-auth.json");
+    std::fs::write(&no_access_path, br#"{"tokens":{"refresh_token":"r"}}"#).unwrap();
+    let no_access = import_codex_cli_auth_from_path(&config, &no_access_path).unwrap_err();
+
+    for err in [&missing, &garbage, &no_tokens, &no_access] {
+        assert_eq!(
+            expected_error_kind(err),
+            Some(ExpectedErrorKind::CodexCliAuthUnavailable),
+            "codex import user-state error must classify as CodexCliAuthUnavailable: {err}"
+        );
+    }
+}
+
+/// Exercise the ops entry point (`inference_openai_oauth_import_codex_cli`) on
+/// the failure path so the `report_error_or_expected` call at the match arm is
+/// covered: point `CODEX_HOME` at an empty dir (no `auth.json`) and assert the
+/// RPC surfaces the actionable error.
+#[tokio::test]
+async fn inference_import_codex_cli_surfaces_error_when_auth_missing() {
+    let _env_lock = crate::openhuman::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tmp = tempdir().unwrap();
+    let config = test_config(&tmp);
+    let _env_guard = EnvVarGuard::set("CODEX_HOME", tmp.path());
+
+    let err = crate::openhuman::inference::ops::inference_openai_oauth_import_codex_cli(&config)
+        .await
+        .unwrap_err();
+
+    assert!(err.contains("Could not read Codex CLI auth"));
+    assert!(err.contains("codex login"));
+}
+
 #[test]
 fn openai_oauth_status_reports_token_profile_as_disconnected() {
     let tmp = tempdir().unwrap();
@@ -493,6 +603,41 @@ fn lookup_openai_bearer_token_uses_oauth_when_api_key_missing() {
 }
 
 #[test]
+fn credits_gate_bypassed_with_oauth_only_credentials() {
+    // #3767 regression: the per-tier credits-gate bypass chains through
+    // route_has_usable_credentials → lookup_key_for_slug, which falls back to
+    // the OpenAI OAuth token for the `openai` slug. Pin that OAuth-only
+    // credentials (no new-style provider key) bypass the gate when the chat tier
+    // is routed to a concrete OpenAI model.
+    use crate::openhuman::inference::provider::factory::role_bypasses_managed_credits;
+
+    let tmp = tempdir().unwrap();
+    let mut config = test_config(&tmp);
+    config.chat_provider = Some("openai:gpt-4o".into());
+
+    // No credential yet → gate stays on.
+    assert!(!role_bypasses_managed_credits("chat", &config));
+
+    let store = AuthProfilesStore::new(tmp.path(), false);
+    let oauth_profile = AuthProfile::new_oauth(
+        OPENAI_PROVIDER_KEY,
+        OPENAI_OAUTH_PROFILE_NAME,
+        TokenSet {
+            access_token: "oauth-access".into(),
+            refresh_token: Some("refresh".into()),
+            id_token: None,
+            expires_at: Some(Utc::now() + Duration::hours(1)),
+            token_type: Some("Bearer".into()),
+            scope: None,
+        },
+    );
+    store.upsert_profile(oauth_profile, true).unwrap();
+
+    // OAuth-only credential now backs the route → gate bypassed.
+    assert!(role_bypasses_managed_credits("chat", &config));
+}
+
+#[test]
 fn lookup_key_for_slug_uses_legacy_openai_api_key_when_new_style_is_empty() {
     let tmp = tempdir().unwrap();
     let config = test_config(&tmp);
@@ -544,6 +689,66 @@ fn lookup_openai_bearer_token_keeps_expired_token_when_refresh_fails_without_run
 
     let token = lookup_openai_bearer_token(&config).unwrap();
     assert_eq!(token.as_deref(), Some("expired-access"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lookup_openai_bearer_token_does_not_persist_blank_refreshed_access_token() {
+    let _env_lock = crate::openhuman::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tmp = tempdir().unwrap();
+    let config = test_config(&tmp);
+    let store = AuthProfilesStore::new(tmp.path(), false);
+    let original_profile = AuthProfile::new_oauth(
+        OPENAI_PROVIDER_KEY,
+        OPENAI_OAUTH_PROFILE_NAME,
+        TokenSet {
+            access_token: "oauth-access".into(),
+            refresh_token: Some("refresh-token".into()),
+            id_token: None,
+            expires_at: Some(Utc::now() - Duration::minutes(5)),
+            token_type: Some("Bearer".into()),
+            scope: None,
+        },
+    );
+    store.upsert_profile(original_profile, true).unwrap();
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "   ",
+            "refresh_token": "refresh-updated",
+            "id_token": "id-updated",
+            "expires_in": 3600,
+        })))
+        .mount(&server)
+        .await;
+
+    let _env_guard = EnvVarGuard::set(
+        "OPENAI_CODEX_OAUTH_TOKEN_URL",
+        format!("{}/token", server.uri()),
+    );
+
+    let token = lookup_openai_bearer_token(&config).unwrap();
+    assert_eq!(
+        token.as_deref(),
+        Some("oauth-access"),
+        "invalid refresh payload should not replace the last known good access token"
+    );
+
+    let reloaded = AuthProfilesStore::new(tmp.path(), false).load().unwrap();
+    let stored = reloaded
+        .profiles
+        .get(&format!(
+            "{OPENAI_PROVIDER_KEY}:{OPENAI_OAUTH_PROFILE_NAME}"
+        ))
+        .expect("oauth profile should still exist after invalid refresh response");
+    let token_set = stored.token_set.as_ref().expect("oauth token_set");
+    assert_eq!(
+        token_set.access_token, "oauth-access",
+        "invalid refresh payload should not be persisted"
+    );
 }
 
 #[test]

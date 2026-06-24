@@ -53,8 +53,10 @@ pub fn all_controller_schemas() -> Vec<ControllerSchema> {
         schemas("update"),
         schemas("remove"),
         schemas("fetch"),
+        schemas("sync"),
         schemas("list_tasks"),
         schemas("preview_filter"),
+        schemas("list_databases"),
         schemas("status"),
     ]
 }
@@ -86,12 +88,20 @@ pub fn all_registered_controllers() -> Vec<RegisteredController> {
             handler: handle_fetch,
         },
         RegisteredController {
+            schema: schemas("sync"),
+            handler: handle_sync,
+        },
+        RegisteredController {
             schema: schemas("list_tasks"),
             handler: handle_list_tasks,
         },
         RegisteredController {
             schema: schemas("preview_filter"),
             handler: handle_preview_filter,
+        },
+        RegisteredController {
+            schema: schemas("list_databases"),
+            handler: handle_list_databases,
         },
         RegisteredController {
             schema: schemas("status"),
@@ -225,6 +235,12 @@ pub fn schemas(function: &str) -> ControllerSchema {
                             comment: "True when the source was removed.",
                             required: true,
                         },
+                        FieldSchema {
+                            name: "pruned",
+                            ty: TypeSchema::U64,
+                            comment: "Count of ingested refs/cards pruned during removal.",
+                            required: true,
+                        },
                     ],
                 },
                 comment: "Removal result payload.",
@@ -234,7 +250,7 @@ pub fn schemas(function: &str) -> ControllerSchema {
         "fetch" => ControllerSchema {
             namespace: "task_sources",
             function: "fetch",
-            description: "Fetch one source immediately and route any new tasks.",
+            description: "Fetch one source immediately, route new tasks, and prune tasks no longer returned by the source.",
             inputs: vec![source_id_input(
                 "Identifier of the task source to fetch now.",
             )],
@@ -242,6 +258,18 @@ pub fn schemas(function: &str) -> ControllerSchema {
                 name: "outcome",
                 ty: TypeSchema::Ref("FetchOutcome"),
                 comment: "Fetch outcome counts.",
+                required: true,
+            }],
+        },
+        "sync" => ControllerSchema {
+            namespace: "task_sources",
+            function: "sync",
+            description: "Fetch every enabled source immediately, route new tasks, and prune tasks no longer returned by their source.",
+            inputs: vec![],
+            outputs: vec![FieldSchema {
+                name: "outcomes",
+                ty: TypeSchema::Array(Box::new(TypeSchema::Ref("FetchOutcome"))),
+                comment: "Fetch outcome counts for each enabled source.",
                 required: true,
             }],
         },
@@ -289,6 +317,26 @@ pub fn schemas(function: &str) -> ControllerSchema {
                 name: "tasks",
                 ty: TypeSchema::Array(Box::new(TypeSchema::Ref("NormalizedTask"))),
                 comment: "Tasks that would be ingested (not routed).",
+                required: true,
+            }],
+        },
+        "list_databases" => ControllerSchema {
+            namespace: "task_sources",
+            function: "list_databases",
+            description: "List selectable containers (e.g. Notion databases) for a provider/connection so the UI can offer a picker.",
+            inputs: vec![
+                provider_input(),
+                FieldSchema {
+                    name: "connection_id",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::String)),
+                    comment: "Optional Composio connection id.",
+                    required: false,
+                },
+            ],
+            outputs: vec![FieldSchema {
+                name: "databases",
+                ty: TypeSchema::Array(Box::new(TypeSchema::Json)),
+                comment: "Selectable containers, each `{ id, title }`.",
                 required: true,
             }],
         },
@@ -419,6 +467,13 @@ fn handle_fetch(params: Map<String, Value>) -> ControllerFuture {
     })
 }
 
+fn handle_sync(_params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let config = config_rpc::load_config_with_timeout().await?;
+        to_json(ops::sync(&config).await?)
+    })
+}
+
 fn handle_list_tasks(params: Map<String, Value>) -> ControllerFuture {
     Box::pin(async move {
         let config = config_rpc::load_config_with_timeout().await?;
@@ -442,6 +497,15 @@ fn handle_preview_filter(params: Map<String, Value>) -> ControllerFuture {
         let connection_id = read_optional::<String>(&params, "connection_id")?;
         let max = read_optional_u32(&params, "max")?;
         to_json(ops::preview_filter(&config, provider, filter, connection_id, max).await?)
+    })
+}
+
+fn handle_list_databases(params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let config = config_rpc::load_config_with_timeout().await?;
+        let provider = read_provider(&params)?;
+        let connection_id = read_optional::<String>(&params, "connection_id")?;
+        to_json(ops::list_databases(&config, provider, connection_id).await?)
     })
 }
 
@@ -516,8 +580,10 @@ mod tests {
                 "update",
                 "remove",
                 "fetch",
+                "sync",
                 "list_tasks",
                 "preview_filter",
+                "list_databases",
                 "status"
             ]
         );
@@ -526,7 +592,7 @@ mod tests {
     #[test]
     fn all_registered_controllers_has_handler_per_schema() {
         let controllers = all_registered_controllers();
-        assert_eq!(controllers.len(), 9);
+        assert_eq!(controllers.len(), all_controller_schemas().len());
         assert!(controllers
             .iter()
             .all(|c| c.schema.namespace == "task_sources"));

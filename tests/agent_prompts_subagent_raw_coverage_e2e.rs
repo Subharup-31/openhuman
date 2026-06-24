@@ -225,6 +225,7 @@ fn tool_response(name: &str, arguments: serde_json::Value) -> ChatResponse {
             id: "round18-call".to_string(),
             name: name.to_string(),
             arguments: arguments.to_string(),
+            extra_content: None,
         }],
         usage: None,
         reasoning_content: Some("test reasoning".to_string()),
@@ -259,6 +260,7 @@ fn definition(prompt: PromptSource) -> AgentDefinition {
         timeout_secs: None,
         sandbox_mode: SandboxMode::None,
         background: false,
+        trigger_memory_agent: Default::default(),
         subagents: Vec::new(),
         delegate_name: None,
         agent_tier: Default::default(),
@@ -270,15 +272,24 @@ fn parent(workspace: PathBuf, provider: Arc<ScriptedProvider>) -> ParentExecutio
     let tools = vec![tool("echo"), tool("delegate_nested"), tool("other__skip")];
     let specs = tools.iter().map(|tool| tool.spec()).collect();
     ParentExecutionContext {
+        agent_definition_id: "orchestrator".into(),
+        allowed_subagent_ids: [
+            "test".to_string(),
+            "researcher".to_string(),
+            "code_executor".to_string(),
+        ]
+        .into_iter()
+        .collect(),
         provider,
         all_tools: Arc::new(tools),
         all_tool_specs: Arc::new(specs),
+        visible_tool_names: std::collections::HashSet::new(),
         model_name: "round18-model".to_string(),
         temperature: 0.0,
         workspace_dir: workspace,
         memory: Arc::new(StubMemory),
         agent_config: AgentConfig::default(),
-        skills: Arc::new(Vec::new()),
+        workflows: Arc::new(Vec::new()),
         memory_context: Arc::new(Some("parent memory survives when allowed".to_string())),
         session_id: "round18-session".to_string(),
         channel: "round18".to_string(),
@@ -287,6 +298,7 @@ fn parent(workspace: PathBuf, provider: Arc<ScriptedProvider>) -> ParentExecutio
         session_key: "1700000000_round18_parent".to_string(),
         session_parent_prefix: None,
         on_progress: None,
+        run_queue: None,
     }
 }
 
@@ -300,7 +312,7 @@ fn prompt_context<'a>(
         model_name: "round18-model",
         agent_id: "round18_agent",
         tools,
-        skills: &[],
+        workflows: &[],
         dispatcher_instructions: "dispatcher rules",
         learned: LearnedContextData {
             reflections: vec!["Prefer direct answers.".to_string(), "   ".to_string()],
@@ -331,7 +343,6 @@ fn prompt_context<'a>(
         personality_soul_md: Some("personality soul override".to_string()),
         personality_memory_md: None,
         personality_roster: vec![],
-        workflows: &[],
     }
 }
 

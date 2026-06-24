@@ -62,6 +62,7 @@ async fn query_namespace_uses_graph_signal_for_document_ranking() {
             category: "core".to_string(),
             session_id: None,
             document_id: None,
+            taint: crate::openhuman::memory::MemoryTaint::Internal,
         })
         .await
         .unwrap();
@@ -104,6 +105,7 @@ async fn query_scores_relation_entities_found_in_document_content() {
             category: "core".to_string(),
             session_id: None,
             document_id: None,
+            taint: crate::openhuman::memory::MemoryTaint::Internal,
         })
         .await
         .unwrap();
@@ -262,6 +264,63 @@ async fn query_episodic_hits_have_correct_kind() {
     }
 }
 
+/// Episodic FTS relevance is derived from each hit's rank position
+/// (`1.0 - idx / len`). With two equally-fresh matches the only
+/// differentiator is rank, so the relevance scores must be exactly the
+/// per-position values {1.0, 0.5}. This pins the position-indexing math
+/// for n > 1 — the single-entry tests above cannot, since idx is always 0.
+#[tokio::test]
+async fn query_episodic_relevance_tracks_rank_position() {
+    use crate::openhuman::memory_store::fts5::{self, EpisodicEntry};
+
+    let tmp = TempDir::new().unwrap();
+    let memory = UnifiedMemory::new(tmp.path(), Arc::new(NoopEmbedding), None).unwrap();
+
+    // Two distinct entries, identical timestamp (equal freshness), both
+    // matching the query so episodic_hits has len == 2.
+    for content in [
+        "I have been using Tokio for async Rust development",
+        "Tokio async runtime powers our backend services",
+    ] {
+        fts5::episodic_insert(
+            &memory.conn,
+            &EpisodicEntry {
+                id: None,
+                session_id: "sess-rank".into(),
+                timestamp: 1000.0,
+                role: "user".into(),
+                content: content.into(),
+                lesson: None,
+                tool_calls_json: None,
+                cost_microdollars: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    let hits = memory
+        .query_namespace_hits("global", "Tokio async", 10)
+        .await
+        .unwrap();
+
+    let mut relevances: Vec<f64> = hits
+        .iter()
+        .filter(|h| h.kind == crate::openhuman::memory_store::MemoryItemKind::Episodic)
+        .map(|h| h.score_breakdown.episodic_relevance)
+        .collect();
+    relevances.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    assert_eq!(
+        relevances.len(),
+        2,
+        "expected exactly two episodic hits, got {relevances:?}"
+    );
+    assert!(
+        (relevances[0] - 0.5).abs() < 1e-9 && (relevances[1] - 1.0).abs() < 1e-9,
+        "episodic relevance must be {{0.5, 1.0}} for two-element rank order, got {relevances:?}"
+    );
+}
+
 #[tokio::test]
 async fn query_supporting_relations_contain_entity_types() {
     let tmp = TempDir::new().unwrap();
@@ -280,6 +339,7 @@ async fn query_supporting_relations_contain_entity_types() {
             category: "core".to_string(),
             session_id: None,
             document_id: None,
+            taint: crate::openhuman::memory::MemoryTaint::Internal,
         })
         .await
         .unwrap();
@@ -386,6 +446,7 @@ async fn format_context_text_includes_entity_types() {
             category: "core".to_string(),
             session_id: None,
             document_id: None,
+            taint: crate::openhuman::memory::MemoryTaint::Internal,
         })
         .await
         .unwrap();
@@ -467,6 +528,7 @@ fn pref_doc(key: &str, content: &str) -> NamespaceDocumentInput {
         category: "core".to_string(),
         session_id: None,
         document_id: None,
+        taint: crate::openhuman::memory::MemoryTaint::Internal,
     }
 }
 
@@ -633,6 +695,7 @@ fn situational_doc(key: &str, content: &str) -> NamespaceDocumentInput {
         category: "core".to_string(),
         session_id: None,
         document_id: None,
+        taint: crate::openhuman::memory::MemoryTaint::Internal,
     }
 }
 

@@ -59,17 +59,9 @@ use openhuman_core::openhuman::agent::multimodal::{
     contains_image_markers, count_image_markers, extract_ollama_image_payload, parse_image_markers,
     prepare_messages_for_provider, MultimodalError,
 };
-use openhuman_core::openhuman::agent::personality_paths::{
-    filter_integrations, memory_subdir_for_suffix, memory_tree_subdir_for_suffix,
-    resolve_personality_memory_md, resolve_personality_soul, session_raw_subdir_for_suffix,
-    HasToolkit, PersonalityContext,
-};
 use openhuman_core::openhuman::agent::pformat::{
     build_registry, parse_call as parse_pformat_call, render_signature, render_signature_from_tool,
     PFormatParamType, PFormatRegistry, PFormatToolParams,
-};
-use openhuman_core::openhuman::agent::profiles::{
-    AgentProfile, AgentProfileStore, AgentProfilesState, DEFAULT_PROFILE_ID,
 };
 use openhuman_core::openhuman::agent::prompts::{
     render_ambient_environment, render_subagent_system_prompt, render_tools, ConnectedIntegration,
@@ -172,9 +164,21 @@ use openhuman_core::openhuman::inference::voice::local_speech::{synthesize_piper
 use openhuman_core::openhuman::inference::voice::postprocess::cleanup_transcription;
 use openhuman_core::openhuman::inference::{
     all_inference_controller_schemas, all_inference_registered_controllers,
-    all_local_ai_controller_schemas, all_local_ai_registered_controllers, DeviceProfile,
+    all_local_inference_controller_schemas, all_local_inference_registered_controllers,
+    DeviceProfile,
 };
 use openhuman_core::openhuman::memory::{Memory, MemoryCategory, MemoryEntry, RecallOpts};
+use openhuman_core::openhuman::profiles::{
+    all_profiles_controller_schemas, all_profiles_registered_controllers,
+};
+use openhuman_core::openhuman::profiles::{
+    filter_integrations, memory_subdir_for_suffix, memory_tree_subdir_for_suffix,
+    resolve_personality_memory_md, resolve_personality_soul, session_raw_subdir_for_suffix,
+    HasToolkit, PersonalityContext,
+};
+use openhuman_core::openhuman::profiles::{
+    AgentProfile, AgentProfileStore, AgentProfilesState, DEFAULT_PROFILE_ID,
+};
 use openhuman_core::openhuman::security::SecurityPolicy;
 use openhuman_core::openhuman::todos::ops::BoardLocation;
 use openhuman_core::openhuman::tools::{Tool, ToolResult, ToolSpec};
@@ -567,6 +571,7 @@ fn memory_entry(
         timestamp: "2026-05-29T12:00:00Z".to_string(),
         session_id: session_id.map(ToOwned::to_owned),
         score,
+        taint: Default::default(),
     }
 }
 
@@ -725,7 +730,7 @@ fn write_mock_piper(bin_dir: &std::path::Path, name: &str, exit_success: bool) -
         bin_dir,
         name,
         &format!(
-            "#!/bin/sh\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output_file\" ]; then\n    shift\n    out=\"$1\"\n  fi\n  shift\ndone\ncat >/dev/null\nif [ {exit_code} -ne 0 ]; then\n  echo 'mock piper failure' >&2\n  exit {exit_code}\nfi\nprintf 'RIFFmockWAVEfmt data' > \"$out\"\n"
+            "#!/bin/sh\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output_file\" ]; then\n    shift\n    out=\"$1\"\n  fi\n  shift\ndone\nwhile IFS= read -r _line; do\n  :\ndone\nif [ {exit_code} -ne 0 ]; then\n  echo 'mock piper failure' >&2\n  exit {exit_code}\nfi\nprintf 'RIFFmockWAVEfmt data' > \"$out\"\n"
         ),
     )
 }
@@ -1114,6 +1119,14 @@ async fn agent_registry_and_profile_controllers_cover_success_and_errors() {
         .iter()
         .all(|controller| controller.rpc_method_name().starts_with("openhuman.agent_")));
 
+    // Profiles moved to their own top-level domain (`openhuman.profiles_*`).
+    let profile_schemas = all_profiles_controller_schemas();
+    let profiles = all_profiles_registered_controllers();
+    assert_eq!(profile_schemas.len(), profiles.len());
+    assert!(profiles.iter().all(|controller| controller
+        .rpc_method_name()
+        .starts_with("openhuman.profiles_")));
+
     let status = call(controller(&registered, "server_status"), json!({}))
         .await
         .expect("server status");
@@ -1153,7 +1166,7 @@ async fn agent_registry_and_profile_controllers_cover_success_and_errors() {
     assert_eq!(reload.pointer("/status"), Some(&json!("noop")));
     assert_eq!(reload.pointer("/registry_initialised"), Some(&json!(true)));
 
-    let list = call(controller(&registered, "profiles_list"), json!({}))
+    let list = call(controller(&profiles, "list"), json!({}))
         .await
         .expect("profiles list");
     assert_eq!(
@@ -1168,7 +1181,7 @@ async fn agent_registry_and_profile_controllers_cover_success_and_errors() {
         .any(|profile| profile.pointer("/id") == Some(&json!("research"))));
 
     let unknown_agent = call(
-        controller(&registered, "profile_upsert"),
+        controller(&profiles, "upsert"),
         json!({
             "profile": {
                 "id": "Bad Agent",
@@ -1183,7 +1196,7 @@ async fn agent_registry_and_profile_controllers_cover_success_and_errors() {
     assert!(unknown_agent.contains("agent definition 'unknown-agent-id' not found"));
 
     let upserted = call(
-        controller(&registered, "profile_upsert"),
+        controller(&profiles, "upsert"),
         json!({
             "profile": {
                 "id": " My Research Profile ",
@@ -1218,7 +1231,7 @@ async fn agent_registry_and_profile_controllers_cover_success_and_errors() {
     );
 
     let selected = call(
-        controller(&registered, "profile_select"),
+        controller(&profiles, "select"),
         json!({ "profile_id": "my-research-profile" }),
     )
     .await
@@ -1229,7 +1242,7 @@ async fn agent_registry_and_profile_controllers_cover_success_and_errors() {
     );
 
     let missing_select = call(
-        controller(&registered, "profile_select"),
+        controller(&profiles, "select"),
         json!({ "profile_id": "missing-profile" }),
     )
     .await
@@ -1237,7 +1250,7 @@ async fn agent_registry_and_profile_controllers_cover_success_and_errors() {
     assert!(missing_select.contains("agent profile 'missing-profile' not found"));
 
     let delete_builtin = call(
-        controller(&registered, "profile_delete"),
+        controller(&profiles, "delete"),
         json!({ "profile_id": DEFAULT_PROFILE_ID }),
     )
     .await
@@ -1245,7 +1258,7 @@ async fn agent_registry_and_profile_controllers_cover_success_and_errors() {
     assert!(delete_builtin.contains("built-in agent profile"));
 
     let deleted = call(
-        controller(&registered, "profile_delete"),
+        controller(&profiles, "delete"),
         json!({ "profile_id": "my-research-profile" }),
     )
     .await
@@ -1299,7 +1312,7 @@ fn agent_builder_public_paths_cover_required_fields_defaults_and_filters() {
     );
     assert_eq!(agent.temperature(), 0.7);
     assert_eq!(agent.workspace_dir(), std::path::Path::new("."));
-    assert!(agent.skills().is_empty());
+    assert!(agent.workflows().is_empty());
     assert!(agent.history().is_empty());
     assert_eq!(agent.agent_config().max_tool_iterations, 10);
     assert_eq!(agent.tools_arc().len(), 2);
@@ -1357,6 +1370,10 @@ fn agent_profile_store_and_personality_helpers_cover_normalisation_edges() {
             soul_md: Some(" inline soul ".to_string()),
             soul_md_path: None,
             composio_integrations: Some(vec![" gmail ".to_string(), String::new()]),
+            memory_sources: None,
+            include_agent_conversations: true,
+            allowed_skills: None,
+            allowed_mcp_servers: None,
             memory_dir_suffix: None,
             is_master: true,
             sort_order: Some(50),
@@ -1391,6 +1408,10 @@ fn agent_profile_store_and_personality_helpers_cover_normalisation_edges() {
             soul_md: None,
             soul_md_path: None,
             composio_integrations: Some(vec![]),
+            memory_sources: None,
+            include_agent_conversations: true,
+            allowed_skills: None,
+            allowed_mcp_servers: None,
             memory_dir_suffix: None,
             is_master: false,
             sort_order: None,
@@ -1408,6 +1429,10 @@ fn agent_profile_store_and_personality_helpers_cover_normalisation_edges() {
 
     let reused = store
         .upsert(AgentProfile {
+            memory_sources: None,
+            include_agent_conversations: true,
+            allowed_skills: None,
+            allowed_mcp_servers: None,
             memory_dir_suffix: None,
             description: "updated".to_string(),
             ..second_profile.clone()
@@ -1576,6 +1601,7 @@ named = ["todo", "plan_exit"]
         timeout_secs: None,
         sandbox_mode: SandboxMode::None,
         background: false,
+        trigger_memory_agent: Default::default(),
         subagents: Vec::new(),
         delegate_name: None,
         agent_tier: AgentTier::Worker,
@@ -1625,6 +1651,7 @@ fn agent_task_board_and_dispatcher_public_paths_cover_storage_and_prompt_shapes(
         acceptance_criteria: vec!["Focused tests pass".into()],
         evidence: vec![],
         notes: Some("Keep scope narrow".into()),
+        session_thread_id: None,
         blocker: None,
         source_metadata: Some(json!({
             "provider": "github",
@@ -1663,6 +1690,7 @@ fn agent_task_board_and_dispatcher_public_paths_cover_storage_and_prompt_shapes(
     let title_prompt = build_task_prompt(&TaskBoardCard {
         objective: Some("   ".into()),
         source_metadata: Some(json!({ "external_id": "123" })),
+        session_thread_id: None,
         ..loaded.cards[0].clone()
     });
     assert!(title_prompt.contains("Fallback title"));
@@ -1714,6 +1742,10 @@ fn agent_personality_paths_cover_safe_fallbacks_and_integration_filters() {
         soul_md: Some("inline soul".into()),
         soul_md_path: Some("personality-soul.md".into()),
         composio_integrations: Some(vec!["gmail".into(), "slack".into()]),
+        memory_sources: None,
+        include_agent_conversations: true,
+        allowed_skills: None,
+        allowed_mcp_servers: None,
         memory_dir_suffix: Some("-7".into()),
         is_master: false,
         sort_order: Some(10),
@@ -1971,7 +2003,6 @@ async fn inference_provider_factory_and_classifiers_cover_user_state_edges() {
         "The supported API model names are native-a or native-b",
         "ModelNotAllowed",
         "invalid_authentication_error",
-        "unknown parameter: tools",
         "requires a subscription, upgrade for access",
         "No active credentials for provider: openai",
     ] {
@@ -1982,6 +2013,12 @@ async fn inference_provider_factory_and_classifiers_cover_user_state_edges() {
     }
     assert!(is_openai_compatible_unknown_model_message(
         "Model `gpt-unknown` is not available. Use GET /openai/v1/models to list available models."
+    ));
+    // PR #2959 reverted the "unknown parameter: tools" suppression: this shape
+    // is no longer demoted to user-config state, so it fires to Sentry again
+    // (root cause to be fixed separately).
+    assert!(!is_provider_config_rejection_message(
+        "unknown parameter: tools"
     ));
     assert!(!is_provider_config_rejection_message(
         "internal server error while streaming tokens"
@@ -2060,7 +2097,7 @@ async fn inference_openhuman_backend_provider_covers_authless_and_streaming_edge
         },
     );
     assert!(provider.supports_native_tools());
-    assert!(!provider.supports_vision());
+    assert!(provider.supports_vision());
     assert!(!provider.supports_streaming());
 
     let missing_session = provider
@@ -2146,6 +2183,7 @@ async fn inference_provider_trait_defaults_cover_prompt_guided_paths() {
                 messages: &[ChatMessage::user("need docs")],
                 tools: Some(&[tool_spec.clone()]),
                 stream: None,
+                max_tokens: None,
             },
             "agentic-v1",
             0.4,
@@ -2161,6 +2199,7 @@ async fn inference_provider_trait_defaults_cover_prompt_guided_paths() {
                 messages: &[ChatMessage::user("plain")],
                 tools: None,
                 stream: None,
+                max_tokens: None,
             },
             "agentic-v1",
             0.5,
@@ -2246,6 +2285,7 @@ async fn inference_openai_compatible_provider_covers_native_streaming_and_fallba
                 ],
                 tools: Some(&[tool_spec.clone(), tool_spec.clone()]),
                 stream: Some(&delta_tx),
+                max_tokens: None,
             },
             "stream-native",
             0.9,
@@ -2285,6 +2325,7 @@ async fn inference_openai_compatible_provider_covers_native_streaming_and_fallba
                 messages: &[ChatMessage::user("json encoded tool call")],
                 tools: None,
                 stream: None,
+                max_tokens: None,
             },
             "tool-content-json",
             0.2,
@@ -2861,6 +2902,7 @@ async fn agent_triage_evaluator_covers_native_dispatch_decision_and_deferred_pat
             visible_tool_names: Some(HashSet::new()),
             extra_tools: Vec::new(),
             on_progress: None,
+            origin: openhuman_core::openhuman::agent::turn_origin::AgentTurnOrigin::Cli,
         },
     )
     .await
@@ -3008,13 +3050,13 @@ async fn inference_local_controllers_and_presets_cover_public_paths() {
     let _ollama_bin_guard = EnvVarGuard::set("OLLAMA_BIN", &mock_ollama);
     let _ollama_base_guard = EnvVarGuard::set("OPENHUMAN_OLLAMA_BASE_URL", &provider_base);
 
-    let local_schemas = all_local_ai_controller_schemas();
-    let local_registered = all_local_ai_registered_controllers();
+    let local_schemas = all_local_inference_controller_schemas();
+    let local_registered = all_local_inference_registered_controllers();
     assert_eq!(local_schemas.len(), local_registered.len());
     assert!(local_registered.iter().all(|controller| {
         controller
             .rpc_method_name()
-            .starts_with("openhuman.local_ai_")
+            .starts_with("openhuman.inference_")
     }));
 
     let reachable = call(
@@ -3278,6 +3320,7 @@ fn agent_pformat_and_prompt_renderers_cover_public_paths() {
             unlock_paths: vec!["Open Settings > Connections".into()],
         }],
         connected: false,
+        connections: Vec::new(),
         non_active_status: Some("INITIATED".into()),
     }];
     let learned = LearnedContextData {
@@ -3296,7 +3339,7 @@ fn agent_pformat_and_prompt_renderers_cover_public_paths() {
         model_name: "agentic-v1",
         agent_id: "planner",
         tools: &prompt_tools,
-        skills: &skills,
+        workflows: &skills,
         dispatcher_instructions: "Use tool calls when useful.",
         learned,
         visible_tool_names: &visible_tool_names,
@@ -3314,7 +3357,6 @@ fn agent_pformat_and_prompt_renderers_cover_public_paths() {
         personality_soul_md: None,
         personality_memory_md: None,
         personality_roster: vec![],
-        workflows: &[],
     };
 
     let tools_md = render_tools(&ctx).expect("render tools");
@@ -3406,7 +3448,7 @@ fn agent_builtin_prompt_builders_cover_all_registered_archetypes() {
             model_name: "agentic-v1",
             agent_id: builtin.id,
             tools: &prompt_tools,
-            skills: &skills,
+            workflows: &skills,
             dispatcher_instructions: "Use available tools when needed.",
             learned: LearnedContextData::default(),
             visible_tool_names: &visible_tool_names,
@@ -3429,7 +3471,6 @@ fn agent_builtin_prompt_builders_cover_all_registered_archetypes() {
                 description: "Default assistant".into(),
                 memory_summary: Some("Recent planner context".into()),
             }],
-            workflows: &[],
         };
         let body = (builtin.prompt_fn)(&ctx)
             .unwrap_or_else(|err| panic!("built-in prompt {} should render: {err}", builtin.id));
@@ -3444,8 +3485,8 @@ fn agent_builtin_prompt_builders_cover_all_registered_archetypes() {
 #[tokio::test]
 async fn agent_public_tools_cover_validation_and_metadata_paths() {
     use openhuman_core::openhuman::agent::tools::{
-        AskClarificationTool, DelegateToPersonalityTool, DelegateTool, RunSkillTool, TodoTool,
-        RUN_SKILL_TOOL_NAME,
+        AskClarificationTool, DelegateToPersonalityTool, DelegateTool, RunWorkflowTool, TodoTool,
+        RUN_WORKFLOW_TOOL_NAME,
     };
     use openhuman_core::openhuman::tools::{ArchetypeDelegationTool, SkillDelegationTool};
 
@@ -3461,18 +3502,18 @@ async fn agent_public_tools_cover_validation_and_metadata_paths() {
     assert!(clarification.output().contains("Which target?"));
     assert!(clarification.output().contains("unit, coverage"));
 
-    let run_skill = RunSkillTool::new();
-    assert_eq!(run_skill.name(), RUN_SKILL_TOOL_NAME);
+    let run_workflow = RunWorkflowTool::new();
+    assert_eq!(run_workflow.name(), RUN_WORKFLOW_TOOL_NAME);
     assert_eq!(
-        run_skill.parameters_schema().pointer("/required/0"),
-        Some(&json!("skill_id"))
+        run_workflow.parameters_schema().pointer("/required/0"),
+        Some(&json!("workflow_id"))
     );
-    let missing_skill = run_skill
+    let missing_workflow = run_workflow
         .execute(json!({ "inputs": {} }))
         .await
-        .expect("missing skill id returns tool error");
-    assert!(missing_skill.is_error);
-    assert!(missing_skill.output().contains("skill_id"));
+        .expect("missing workflow id returns tool error");
+    assert!(missing_workflow.is_error);
+    assert!(missing_workflow.output().contains("workflow_id"));
 
     let delegate_personality = DelegateToPersonalityTool::new();
     assert_eq!(delegate_personality.name(), "delegate_to_personality");
@@ -3788,11 +3829,13 @@ fn agent_dispatchers_and_host_runtime_cover_public_edge_paths() {
                 id: "call-ok".into(),
                 name: "search_docs".into(),
                 arguments: "{\"query\":\"native\"}".into(),
+                extra_content: None,
             },
             ToolCall {
                 id: "call-bad-json".into(),
                 name: "search_docs".into(),
                 arguments: "{not-json".into(),
+                extra_content: None,
             },
         ],
         ..Default::default()
@@ -3825,6 +3868,7 @@ fn agent_dispatchers_and_host_runtime_cover_public_edge_paths() {
                 id: "call-1".into(),
                 name: "search_docs".into(),
                 arguments: "{\"query\":\"paired\"}".into(),
+                extra_content: None,
             }],
             reasoning_content: Some("thinking".into()),
         },
@@ -3838,6 +3882,7 @@ fn agent_dispatchers_and_host_runtime_cover_public_edge_paths() {
                 id: "missing-result".into(),
                 name: "search_docs".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             }],
             reasoning_content: None,
         },
@@ -3854,36 +3899,45 @@ fn agent_dispatchers_and_host_runtime_cover_public_edge_paths() {
     assert!(provider_messages[2].content.contains("call-1"));
     assert_eq!(provider_messages[3].content, "done");
 
-    let native_runtime = create_runtime(&RuntimeConfig {
-        kind: "native".into(),
-        ..Default::default()
-    })
+    let native_runtime = create_runtime(
+        &RuntimeConfig {
+            kind: "native".into(),
+            ..Default::default()
+        },
+        false,
+    )
     .expect("native runtime");
     assert_eq!(native_runtime.name(), "native");
     assert!(native_runtime.has_shell_access());
 
-    let docker_runtime = create_runtime(&RuntimeConfig {
-        kind: "docker".into(),
-        docker: DockerRuntimeConfig {
-            image: "alpine:coverage".into(),
-            network: "none".into(),
-            mount_workspace: false,
-            read_only_rootfs: false,
-            memory_limit_mb: Some(128),
-            cpu_limit: None,
+    let docker_runtime = create_runtime(
+        &RuntimeConfig {
+            kind: "docker".into(),
+            docker: DockerRuntimeConfig {
+                image: "alpine:coverage".into(),
+                network: "none".into(),
+                mount_workspace: false,
+                read_only_rootfs: false,
+                memory_limit_mb: Some(128),
+                cpu_limit: None,
+                ..Default::default()
+            },
             ..Default::default()
         },
-        ..Default::default()
-    })
+        false,
+    )
     .expect("docker runtime");
     assert_eq!(docker_runtime.name(), "docker");
     assert!(!docker_runtime.has_filesystem_access());
     assert_eq!(docker_runtime.memory_budget(), 128);
 
-    let unsupported = match create_runtime(&RuntimeConfig {
-        kind: "wasm".into(),
-        ..Default::default()
-    }) {
+    let unsupported = match create_runtime(
+        &RuntimeConfig {
+            kind: "wasm".into(),
+            ..Default::default()
+        },
+        false,
+    ) {
         Ok(runtime) => panic!(
             "unsupported runtime unexpectedly created: {}",
             runtime.name()
@@ -4377,7 +4431,7 @@ async fn inference_router_provider_covers_hint_tier_and_passthrough_routing() {
     assert!(routed_hint.contains("model=fast-chat"));
 
     let routed_tier = router
-        .chat_with_history(&[ChatMessage::user("tier")], "reasoning-quick-v1", 0.3)
+        .chat_with_history(&[ChatMessage::user("tier")], "chat-v1", 0.3)
         .await
         .expect("tier route");
     assert!(routed_tier.contains("model=fast-chat"));
@@ -4388,6 +4442,7 @@ async fn inference_router_provider_covers_hint_tier_and_passthrough_routing() {
                 messages: &[ChatMessage::user("fallback")],
                 tools: None,
                 stream: None,
+                max_tokens: None,
             },
             "reasoning-v1",
             0.4,
@@ -4507,6 +4562,7 @@ async fn inference_reliable_provider_covers_retry_fallback_and_aggregate_errors(
                 messages: &[ChatMessage::user("fail")],
                 tools: None,
                 stream: None,
+                max_tokens: None,
             },
             "missing-model",
             0.0,
@@ -4627,6 +4683,8 @@ async fn agent_subagent_public_types_cover_task_local_and_error_display_paths() 
         worker_thread_id: Some("thread-1".to_string()),
         initial_history: None,
         checkpoint_dir: None,
+        worktree_action_dir: None,
+        run_queue: None,
     };
     assert_eq!(options.skill_filter_override.as_deref(), Some("docs"));
     assert_eq!(options.toolkit_override.as_deref(), Some("github"));
@@ -4640,6 +4698,7 @@ async fn agent_subagent_public_types_cover_task_local_and_error_display_paths() 
         elapsed: Duration::from_millis(12),
         mode: SubagentMode::Typed,
         status: SubagentRunStatus::Completed,
+        final_history: Vec::new(),
     };
     assert_eq!(outcome.mode.as_str(), "typed");
     assert_eq!(outcome.elapsed.as_millis(), 12);

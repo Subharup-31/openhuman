@@ -92,6 +92,7 @@ impl UnifiedMemory {
                 content: hit.content,
                 score: hit.score,
                 category: hit.category,
+                taint: hit.taint,
             });
         }
         Ok(out)
@@ -171,6 +172,7 @@ impl UnifiedMemory {
                 document_id: Some(doc.document_id.clone()),
                 chunk_id: best_chunk_id,
                 supporting_relations,
+                taint: doc.taint,
             });
         }
 
@@ -209,6 +211,10 @@ impl UnifiedMemory {
                 document_id: None,
                 chunk_id: None,
                 supporting_relations: Vec::new(),
+                // KV rows have no provenance column; conservatively
+                // surface as Internal so the subconscious gate doesn't
+                // mis-escalate user-state writes.
+                taint: crate::openhuman::memory::MemoryTaint::Internal,
             });
         }
 
@@ -246,14 +252,10 @@ impl UnifiedMemory {
                 }
             }
 
-            for entry in &episodic_hits {
+            for (position_idx, entry) in episodic_hits.iter().enumerate() {
                 let freshness = Self::recency_score(entry.timestamp, now);
                 // Episodic FTS5 returns results ordered by rank (best first).
                 // Normalize position to a 0-1 relevance score.
-                let position_idx = episodic_hits
-                    .iter()
-                    .position(|e| e.id == entry.id)
-                    .unwrap_or(0);
                 let fts_relevance = 1.0 - (position_idx as f64 / episodic_hits.len().max(1) as f64);
 
                 let episodic_score = (fts_relevance * 0.7) + (freshness * 0.3);
@@ -287,6 +289,10 @@ impl UnifiedMemory {
                     document_id: None,
                     chunk_id: None,
                     supporting_relations: Vec::new(),
+                    // Episodic rows are derived from user chat turns and
+                    // never carry sync-ingest content; surface as
+                    // Internal so the subconscious gate trusts them.
+                    taint: crate::openhuman::memory::MemoryTaint::Internal,
                 });
             }
         }
@@ -325,6 +331,10 @@ impl UnifiedMemory {
                 document_id: None,
                 chunk_id: None,
                 supporting_relations: Vec::new(),
+                // Event extractions are derived from chat segments;
+                // treat them as Internal until a future migration
+                // surfaces per-event provenance.
+                taint: crate::openhuman::memory::MemoryTaint::Internal,
             });
         }
 
@@ -428,6 +438,7 @@ impl UnifiedMemory {
                         .map(|relation| RelationMatch { relation, hop: 1 })
                         .collect::<Vec<_>>(),
                 ),
+                taint: doc.taint,
             });
         }
 
@@ -462,6 +473,7 @@ impl UnifiedMemory {
                 document_id: None,
                 chunk_id: None,
                 supporting_relations: Vec::new(),
+                taint: crate::openhuman::memory::MemoryTaint::Internal,
             });
         }
 

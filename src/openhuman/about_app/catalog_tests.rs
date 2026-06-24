@@ -7,13 +7,43 @@ fn lookup_returns_expected_capability() {
     assert_eq!(capability.status, CapabilityStatus::Beta);
 }
 
+/// PR #3090: the global push-to-talk feature is user-facing and must be
+/// discoverable in the capability catalog so the in-app /about surface and
+/// settings search can describe it. Pins the id, category, and the rough
+/// shape of the how_to / description so a future rewrite can't silently
+/// drop the entry or split it from the Conversation umbrella where the
+/// related voice capabilities live.
+#[test]
+fn capability_list_includes_voice_ptt() {
+    let caps = all_capabilities();
+    assert!(
+        caps.iter().any(|c| c.id == "voice.ptt"),
+        "voice.ptt capability must be registered"
+    );
+
+    let ptt = lookup("voice.ptt").expect("voice.ptt should be registered");
+    assert_eq!(ptt.category, CapabilityCategory::Conversation);
+    assert_eq!(ptt.domain, "voice");
+    assert!(
+        ptt.how_to.contains("Push-to-Talk") || ptt.how_to.contains("push-to-talk"),
+        "how_to must mention Push-to-Talk, got: {}",
+        ptt.how_to
+    );
+    assert!(
+        ptt.description.to_lowercase().contains("hold")
+            && ptt.description.to_lowercase().contains("hotkey"),
+        "description must describe the hold-to-talk hotkey behaviour, got: {}",
+        ptt.description
+    );
+}
+
 #[test]
 fn composio_direct_mode_capabilities_are_registered() {
     // PR #1710 PR3: ensure the direct-mode capability and the trigger-gap
     // capability are advertised in the catalog so downstream UI surfaces
     // (settings search, /about catalog dump) can find them.
     let direct = lookup("composio.direct_mode").expect("direct_mode entry exists");
-    assert_eq!(direct.category, CapabilityCategory::Skills);
+    assert_eq!(direct.category, CapabilityCategory::Workflows);
     // Direct mode itself is Beta (works for tool execution today).
     assert_eq!(direct.status, CapabilityStatus::Beta);
 
@@ -91,8 +121,8 @@ fn catalog_includes_additional_user_facing_surfaces() {
         .collect();
 
     for expected in [
-        "skills.open_connections_hub",
-        "skills.connect_google",
+        "workflows.open_connections_hub",
+        "workflows.connect_google",
         "auth.backup_recovery_phrase",
         "auth.configure_tool_access",
         "settings.manage_service",
@@ -103,8 +133,11 @@ fn catalog_includes_additional_user_facing_surfaces() {
         "intelligence.mcp_server",
         "intelligence.searxng_search",
         "intelligence.tool_registry",
+        "intelligence.agent_library",
         "intelligence.embedding_provider_config",
         "intelligence.embedding_provider_test",
+        "intelligence.github_repo_memory_source",
+        "intelligence.memory_source_sync_controls",
         "conversation.subagent_mascots",
     ] {
         assert!(
@@ -220,6 +253,89 @@ fn embedding_provider_test_destinations_cover_all_providers() {
         "expected ≥4 destinations covering managed + openai + cohere + custom, \
          got {}: {:?}",
         privacy.destinations.len(),
+        privacy.destinations
+    );
+}
+
+/// The GitHub repo memory source (#3047) is a user-facing capability — it
+/// surfaces a browsable repo-grouped raw archive plus priority/entity
+/// enrichment that the agent should be able to describe when asked "can you
+/// read my GitHub repo?". Pin its catalog shape: it lives under the
+/// `memory_sources` Rust domain but the Intelligence UI umbrella (same split
+/// the embeddings entries use — Rust domain on `domain`, UI grouping on
+/// `category`), and its `how_to` points at the real Settings breadcrumb +
+/// RPC, not a stale path.
+#[test]
+fn github_repo_memory_source_is_registered_with_expected_shape() {
+    let cap =
+        lookup("intelligence.github_repo_memory_source").expect("github memory source registered");
+
+    assert_eq!(
+        cap.domain, "memory_sources",
+        "domain should reflect the Rust `memory_sources` domain"
+    );
+    assert_eq!(cap.category, CapabilityCategory::Intelligence);
+    assert_eq!(cap.status, CapabilityStatus::Beta);
+
+    // how_to must point at the live Settings surface + the programmatic RPC,
+    // so a future nav rename can't silently strand the breadcrumb.
+    assert!(
+        cap.how_to.contains("Memory Sources"),
+        "how_to must name the Memory Sources surface, got: {}",
+        cap.how_to
+    );
+    assert!(
+        cap.how_to.contains("memory_sources_add"),
+        "how_to must cite the programmatic RPC, got: {}",
+        cap.how_to
+    );
+
+    // The description has to make clear this reads project *activity*, not
+    // source code — that distinction is the whole point of the GitHub memory
+    // source and keeps users from expecting code search.
+    let desc = cap.description.to_lowercase();
+    assert!(
+        desc.contains("commits") && desc.contains("issues"),
+        "description must enumerate the synced item types, got: {}",
+        cap.description
+    );
+    assert!(
+        desc.contains("not source code"),
+        "description must clarify it ingests activity, not source code, got: {}",
+        cap.description
+    );
+}
+
+/// Privacy: the GitHub memory source reaches out to the GitHub API directly
+/// (via `gh` / public REST), so it must report `leaves_device = true` with
+/// GitHub as the destination — not the managed OpenHuman backend. Treating it
+/// as local-only or attributing it to the backend would under-report where the
+/// sync request actually goes (the exact under-reporting failure mode #2656's
+/// review flagged for the embeddings probe).
+#[test]
+fn github_repo_memory_source_reports_github_destination() {
+    let cap =
+        lookup("intelligence.github_repo_memory_source").expect("github memory source registered");
+    let privacy = cap
+        .privacy
+        .expect("github memory source is privacy-annotated");
+
+    assert!(
+        privacy.leaves_device,
+        "syncing a repo issues an outbound request to GitHub — must report leaves_device"
+    );
+
+    let haystack = privacy.destinations.join(" | ").to_lowercase();
+    assert!(
+        haystack.contains("github"),
+        "destinations must name GitHub so the Privacy surface attributes the \
+         request to the right third-party host, got: {:?}",
+        privacy.destinations
+    );
+    assert!(
+        !haystack.contains("openhuman backend"),
+        "the reader talks to GitHub directly, not the managed backend — listing \
+         the backend would mis-attribute the destination: {:?}",
         privacy.destinations
     );
 }

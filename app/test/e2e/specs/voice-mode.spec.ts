@@ -96,10 +96,10 @@ describe.skip('Voice mode integration', () => {
     }
     expect(onHome).toBe(true);
 
-    const hasTextInput = await waitForAnyText(['Type a message', 'Threads', 'New'], 10_000);
+    const hasTextInput = await waitForAnyText(['How can I help', 'Threads', 'New'], 10_000);
     expect(hasTextInput).not.toBeNull();
 
-    await clickButton('Start recording', 10_000);
+    await clickButton('Voice mode', 10_000);
 
     const voiceStatusMessage = await waitForAnyText(
       [
@@ -116,18 +116,18 @@ describe.skip('Voice mode integration', () => {
     expect(voiceStatusMessage).not.toBeNull();
 
     await clickButton('Switch to text', 10_000);
-    const textRestored = await waitForAnyText(['Type a message', 'Threads', 'New'], 10_000);
+    const textRestored = await waitForAnyText(['How can I help', 'Threads', 'New'], 10_000);
     expect(textRestored).not.toBeNull();
   });
 
   it('surfaces a mic entry button from the text composer', async () => {
-    const onConversations = await waitForAnyText(['Type a message', 'Threads', 'New'], 10_000);
+    const onConversations = await waitForAnyText(['How can I help', 'Threads', 'New'], 10_000);
     if (!onConversations) {
       const tree = await dumpAccessibilityTree();
       console.log('[VoiceModeE2E] Conversations not ready. Tree:\n', tree.slice(0, 4000));
     }
     expect(onConversations).not.toBeNull();
-    expect(await textExists('Start recording')).toBe(true);
+    expect(await textExists('Voice mode')).toBe(true);
   });
 });
 
@@ -251,19 +251,21 @@ describe.skip('Voice mode — Human tab capture & error mapping (#1610)', () => 
   });
 
   // ---------------------------------------------------------------------------
-  // Helper: navigate to the Human tab via hash routing.
+  // Helper: navigate to the Assistant (Chat) tab via hash routing.
+  // Phase 6: /human merged into /chat (Assistant surface). /human redirects.
   // ---------------------------------------------------------------------------
   async function navigateToHumanTab(): Promise<void> {
     if (supportsExecuteScript()) {
       await browser.execute(() => {
-        window.location.hash = '#/human';
+        // Phase 6: /human → /chat (back-compat redirect preserved)
+        window.location.hash = '#/chat';
       });
     } else {
       // Mac2 path: use the shared helper which abstracts the XCUIElementTypeButton
       // XPath so the selector stays cross-driver and policy-compliant.
-      await clickNativeButton('Human');
+      await clickNativeButton('Assistant');
     }
-    // Allow React router to settle and the Human page to mount.
+    // Allow React router to settle and the Chat page to mount.
     await browser.pause(1_500);
   }
 

@@ -252,6 +252,13 @@ impl Channel for CapturingChannel {
         "capture"
     }
 
+    // External channel exposes a proactive delivery target so the proactive
+    // router resolves a recipient for it (#3794 — recipient-less proactive sends
+    // are skipped for channels that return `None`).
+    fn proactive_target(&self) -> Option<String> {
+        Some("capture".to_string())
+    }
+
     async fn send(&self, message: &SendMessage) -> Result<()> {
         self.sent
             .lock()
@@ -293,6 +300,7 @@ fn coverage_agent_definition(
         timeout_secs: None,
         sandbox_mode: SandboxMode::None,
         background: false,
+        trigger_memory_agent: Default::default(),
         subagents: vec![],
         delegate_name: delegate_name.map(str::to_string),
         agent_tier: AgentTier::Worker,
@@ -311,6 +319,7 @@ fn coverage_connected_integration(
         tools: vec![],
         gated_tools: vec![],
         connected,
+        connections: Vec::new(),
         non_active_status: None,
     }
 }
@@ -778,7 +787,7 @@ async fn composio_agent_tools_cover_backend_discovery_markdown_and_execution_pat
     );
     assert!(tools
         .iter()
-        .all(|tool| tool.category() == ToolCategory::Skill));
+        .all(|tool| tool.category() == ToolCategory::Workflow));
 
     let list_toolkits = tools
         .iter()
@@ -1606,6 +1615,14 @@ fn tools_and_tool_registry_public_surfaces_cover_schema_and_assembly_paths() {
 
 #[tokio::test]
 async fn orchestrator_tool_synthesis_covers_agent_and_integration_delegation_edges() {
+    // This test reads the process-global connection/toolkit registry (the
+    // integrations tool's available-toolkit list). Sibling tests mutate
+    // OPENHUMAN_WORKSPACE under env_lock; without holding it here, a concurrent
+    // workspace swap trampled our view and dropped gmail_pro/slack_bot from the
+    // unknown-toolkit suggestion (flaky only under llvm-cov's slower parallel
+    // run). Hold the same lock so this test is hermetic without serializing the
+    // whole suite.
+    let _lock = env_lock();
     let mut registry = AgentDefinitionRegistry::default();
     registry.insert(coverage_agent_definition(
         "researcher",
@@ -2065,7 +2082,15 @@ async fn web_channel_public_paths_cover_event_delivery_and_validation_errors() {
 
     assert_eq!(
         openhuman_core::openhuman::channels::web::start_chat(
-            "", "thread-1", "hello", None, None, None, None,
+            "",
+            "thread-1",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            None,
+            openhuman_core::openhuman::channels::web::ChatRequestMetadata::default(),
         )
         .await
         .expect_err("blank client_id"),
@@ -2073,7 +2098,15 @@ async fn web_channel_public_paths_cover_event_delivery_and_validation_errors() {
     );
     assert_eq!(
         openhuman_core::openhuman::channels::web::start_chat(
-            "client-1", "", "hello", None, None, None, None,
+            "client-1",
+            "",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            None,
+            openhuman_core::openhuman::channels::web::ChatRequestMetadata::default(),
         )
         .await
         .expect_err("blank thread_id"),
@@ -2081,7 +2114,15 @@ async fn web_channel_public_paths_cover_event_delivery_and_validation_errors() {
     );
     assert_eq!(
         openhuman_core::openhuman::channels::web::start_chat(
-            "client-1", "thread-1", "   ", None, None, None, None,
+            "client-1",
+            "thread-1",
+            "   ",
+            None,
+            None,
+            None,
+            None,
+            None,
+            openhuman_core::openhuman::channels::web::ChatRequestMetadata::default(),
         )
         .await
         .expect_err("blank message"),
@@ -2173,7 +2214,9 @@ async fn proactive_subscriber_routes_web_and_active_external_channel_without_net
     let sent = capture.sent.lock().expect("capture lock").clone();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].content, "send through active external channel");
-    assert_eq!(sent[0].recipient, "");
+    // Recipient is now resolved from the channel's proactive_target (#3794),
+    // rather than the previously-empty recipient.
+    assert_eq!(sent[0].recipient, "capture");
 
     subscriber.set_active_channel(Some("web".into()));
     subscriber
@@ -2860,7 +2903,7 @@ async fn generated_tools_raw_paths_cover_admission_validation_and_execution() {
         " echo-generated ",
     );
     definition.permission_level = PermissionLevel::Write;
-    definition.category = ToolCategory::Skill;
+    definition.category = ToolCategory::Workflow;
     definition.scope = ToolScope::All;
     definition.provider_id = Some(" Trusted.Runtime ".into());
     definition.capability_id = Some(" messages.send ".into());
@@ -2903,7 +2946,7 @@ async fn generated_tools_raw_paths_cover_admission_validation_and_execution() {
         "Execute through the generated adapter."
     );
     assert_eq!(tools[0].permission_level(), PermissionLevel::Write);
-    assert_eq!(tools[0].category(), ToolCategory::Skill);
+    assert_eq!(tools[0].category(), ToolCategory::Workflow);
     assert_eq!(tools[0].scope(), ToolScope::All);
     assert_eq!(tools[0].parameters_schema(), schema);
     assert!(tools[0].external_effect());

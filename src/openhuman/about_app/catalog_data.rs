@@ -14,6 +14,14 @@ const DERIVED_TO_BACKEND: Option<CapabilityPrivacy> = Some(CapabilityPrivacy {
     destinations: &["OpenHuman backend", "TinyHumans Neocortex"],
 });
 
+// Vision sub-agent ships the attached image (raw pixels) to the managed
+// multimodal model for analysis.
+const IMAGE_TO_BACKEND: Option<CapabilityPrivacy> = Some(CapabilityPrivacy {
+    leaves_device: true,
+    data_kind: PrivacyDataKind::Raw,
+    destinations: &["OpenHuman backend", "TinyHumans Neocortex"],
+});
+
 const LOCAL_CREDENTIALS: Option<CapabilityPrivacy> = Some(CapabilityPrivacy {
     leaves_device: false,
     data_kind: PrivacyDataKind::Credentials,
@@ -42,6 +50,22 @@ const GITHUB_RELEASES_METADATA: Option<CapabilityPrivacy> = Some(CapabilityPriva
     leaves_device: true,
     data_kind: PrivacyDataKind::Metadata,
     destinations: &["GitHub Releases"],
+});
+
+// GitHub repo memory source: the reader queries a repository's activity
+// (commits / issues / PRs) directly against the GitHub API — via the `gh`
+// CLI when available, otherwise the public REST API — not through the
+// OpenHuman backend. The *outbound* payload is metadata (which repo, which
+// activity, pagination) plus whatever auth `gh` carries; the fetched content
+// is archived locally under the vault and only its embeddings travel onward
+// (covered by the embedding-provider capability). Mirrors the
+// `GITHUB_RELEASES_METADATA` shape — third-party GitHub host, metadata-class
+// outbound — so the Privacy surface reflects that the request leaves the
+// device to a destination distinct from the managed backend.
+const GITHUB_REPO_SOURCE: Option<CapabilityPrivacy> = Some(CapabilityPrivacy {
+    leaves_device: true,
+    data_kind: PrivacyDataKind::Metadata,
+    destinations: &["GitHub API (api.github.com)"],
 });
 
 const SEARXNG_RAW_TO_CONFIGURED_INSTANCE: Option<CapabilityPrivacy> = Some(CapabilityPrivacy {
@@ -132,6 +156,22 @@ pub(super) const CAPABILITIES: &[Capability] = &[
         privacy: DERIVED_TO_BACKEND,
     },
     Capability {
+        id: "voice.ptt",
+        name: "Global push-to-talk",
+        domain: "voice",
+        category: CapabilityCategory::Conversation,
+        description: "Hold a global hotkey from anywhere on the desktop to dictate into the \
+                      active chat thread. Press opens the mic, release commits the transcript, \
+                      and an always-on-top overlay shows listening/idle state without stealing \
+                      focus. Cross-platform via tauri-plugin-global-shortcut (macOS, Windows, \
+                      Linux/X11); requires microphone access and a global shortcut binding. \
+                      Optional speak_reply plays the agent's response through local TTS.",
+        how_to: "Settings → Voice → Push-to-Talk: pick a shortcut, grant microphone access, \
+                 then hold the configured hotkey from any window.",
+        status: CapabilityStatus::Beta,
+        privacy: DERIVED_TO_BACKEND,
+    },
+    Capability {
         id: "conversation.inline_autocomplete",
         name: "Inline Autocomplete",
         domain: "conversation",
@@ -182,6 +222,16 @@ pub(super) const CAPABILITIES: &[Capability] = &[
         privacy: None,
     },
     Capability {
+        id: "conversation.background_monitors",
+        name: "Background Monitors",
+        domain: "conversation",
+        category: CapabilityCategory::Conversation,
+        description: "Start, inspect, and stop bounded background command monitors that stream new events into active agent work.",
+        how_to: "Conversations > ask the assistant to monitor a command or status source",
+        status: CapabilityStatus::Beta,
+        privacy: LOCAL_RAW,
+    },
+    Capability {
         id: "conversation.subagent_mascots",
         name: "Subagent Mascots",
         domain: "conversation",
@@ -190,6 +240,16 @@ pub(super) const CAPABILITIES: &[Capability] = &[
         how_to: "Human > ask the assistant to delegate work to sub-agents",
         status: CapabilityStatus::Beta,
         privacy: None,
+    },
+    Capability {
+        id: "intelligence.vision_subagent",
+        name: "Vision Sub-agent",
+        domain: "agent",
+        category: CapabilityCategory::Intelligence,
+        description: "Delegate image / screenshot understanding to a dedicated vision sub-agent — describe, OCR, read charts/diagrams, compare images, or locate UI elements. Rides the multimodal `vision-v1` tier so attached images are always analyzed.",
+        how_to: "Attach an image in chat, or ask the assistant to look at a screenshot / image file",
+        status: CapabilityStatus::Beta,
+        privacy: IMAGE_TO_BACKEND,
     },
     Capability {
         id: "conversation.label_filter",
@@ -301,12 +361,97 @@ pub(super) const CAPABILITIES: &[Capability] = &[
         privacy: LOCAL_RAW,
     },
     Capability {
+        id: "intelligence.long_term_goals",
+        name: "Long-term Goals",
+        domain: "intelligence",
+        category: CapabilityCategory::Intelligence,
+        description: "An editable list of the assistant's durable long-term goals for working with \
+            you, stored locally in MEMORY_GOALS.md (capped ~500 tokens). A background goals agent \
+            keeps the list fresh: it runs when the conversation context is summarized, and on first \
+            run populates initial goals from context. Items can be added/edited/deleted explicitly \
+            via RPC or agent tools.",
+        how_to: "Automatic — refreshed on context summarization. Manage via \
+            memory_goals.list / memory_goals.add / memory_goals.edit / memory_goals.delete / \
+            memory_goals.reflect (RPC), or the goals_* agent tools.",
+        status: CapabilityStatus::Beta,
+        // Enrichment runs a cloud agentic model, so goal/context text can leave
+        // the device during a reflect pass (CRUD/storage stays local).
+        privacy: DERIVED_TO_BACKEND,
+    },
+    Capability {
         id: "intelligence.memory_tree_retrieval",
         name: "Memory Tree Retrieval (chat)",
         domain: "intelligence",
         category: CapabilityCategory::Intelligence,
         description: "Ask questions about your ingested email/chat/document memory in chat. The orchestrator can resolve names to canonical ids, query summaries by source/topic/global window, drill into details, and cite raw chunks.",
         how_to: "Chat > ask the assistant about people, conversations, or windows",
+        status: CapabilityStatus::Beta,
+        privacy: LOCAL_RAW,
+    },
+    Capability {
+        id: "intelligence.memory_pipeline_doctor",
+        name: "Memory Pipeline Doctor",
+        domain: "intelligence",
+        category: CapabilityCategory::Intelligence,
+        description: "Diagnose why the memory tree / wiki is empty or stalled. Walks each pipeline stage (embeddings config, scheduler gate, job queue, extraction/recall degradation, summary-tree precondition) and reports the single first blocking cause with an actionable fix, plus counters and extraction coverage. The agent can run it on itself; a typed 'first blocking cause' is surfaced in the Memory status panel, and jobs that failed under a now-fixed config can be requeued on demand via the `memory_tree_retry_failed` RPC.",
+        how_to: "Memory status panel shows the cause + fix; or ask the agent to diagnose memory; or `openhuman-core` RPC `memory_tree_doctor`",
+        status: CapabilityStatus::Beta,
+        privacy: LOCAL_RAW,
+    },
+    Capability {
+        id: "intelligence.github_repo_memory_source",
+        name: "GitHub Repo Memory Source",
+        domain: "memory_sources",
+        category: CapabilityCategory::Intelligence,
+        description: "Sync a GitHub repository's project activity — commits, issues, and \
+            pull requests (not source code) — into your memory. Items are archived verbatim \
+            under a browsable, repo-grouped vault layout \
+            (raw/github-com-<owner>-<repo>/{commits,issues,prs}/) and ingested into the \
+            memory tree for recall. Contributors are surfaced as @handle entities, and \
+            commit messages plus closed/merged issues & PRs get a priority boost so \
+            high-signal history leads at summary time. Pulls up to 2000 items of each type \
+            per sync by default, overridable per source via max_commits / max_issues / \
+            max_prs.",
+        how_to: "Settings > Memory & Data > Memory Sources — add a GitHub repository URL. \
+            Programmatic: openhuman.memory_sources_add (RPC).",
+        status: CapabilityStatus::Beta,
+        privacy: GITHUB_REPO_SOURCE,
+    },
+    Capability {
+        id: "intelligence.memory_source_sync_controls",
+        name: "Memory Source Sync Defaults & Controls",
+        domain: "memory_sources",
+        category: CapabilityCategory::Intelligence,
+        description: "Connected memory sources are enabled by default with conservative, \
+            per-kind sync caps so the first sync stays cheap (e.g. Gmail ~100 recent emails, \
+            GitHub repo 10 PRs / 10 issues / 50 commits, RSS 20 items). Each source row exposes \
+            an inline settings panel to adjust the limit fields that apply to its kind \
+            (max_items, sync_depth_days, max_prs/issues/commits, since_days). \
+            An \"All In\" action enables every source and removes the caps to build the richest \
+            memory graph, then triggers a full sync. Already-connected sources are migrated to \
+            the new defaults once.",
+        how_to: "Intelligence > Memory Sources — toggle a source, open its gear for per-source \
+            limits, or use \"All In\". Programmatic: openhuman.memory_sources_update and \
+            openhuman.memory_sources_apply_all_in (RPC).",
+        status: CapabilityStatus::Beta,
+        privacy: LOCAL_RAW,
+    },
+    Capability {
+        id: "intelligence.memory_sync_schedule",
+        name: "Memory Sync Schedule",
+        domain: "config",
+        category: CapabilityCategory::Intelligence,
+        description: "Pick a single global cadence for how often all opted-in memory sources \
+            auto-sync, presented like a backup schedule (\"Last synced … · Sync every …\"). \
+            Presets are every 4h / 12h / 24h, plus \"Manual only\" which disables background \
+            auto-sync entirely (you can still sync on demand). The chosen interval overrides each \
+            provider's built-in cadence but is floored at it, so syncs never run more often than \
+            the provider intends — handy for keeping credit spend predictable. Unset defaults to \
+            every 24h.",
+        how_to: "Intelligence > Memory Sources — choose a Sync every… preset or Manual only. \
+            Programmatic: openhuman.config_get_memory_sync_settings / \
+            openhuman.config_update_memory_sync_settings (RPC); ops override via the \
+            OPENHUMAN_MEMORY_SYNC_INTERVAL_SECS env var (0 = manual).",
         status: CapabilityStatus::Beta,
         privacy: LOCAL_RAW,
     },
@@ -395,6 +540,36 @@ pub(super) const CAPABILITIES: &[Capability] = &[
         privacy: DERIVED_TO_BACKEND,
     },
     Capability {
+        id: "intelligence.workflow_orchestration",
+        name: "Workflow Orchestration",
+        domain: "workflow_runs",
+        category: CapabilityCategory::Intelligence,
+        description: "Run declarative multi-agent workflows such as parallel research with cross-checking: a question is decomposed into angles, researched in parallel, adversarially cross-checked, and synthesized into one cited report. Watch each phase progress with its child agent results, stop or resume a run, and read the final synthesis. High-cost / high-concurrency runs require explicit approval before starting.",
+        how_to: "Intelligence > Orchestration > pick a workflow and Start",
+        status: CapabilityStatus::Beta,
+        privacy: DERIVED_TO_BACKEND,
+    },
+    Capability {
+        id: "intelligence.agent_library",
+        name: "Agents Library",
+        domain: "intelligence",
+        category: CapabilityCategory::Intelligence,
+        description: "Browse safe display metadata for registered agent definitions, compare worker capabilities, and start a one-off task with an explicitly selected agent.",
+        how_to: "Intelligence > Agent Tasks > Agents Library",
+        status: CapabilityStatus::Beta,
+        privacy: DERIVED_TO_BACKEND,
+    },
+    Capability {
+        id: "intelligence.worktree_manager",
+        name: "Agent Worktrees",
+        domain: "intelligence",
+        category: CapabilityCategory::Intelligence,
+        description: "Inspect and clean up the isolated git worktrees that parallel sub-agents check out under <repo>/.claude/worktrees. Each row shows the worktree's branch, dirty state, and changed files, plus a cross-worktree overlap warning when two workers touched the same file. Open, diff, or remove a worktree (a dirty worktree requires an explicit discard confirmation; the worker branch is preserved).",
+        how_to: "Intelligence > Worktrees",
+        status: CapabilityStatus::Beta,
+        privacy: None,
+    },
+    Capability {
         id: "intelligence.slack_memory_ingest",
         name: "Slack Memory Ingestion",
         domain: "intelligence",
@@ -445,70 +620,70 @@ pub(super) const CAPABILITIES: &[Capability] = &[
         privacy: None,
     },
     Capability {
-        id: "skills.discover",
-        name: "Discover Skills",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
-        description: "Browse available skills that can extend the app.",
-        how_to: "Skills",
+        id: "workflows.discover",
+        name: "Discover Workflows",
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
+        description: "Browse available workflows that can extend the app.",
+        how_to: "Intelligence > Workflows",
         status: CapabilityStatus::Stable,
         privacy: None,
     },
     Capability {
-        id: "skills.install",
-        name: "Install Skills",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
-        description: "Install a skill into the local workspace.",
-        how_to: "Skills > Install",
+        id: "workflows.install",
+        name: "Install Workflows",
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
+        description: "Install a workflow into the local workspace.",
+        how_to: "Intelligence > Workflows > Install",
         status: CapabilityStatus::Stable,
         privacy: None,
     },
     Capability {
-        id: "skills.configure",
-        name: "Configure Skills",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
-        description: "Open skill setup and update skill-specific configuration.",
-        how_to: "Skills > Setup or Settings > Connections",
+        id: "workflows.configure",
+        name: "Configure Workflows",
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
+        description: "Open workflow setup and update workflow-specific configuration.",
+        how_to: "Intelligence > Workflows > Setup or Settings > Connections",
         status: CapabilityStatus::Stable,
         privacy: None,
     },
     Capability {
-        id: "skills.connection_status",
-        name: "Monitor Skill Connection Status",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
-        description: "See whether a skill-backed integration is connected, offline, or needs setup.",
-        how_to: "Skills or Settings > Connections",
+        id: "workflows.connection_status",
+        name: "Monitor Workflow Connection Status",
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
+        description: "See whether a workflow-backed integration is connected, offline, or needs setup.",
+        how_to: "Intelligence > Workflows or Settings > Connections",
         status: CapabilityStatus::Beta,
         privacy: None,
     },
     Capability {
-        id: "skills.sync_manual",
-        name: "Manually Sync Skill Data",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
-        description: "Trigger a manual data sync for a skill integration.",
-        how_to: "Skills > Skill card > Sync",
+        id: "workflows.sync_manual",
+        name: "Manually Sync Workflow Data",
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
+        description: "Trigger a manual data sync for a workflow integration.",
+        how_to: "Intelligence > Workflows > Workflow card > Sync",
         status: CapabilityStatus::Beta,
         privacy: DERIVED_TO_BACKEND,
     },
     Capability {
-        id: "skills.run_apify_actors",
+        id: "workflows.run_apify_actors",
         name: "Run Apify Actors",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
         description: "Launch Apify scrapers and automation actors, then inspect run status and collected results.",
         how_to: "Conversations > Ask the assistant to run an Apify actor",
         status: CapabilityStatus::Beta,
         privacy: None,
     },
     Capability {
-        id: "skills.tinyfish_web_automation",
+        id: "workflows.tinyfish_web_automation",
         name: "TinyFish Web Automation",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
         description:
             "Search the web, render JavaScript-heavy pages, and run goal-based browser automations through TinyFish.",
         how_to: "Conversations > Ask the assistant to search, fetch, or automate a website with TinyFish",
@@ -516,21 +691,21 @@ pub(super) const CAPABILITIES: &[Capability] = &[
         privacy: DERIVED_TO_BACKEND,
     },
     Capability {
-        id: "skills.toggle_enabled",
-        name: "Enable or Disable Skills",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
-        description: "Turn individual skills on or off without uninstalling them.",
-        how_to: "Settings > Developer Options > Skills",
+        id: "workflows.toggle_enabled",
+        name: "Enable or Disable Workflows",
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
+        description: "Turn individual workflows on or off without uninstalling them.",
+        how_to: "Settings > Developer Options > Workflows",
         status: CapabilityStatus::Stable,
         privacy: None,
     },
     Capability {
-        id: "skills.open_connections_hub",
+        id: "workflows.open_connections_hub",
         name: "Open Connections Hub",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
-        description: "Browse the dedicated connections hub for external skill-backed integrations.",
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
+        description: "Browse the dedicated connections hub for external workflow-backed integrations.",
         how_to: "Settings > Connections",
         status: CapabilityStatus::Beta,
         privacy: None,
@@ -548,8 +723,8 @@ pub(super) const CAPABILITIES: &[Capability] = &[
     Capability {
         id: "composio.direct_mode",
         name: "Composio Direct Mode (BYO API Key)",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
         description:
             "Route Composio tool calls directly to backend.composio.dev with your own API key, \
              bypassing the OpenHuman backend proxy. Tool execution only — trigger webhooks still \
@@ -561,8 +736,8 @@ pub(super) const CAPABILITIES: &[Capability] = &[
     Capability {
         id: "composio.direct_mode_triggers_gap",
         name: "Composio Triggers (Direct Mode — Limited)",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
         description:
             "Composio real-time trigger webhooks (Gmail new-message, Slack new-message, …) \
              currently arrive over wss://api.tinyhumans.ai/socket.io and require backend mode. \
@@ -573,80 +748,90 @@ pub(super) const CAPABILITIES: &[Capability] = &[
         privacy: None,
     },
     Capability {
-        id: "skills.connect_google",
+        id: "workflows.connect_google",
         name: "Connect Google",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
         description: "Connect Google services for email, contacts, and calendar workflows.",
         how_to: "Settings > Connections",
         status: CapabilityStatus::ComingSoon,
         privacy: LOCAL_CREDENTIALS,
     },
     Capability {
-        id: "skills.connect_notion",
+        id: "workflows.connect_notion",
         name: "Connect Notion",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
         description: "Connect Notion for workspace sync and productivity workflows.",
         how_to: "Settings > Connections",
         status: CapabilityStatus::ComingSoon,
         privacy: LOCAL_CREDENTIALS,
     },
     Capability {
-        id: "skills.connect_web3_wallet",
+        id: "workflows.connect_web3_wallet",
         name: "Connect Web3 Wallet",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
         description: "Set up local EVM, BTC, Solana, and Tron wallet identities from one recovery phrase.",
         how_to: "Settings > Crypto > Recovery Phrase or Settings > Connections",
         status: CapabilityStatus::Beta,
         privacy: LOCAL_CREDENTIALS,
     },
     Capability {
-        id: "skills.wallet_execution",
+        id: "workflows.wallet_execution",
         name: "Wallet Execution Tools",
         domain: "wallet",
-        category: CapabilityCategory::Skills,
+        category: CapabilityCategory::Workflows,
         description: "Read addresses and balances, prepare/confirm/execute native + token transfers (ERC20/SPL/TRC20/BEP20), and inspect transactions (status, receipt, lookup) across the connected wallet (EVM, BTC, Solana, Tron). Quote-first; signing stays local.",
         how_to: "Use wallet.* RPC methods (balances, prepare_transfer, execute_prepared, tx_status, tx_receipt, lookup_tx) via the agent or core_rpc_relay, or via Settings > Crypto > Wallet Balances.",
         status: CapabilityStatus::Beta,
         privacy: LOCAL_CREDENTIALS,
     },
     Capability {
-        id: "skills.web3_defi",
+        id: "workflows.web3_defi",
         name: "Web3 Swaps & Bridges",
         domain: "web3",
-        category: CapabilityCategory::Skills,
+        category: CapabilityCategory::Workflows,
         description: "Quote and execute cross-chain swaps and bridges (deBridge) plus generic EVM dapp contract calls, built on the local wallet's signing. EVM/Solana(/BTC); signing stays local.",
         how_to: "Use web3_swap.* / web3_bridge.* / web3_dapp.* RPC methods (quote/execute, web3_swap.routes) via the agent or core_rpc_relay.",
         status: CapabilityStatus::Beta,
         privacy: LOCAL_CREDENTIALS,
     },
     Capability {
-        id: "skills.connect_crypto_exchange",
+        id: "workflows.x402_payments",
+        name: "x402 Machine Payments",
+        domain: "x402",
+        category: CapabilityCategory::Workflows,
+        description: "Automatic HTTP 402 payment handling for machine-payable APIs via the x402 protocol. When an API returns 402 Payment Required, the agent pays with USDC on Solana using the local wallet and retries. Budget enforcement with per-request, daily, and monthly caps.",
+        how_to: "Use x402.* RPC methods (get_summary, list_payments, update_budget) to manage spending. Payments happen automatically when the http_request tool encounters a 402 with a PAYMENT-REQUIRED header.",
+        status: CapabilityStatus::Beta,
+        privacy: LOCAL_CREDENTIALS,
+    },
+    Capability {
+        id: "workflows.connect_crypto_exchange",
         name: "Connect Crypto Exchange",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
         description: "Connect supported exchanges for trading and portfolio workflows.",
         how_to: "Settings > Connections",
         status: CapabilityStatus::ComingSoon,
         privacy: None,
     },
     Capability {
-        id: "skills.polymarket_readonly",
+        id: "workflows.polymarket_readonly",
         name: "Polymarket Read-Only Browse",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
         description: "Browse Polymarket markets, events, orderbooks, and prices via Gamma + CLOB APIs.",
         how_to: "Conversations > ask the assistant to browse Polymarket (tool: polymarket).",
         status: CapabilityStatus::Beta,
         privacy: POLYMARKET_MARKET_DATA,
     },
     Capability {
-        id: "skills.polymarket_trading",
+        id: "workflows.polymarket_trading",
         name: "Polymarket Trading",
-        domain: "skills",
-        category: CapabilityCategory::Skills,
+        domain: "workflows",
+        category: CapabilityCategory::Workflows,
         description: "Place and cancel Polymarket limit orders with EIP-712 signing, authenticated account reads, and explicit approval for writes.",
         how_to: "Conversations > ask the assistant to trade on Polymarket (tool: polymarket; set `approved=true` for write actions).",
         status: CapabilityStatus::Beta,
@@ -667,8 +852,8 @@ pub(super) const CAPABILITIES: &[Capability] = &[
         name: "Configure Local Provider",
         domain: "local_ai",
         category: CapabilityCategory::LocalAI,
-        description: "Select Ollama or LM Studio as the local model provider and configure the local server endpoint.",
-        how_to: "Settings > Local AI Model",
+        description: "Select Ollama, LM Studio, MLX, or a generic local OpenAI-compatible server as the local model provider and configure the endpoint.",
+        how_to: "Settings > AI > providers, or use provider strings: ollama:<model>, lmstudio:<model>, mlx:<model>, local-openai:<model>",
         status: CapabilityStatus::Beta,
         privacy: None,
     },
@@ -1168,7 +1353,7 @@ pub(super) const CAPABILITIES: &[Capability] = &[
         name: "Developer Options",
         domain: "settings",
         category: CapabilityCategory::Settings,
-        description: "Open developer-focused panels for diagnostics, skills, AI config, and memory tools.",
+        description: "Open developer-focused panels for diagnostics, workflows, AI config, and memory tools.",
         how_to: "Settings > Developer Options",
         status: CapabilityStatus::Beta,
         privacy: None,
@@ -1199,7 +1384,7 @@ pub(super) const CAPABILITIES: &[Capability] = &[
         name: "Log Out and Clear App Data",
         domain: "settings",
         category: CapabilityCategory::Settings,
-        description: "Sign out and permanently clear local app data, including skills data.",
+        description: "Sign out and permanently clear local app data, including workflow data.",
         how_to: "Settings > Log Out & Clear App Data",
         status: CapabilityStatus::Stable,
         privacy: None,
@@ -1225,18 +1410,6 @@ pub(super) const CAPABILITIES: &[Capability] = &[
         how_to: "Settings > Task Sources",
         status: CapabilityStatus::Beta,
         privacy: DERIVED_TO_BACKEND,
-    },
-    Capability {
-        id: "automation.agent_workflows",
-        name: "Agent Workflows",
-        domain: "automation",
-        category: CapabilityCategory::Automation,
-        description: "Define phase-keyed workflows (WORKFLOW.md) that inject rules, run \
-                      gated scripts, scope visible tools, and surface working-directory \
-                      context across a task's lifecycle (pick-up, close, directory entry).",
-        how_to: "Workflows",
-        status: CapabilityStatus::Beta,
-        privacy: None,
     },
     Capability {
         id: "automation.view_cron_jobs",
@@ -1507,6 +1680,21 @@ pub(super) const CAPABILITIES: &[Capability] = &[
                       of memory databases, session transcripts, tokens, and other internal state.",
         how_to: "Settings → Agent OS access",
         status: CapabilityStatus::Stable,
+        privacy: None,
+    },
+    Capability {
+        id: "security.sandbox_backends",
+        name: "Sandbox Execution Backends",
+        domain: "security",
+        category: CapabilityCategory::Settings,
+        description: "Route agent tool execution (shell, filesystem, process) through sandbox \
+                      backends — Docker containers or OS-level jails (Landlock/Seatbelt) — for \
+                      reduced blast radius on remote, channel, cron, or background sessions. \
+                      Configurable per agent/session/channel with safe defaults for non-main sessions.",
+        how_to: "Set sandbox_mode = \"sandboxed\" in agent.toml, or configure runtime.kind = \
+                 \"docker\" in the TOML config. Use openhuman.sandbox_status / \
+                 openhuman.sandbox_resolve_policy RPC to inspect.",
+        status: CapabilityStatus::Beta,
         privacy: None,
     },
     Capability {

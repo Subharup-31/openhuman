@@ -41,21 +41,63 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// How the channels runtime should construct its default chat provider.
+///
+/// Issue #3098 sub-issue 1: the runtime used to ignore the per-workload
+/// `chat_provider` routing and unconditionally build a cloud chain, so
+/// Telegram (and other channels) never honored a user's local-Ollama /
+/// BYOK selection. `resolve_chat_workload` inspects the resolved chat
+/// workload string and chooses between preserving the legacy
+/// `create_intelligent_routing_provider` chain (Cloud) and dispatching
+/// to the unified workload factory (Workload).
+pub(super) enum ChatWorkloadResolution {
+    /// Preserve the existing cloud chain (`ReliableProvider` +
+    /// `IntelligentRoutingProvider`) and `config.default_model`.
+    Cloud,
+    /// Build the channel provider via `create_chat_provider("chat", config)`.
+    Workload {
+        provider_string: String,
+        slug: String,
+    },
+}
+
+pub(super) fn resolve_chat_workload(config: &Config) -> ChatWorkloadResolution {
+    let resolved = provider::provider_for_role("chat", config);
+    let trimmed = resolved.trim();
+    if trimmed.is_empty() || trimmed == "cloud" || trimmed == provider::INFERENCE_BACKEND_ID {
+        return ChatWorkloadResolution::Cloud;
+    }
+    let slug = trimmed
+        .split_once(':')
+        .map(|(s, _)| s.to_string())
+        .unwrap_or_else(|| trimmed.to_string());
+    ChatWorkloadResolution::Workload {
+        provider_string: trimmed.to_string(),
+        slug,
+    }
+}
+
 pub async fn start_channels(mut config: Config) -> Result<()> {
     // Initialize the global event bus singleton and register the tracing
     // subscriber for debug logging of all domain events.
     let bus = event_bus::init_global(DEFAULT_CAPACITY);
     let _tracing_handle = bus.subscribe(Arc::new(TracingSubscriber));
     crate::openhuman::health::bus::register_health_subscriber();
-    crate::openhuman::skills::bus::register_skill_cleanup_subscriber();
+    crate::openhuman::workflows::bus::register_workflow_cleanup_subscriber();
     crate::openhuman::memory_conversations::register_conversation_persistence_subscriber(
         config.workspace_dir.clone(),
     );
-    crate::openhuman::memory::sync::register_sync_stage_bridge();
+    crate::openhuman::memory::sync::register_sync_stage_bridge(&config);
     crate::openhuman::composio::register_composio_trigger_subscriber();
+    crate::openhuman::agent_meetings::calendar::register_meet_calendar_subscriber();
+    crate::openhuman::agent_meetings::bus::register_meeting_event_subscriber();
     // Surface parked ApprovalGate requests as chat messages so the user can
     // answer yes/no in the thread (chat-native approval, issue #1339).
     crate::openhuman::channels::providers::web::register_approval_surface_subscriber();
+    // Surface generated-artifact lifecycle events (ArtifactReady /
+    // ArtifactFailed) as `artifact_ready` / `artifact_failed` web-channel
+    // events so the frontend ArtifactCard can render in chat (#2779).
+    crate::openhuman::channels::providers::web::register_artifact_surface_subscriber();
     // Spawn the per-toolkit provider periodic sync scheduler. This is
     // a thin tokio task that ticks every minute and dispatches into
     // any provider whose `sync_interval_secs` has elapsed for an
@@ -174,13 +216,36 @@ pub async fn start_channels(mut config: Config) -> Result<()> {
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
-    let provider: Arc<dyn Provider> = Arc::from(provider::create_intelligent_routing_provider(
-        config.inference_url.as_deref(),
-        config.api_url.as_deref(),
-        config.api_key.as_deref(),
-        &config,
-        &provider_runtime_options,
-    )?);
+    let (provider, model, provider_name): (Arc<dyn Provider>, String, String) =
+        match resolve_chat_workload(&config) {
+            ChatWorkloadResolution::Cloud => {
+                let p: Arc<dyn Provider> =
+                    Arc::from(provider::create_intelligent_routing_provider(
+                        config.inference_url.as_deref(),
+                        config.api_url.as_deref(),
+                        config.api_key.as_deref(),
+                        &config,
+                        &provider_runtime_options,
+                    )?);
+                let m = config
+                    .default_model
+                    .clone()
+                    .unwrap_or_else(|| crate::openhuman::config::DEFAULT_MODEL.into());
+                (p, m, provider::INFERENCE_BACKEND_ID.to_string())
+            }
+            ChatWorkloadResolution::Workload {
+                provider_string,
+                slug,
+            } => {
+                tracing::info!(
+                    chat_provider = %provider_string,
+                    slug = %slug,
+                    "[channels][startup] chat workload routed to per-workload provider — building dedicated channel provider"
+                );
+                let (boxed, model_id) = provider::create_chat_provider("chat", &config)?;
+                (Arc::from(boxed), model_id, slug)
+            }
+        };
 
     // Warm up the provider connection pool (TLS handshake, DNS, HTTP/2 setup)
     // so the first real message doesn't hit a cold-start timeout.
@@ -188,49 +253,15 @@ pub async fn start_channels(mut config: Config) -> Result<()> {
         tracing::warn!("Provider warmup failed (non-fatal): {e}");
     }
 
-    let runtime: Arc<dyn host_runtime::RuntimeAdapter> =
-        Arc::from(host_runtime::create_runtime(&config.runtime)?);
-    // Ensure the agent's default projects home (~/OpenHuman/projects) exists and
-    // is a read-write trusted root, so the coding agent creates/edits projects
-    // there freely — distinct from the hidden internal workspace dir. A user who
-    // has already granted it (or any other root) is left untouched.
-    {
-        use crate::openhuman::security::{TrustedAccess, TrustedRoot};
-        let projects_dir = crate::openhuman::config::default_projects_dir();
-        if let Err(e) = tokio::fs::create_dir_all(&projects_dir).await {
-            tracing::warn!(
-                dir = %projects_dir.display(),
-                error = %e,
-                "[startup] could not create default projects dir"
-            );
-        }
-        let projects_path = projects_dir.to_string_lossy().to_string();
-        if !config
-            .autonomy
-            .trusted_roots
-            .iter()
-            .any(|r| r.path == projects_path)
-        {
-            config.autonomy.trusted_roots.push(TrustedRoot {
-                path: projects_path,
-                access: TrustedAccess::ReadWrite,
-            });
-        }
-    }
-    // Ensure the action sandbox directory exists (defaults to ~/OpenHuman/projects).
-    let action_dir = config.action_dir.clone();
-    if let Err(e) = tokio::fs::create_dir_all(&action_dir).await {
-        tracing::warn!(
-            dir = %action_dir.display(),
-            error = %e,
-            "[startup] could not create action sandbox dir"
-        );
-    }
-    tracing::info!(
-        workspace = %config.workspace_dir.display(),
-        action = %action_dir.display(),
-        "[startup] workspace (internal state) and action sandbox (tool cwd) directories configured"
-    );
+    let runtime: Arc<dyn host_runtime::RuntimeAdapter> = Arc::from(host_runtime::create_runtime(
+        &config.runtime,
+        config.shell.hide_window,
+    )?);
+    // Create the agent's action sandbox + default projects home and register the
+    // projects dir as a ReadWrite trusted root. Shared with the always-run
+    // `bootstrap_core_runtime` boot so a fresh install gets these dirs even with
+    // no messaging integrations connected (#3353, RC-A).
+    crate::openhuman::config::ensure_agent_dirs(&mut config).await;
     // Install as the process-global live policy so runtime autonomy changes
     // (config.update_autonomy_settings) are reflected by `live_policy::current()`
     // and picked up by the next session.
@@ -264,19 +295,45 @@ pub async fn start_channels(mut config: Config) -> Result<()> {
         crate::openhuman::config::AuditConfig::default(),
         config.workspace_dir.clone(),
     )?;
-    let model = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| crate::openhuman::config::DEFAULT_MODEL.into());
     let temperature = config.default_temperature;
     let local_embedding = config.workload_local_model("embeddings");
-    let mem: Arc<dyn Memory> = Arc::from(memory_store::create_memory_with_local_ai(
+    let embedding_api_key =
+        crate::openhuman::embeddings::resolve_api_key(&config, &config.memory.embedding_provider);
+    // Build the memory store. A misconfigured/removed embedding provider (e.g. a
+    // stale `embedding_provider = "fastembed"` that the factory no longer knows)
+    // makes the embedder build fail — but that must NOT take every messaging
+    // channel offline (issue #3712). Fall back to keyword-only memory
+    // (`embedding_provider = "none"` → NoopEmbedding) so the channel listeners
+    // still start; semantic memory degrades gracefully instead of the whole
+    // runtime aborting.
+    let mem: Arc<dyn Memory> = match memory_store::create_memory_with_local_ai(
         &config.memory,
         local_embedding.as_deref(),
+        &embedding_api_key,
         &[],
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-    )?);
+    ) {
+        Ok(mem) => Arc::from(mem),
+        Err(e) => {
+            tracing::error!(
+                error = %format!("{e:#}"),
+                provider = %config.memory.embedding_provider,
+                "[channels] memory embedder build failed — falling back to keyword-only \
+                 memory so channels still start"
+            );
+            let mut fallback_memory = config.memory.clone();
+            fallback_memory.embedding_provider = "none".to_string();
+            Arc::from(memory_store::create_memory_with_local_ai(
+                &fallback_memory,
+                local_embedding.as_deref(),
+                &embedding_api_key,
+                &[],
+                Some(&config.storage.provider.config),
+                &config.workspace_dir,
+            )?)
+        }
+    };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
     let tools_registry = Arc::new(tools::all_tools_with_runtime(
@@ -287,12 +344,21 @@ pub async fn start_channels(mut config: Config) -> Result<()> {
         Arc::clone(&mem),
         &config.browser,
         &config.http_request,
-        &action_dir,
+        &config.action_dir,
         &config.agents,
         &config,
+        None,
+        None,
     ));
 
-    let skills = crate::openhuman::skills::load_skills(&workspace);
+    let skills = crate::openhuman::workflows::load_workflow_metadata(&workspace);
+
+    // Install the triggered-workflow subscriber now that workflows are
+    // discovered — otherwise any workflow declaring `triggers:` is silently
+    // ignored. Idempotent + shares a process-global OnceLock with the
+    // `bootstrap_core_runtime` site, so it registers exactly once regardless of
+    // which startup path runs first (web-chat-only cores never reach here).
+    crate::openhuman::workflows::bus::ensure_triggered_workflow_subscriber(&workspace);
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -365,12 +431,12 @@ pub async fn start_channels(mut config: Config) -> Result<()> {
         bootstrap_max_chars,
         None,
     );
-    // Filter out Skill-category tools (e.g. Composio, Apify) from the
+    // Filter out Workflow-category tools (e.g. Composio, Apify) from the
     // main agent prompt — those are only available to the integrations_agent
     // subagent via category_filter = "skill".
     let non_skill_tools: Vec<&Box<dyn crate::openhuman::tools::Tool>> = tools_registry
         .iter()
-        .filter(|t| t.category() != crate::openhuman::tools::traits::ToolCategory::Skill)
+        .filter(|t| t.category() != crate::openhuman::tools::traits::ToolCategory::Workflow)
         .collect();
     let non_skill_refs: Vec<&dyn crate::openhuman::tools::Tool> =
         non_skill_tools.iter().map(|t| t.as_ref()).collect();
@@ -412,7 +478,8 @@ pub async fn start_channels(mut config: Config) -> Result<()> {
                 tg.stream_mode,
                 tg.draft_update_interval_ms,
                 tg.silent_streaming,
-            ),
+            )
+            .with_chat_id(tg.chat_id.clone()),
         ));
     } else {
         tracing::info!(
@@ -653,12 +720,16 @@ pub async fn start_channels(mut config: Config) -> Result<()> {
     // Register the proactive message subscriber so morning briefings,
     // welcome messages, and other proactive agent output gets routed to
     // the user's active channel (+ always to web).
-    let _proactive_handle = bus.subscribe(Arc::new(
-        crate::openhuman::channels::proactive::ProactiveMessageSubscriber::new(
-            Arc::clone(&channels_by_name),
-            config.channels_config.active_channel.clone(),
-        ),
-    ));
+    let proactive_sub = crate::openhuman::channels::proactive::ProactiveMessageSubscriber::new(
+        Arc::clone(&channels_by_name),
+        config.channels_config.active_channel.clone(),
+    );
+    // Expose its active-channel handle so the `channels_set_default` RPC can
+    // switch the default channel at runtime without a restart (issue #3712).
+    crate::openhuman::channels::proactive::register_active_channel_handle(
+        proactive_sub.active_channel_handle(),
+    );
+    let _proactive_handle = bus.subscribe(Arc::new(proactive_sub));
     let _telegram_remote_handle = if channels_by_name.contains_key("telegram") {
         let handle = bus.subscribe(Arc::new(
             crate::openhuman::channels::providers::telegram::TelegramRemoteSubscriber::new(
@@ -666,6 +737,23 @@ pub async fn start_channels(mut config: Config) -> Result<()> {
             ),
         ));
         tracing::debug!("[telegram-remote] registered TelegramRemoteSubscriber");
+        Some(handle)
+    } else {
+        None
+    };
+    // Sub-issue 2 of #3098: when Telegram is enabled, register the
+    // approval-surface subscriber so `Prompt`-class tool calls actually
+    // get gated for the user instead of silently allowed (the legacy
+    // behavior when `ApprovalChatContext` is unset). The dispatch loop
+    // pairs this by scoping each Telegram turn in an `ApprovalChatContext`
+    // and intercepting `yes`/`no` replies for parked approvals.
+    let _telegram_approval_surface_handle = if channels_by_name.contains_key("telegram") {
+        let handle = bus.subscribe(Arc::new(
+            crate::openhuman::channels::providers::telegram::TelegramApprovalSurfaceSubscriber::new(
+                Arc::clone(&channels_by_name),
+            ),
+        ));
+        tracing::debug!("[telegram-approval] registered TelegramApprovalSurfaceSubscriber");
         Some(handle)
     } else {
         None
@@ -679,7 +767,6 @@ pub async fn start_channels(mut config: Config) -> Result<()> {
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
 
-    let provider_name = provider::INFERENCE_BACKEND_ID.to_string();
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
     let message_timeout_secs =
@@ -828,6 +915,10 @@ pub mod test_support {
         resolve_yuanbao_app_secret(yb_cfg, config)
     }
 }
+
+#[cfg(test)]
+#[path = "startup_tests.rs"]
+mod tests;
 
 #[cfg(test)]
 mod yuanbao_secret_tests {

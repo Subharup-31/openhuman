@@ -183,6 +183,8 @@ fn daily_node(id: &str, tree_id: &str, day: chrono::DateTime<Utc>) -> SummaryNod
         sealed_at: day + Duration::hours(2),
         deleted: false,
         embedding: Some(vec![0.0; 1024]),
+        doc_id: None,
+        version_ms: None,
     }
 }
 
@@ -284,6 +286,8 @@ async fn memory_read_rpc_filters_graphs_scores_reset_and_wipe_seeded_rows() {
         sealed_at: ts0 + Duration::hours(3),
         deleted: false,
         embedding: Some(vec![0.0; 1024]),
+        doc_id: None,
+        version_ms: None,
     };
     insert_summary(
         &cfg,
@@ -562,6 +566,9 @@ async fn thread_ops_welcome_migration_and_turn_state_cover_error_and_cleanup_pat
         elapsed_ms: 50,
         iterations: 2,
         output_chars: 100,
+        worktree_path: None,
+        changed_files: vec![],
+        dirty_status: None,
     }));
     mirror.finish();
 

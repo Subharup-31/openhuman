@@ -1,7 +1,7 @@
 //! Static MCP resource catalog for bundled prompt assets.
 //!
 //! Exposes `IDENTITY.md`, `SOUL.md`, `USER.md` and the `prompt.md` template
-//! for each of the 18 built-in subagents as MCP resources. The content is
+//! for each built-in subagent as MCP resources. The content is
 //! embedded at compile time via `include_str!`.
 //!
 //! ## URI scheme
@@ -86,6 +86,12 @@ const RESOURCE_CATALOG: &[PromptResource] = &[
         content: include_str!("../agent_registry/agents/markets_agent/prompt.md"),
     },
     PromptResource {
+        uri: "openhuman://prompts/agents/tinyplace_agent",
+        name: "tinyplace_agent",
+        description: "Specialist worker for tiny.place identity, marketplace, messaging, and jobs.",
+        content: include_str!("../tinyplace/agent/prompt.md"),
+    },
+    PromptResource {
         uri: "openhuman://prompts/agents/tools_agent",
         name: "tools_agent",
         description: "Generalist worker with access to the full tool surface.",
@@ -110,16 +116,34 @@ const RESOURCE_CATALOG: &[PromptResource] = &[
         content: include_str!("../agent_registry/agents/researcher/prompt.md"),
     },
     PromptResource {
+        uri: "openhuman://prompts/agents/context_scout",
+        name: "context_scout",
+        description: "Read-only pre-flight worker that gathers context (memory, goals, integrations, web) and returns a bounded context bundle.",
+        content: include_str!("../agent_registry/agents/context_scout/prompt.md"),
+    },
+    PromptResource {
         uri: "openhuman://prompts/agents/critic",
         name: "critic",
         description: "Read-only worker that critiques plans and outputs.",
         content: include_str!("../agent_registry/agents/critic/prompt.md"),
     },
     PromptResource {
+        uri: "openhuman://prompts/agents/vision_agent",
+        name: "vision_agent",
+        description: "Multimodal worker that analyses attached images for the vision tier.",
+        content: include_str!("../agent_registry/agents/vision_agent/prompt.md"),
+    },
+    PromptResource {
         uri: "openhuman://prompts/agents/archivist",
         name: "archivist",
         description: "Background worker that distils conversations into persistent memory.",
         content: include_str!("../agent_registry/agents/archivist/prompt.md"),
+    },
+    PromptResource {
+        uri: "openhuman://prompts/agents/goals_agent",
+        name: "goals_agent",
+        description: "Background curator that keeps the user's long-term goals list fresh.",
+        content: include_str!("../agent_registry/agents/goals_agent/prompt.md"),
     },
     PromptResource {
         uri: "openhuman://prompts/agents/trigger_triage",
@@ -152,10 +176,88 @@ const RESOURCE_CATALOG: &[PromptResource] = &[
         content: include_str!("../agent_registry/agents/help/prompt.md"),
     },
     PromptResource {
+        uri: "openhuman://prompts/agents/scheduler_agent",
+        name: "scheduler_agent",
+        description: "Specialist worker for reminders, recurring jobs, and cron inspection.",
+        content: include_str!("../agent_registry/agents/scheduler_agent/prompt.md"),
+    },
+    PromptResource {
+        uri: "openhuman://prompts/agents/presentation_agent",
+        name: "presentation_agent",
+        description: "Specialist worker for evidence-grounded presentation generation.",
+        content: include_str!("../agent_registry/agents/presentation_agent/prompt.md"),
+    },
+    PromptResource {
+        uri: "openhuman://prompts/agents/desktop_control_agent",
+        name: "desktop_control_agent",
+        description: "Specialist worker for desktop app launch and accessibility actions.",
+        content: include_str!("../agent_registry/agents/desktop_control_agent/prompt.md"),
+    },
+    PromptResource {
         uri: "openhuman://prompts/agents/mcp_setup",
         name: "mcp_setup",
         description: "Worker that guides the user through MCP client configuration.",
         content: include_str!("../agent_registry/agents/mcp_setup/prompt.md"),
+    },
+    PromptResource {
+        uri: "openhuman://prompts/agents/mcp_agent",
+        name: "mcp_agent",
+        description: "Worker that discovers and calls tools on already-connected MCP servers.",
+        content: include_str!("../agent_registry/agents/mcp_agent/prompt.md"),
+    },
+    PromptResource {
+        uri: "openhuman://prompts/agents/task_manager_agent",
+        name: "task_manager_agent",
+        description: "Specialist worker for task planning, status, and task-board changes.",
+        content: include_str!("../agent_registry/agents/task_manager_agent/prompt.md"),
+    },
+    PromptResource {
+        uri: "openhuman://prompts/agents/settings_agent",
+        name: "settings_agent",
+        description: "Specialist worker for inspecting and updating OpenHuman settings.",
+        content: include_str!("../agent_registry/agents/settings_agent/prompt.md"),
+    },
+    PromptResource {
+        uri: "openhuman://prompts/agents/profile_memory_agent",
+        name: "profile_memory_agent",
+        description: "Specialist worker for profile and long-term memory updates.",
+        content: include_str!("../agent_registry/agents/profile_memory_agent/prompt.md"),
+    },
+    PromptResource {
+        uri: "openhuman://prompts/agents/account_admin_agent",
+        name: "account_admin_agent",
+        description: "Specialist worker for connected account and integration administration.",
+        content: include_str!("../agent_registry/agents/account_admin_agent/prompt.md"),
+    },
+    PromptResource {
+        uri: "openhuman://prompts/agents/screen_awareness_agent",
+        name: "screen_awareness_agent",
+        description: "Specialist worker for screen context and desktop state inspection.",
+        content: include_str!("../agent_registry/agents/screen_awareness_agent/prompt.md"),
+    },
+    PromptResource {
+        uri: "openhuman://prompts/agents/agent_memory",
+        name: "agent_memory",
+        description: "Dedicated memory retrieval subagent using smart-walk strategies.",
+        content: include_str!("../agent_memory/agent/prompt.md"),
+    },
+    PromptResource {
+        uri: "openhuman://prompts/agents/subconscious",
+        name: "subconscious",
+        description: "Background reasoning agent that maintains subconscious scratchpad context.",
+        content: include_str!("../subconscious/agent/prompt.md"),
+    },
+    PromptResource {
+        uri: "openhuman://prompts/agents/skill_setup",
+        name: "skill_setup",
+        description: "Worker that guides skill installation and backend configuration.",
+        content: include_str!("../skill_registry/agent/skill_setup/prompt.md"),
+    },
+    PromptResource {
+        uri: "openhuman://prompts/agents/skill_executor",
+        name: "skill_executor",
+        description: "Sandboxed worker that runs installed skill packages.",
+        content: include_str!("../skill_runtime/agent/skill_executor/prompt.md"),
     },
 ];
 

@@ -112,6 +112,7 @@ async fn compatible_provider_covers_chat_responses_streaming_tools_and_errors() 
                 messages: &[ChatMessage::user("use a tool")],
                 tools: Some(&tools),
                 stream: None,
+                max_tokens: None,
             },
             "tool-model",
             0.1,
@@ -135,6 +136,7 @@ async fn compatible_provider_covers_chat_responses_streaming_tools_and_errors() 
                 messages: &[ChatMessage::user("stream it")],
                 tools: Some(&tools),
                 stream: Some(&tx),
+                max_tokens: None,
             },
             "stream-model",
             0.1,
@@ -310,11 +312,16 @@ async fn provider_factory_and_model_listing_cover_cloud_local_and_invalid_shapes
         .value;
     assert_eq!(local_listed["models"][0]["id"], "demo-chat");
 
-    let unsupported = list_configured_models("missing")
+    // PR #2959 reverted the list_models 404 suppression: a 404 from /models
+    // now surfaces as a real error instead of a synthetic `unsupported: true`
+    // success, so the failure fires to Sentry for a root-cause fix.
+    let missing_err = list_configured_models("missing")
         .await
-        .expect("404 unsupported")
-        .value;
-    assert_eq!(unsupported["unsupported"], true);
+        .expect_err("404 list_models now surfaces as an error");
+    assert!(
+        missing_err.contains("provider returned 404"),
+        "404 list_models error should surface the status: {missing_err:?}"
+    );
 
     let openrouter = list_configured_models("openrouter")
         .await

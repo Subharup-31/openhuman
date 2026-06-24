@@ -124,7 +124,7 @@ async function waitForSocketConnected(page: Page): Promise<void> {
 async function sendMessage(page: Page, prompt: string): Promise<void> {
   await waitForSocketConnected(page);
   await dismissWalkthroughIfPresent(page);
-  await page.getByPlaceholder('Type a message...').fill(prompt);
+  await page.getByPlaceholder('How can I help you today?').fill(prompt);
   await dismissWalkthroughIfPresent(page);
   await expect(page.getByTestId('send-message-button')).toBeEnabled();
   await page.getByTestId('send-message-button').click();
@@ -170,8 +170,8 @@ test.describe('Harness - Composio tool-call prompt flow', () => {
     await setMockBehavior('llmStreamChunkDelayMs', '10');
 
     await sendMessage(page, 'check my email');
-    await expect(page.getByText(CANARY)).toBeVisible({ timeout: 60_000 });
-    await expect(page.getByText(/Q3 Budget Review/i)).toBeVisible();
+    await expect(page.getByText(CANARY).first()).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByText(/Q3 Budget Review/i).first()).toBeVisible();
 
     const log = await requests();
     const llmHits = log.filter(
@@ -210,8 +210,8 @@ test.describe('Harness - Composio tool-call prompt flow', () => {
     await setMockBehavior('llmStreamChunkDelayMs', '10');
 
     await sendMessage(page, 'list my GitHub repos');
-    await expect(page.getByText(CANARY)).toBeVisible({ timeout: 60_000 });
-    await expect(page.getByText(/openhuman/i)).toBeVisible();
+    await expect(page.getByText(CANARY).first()).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByText(/openhuman/i).first()).toBeVisible();
 
     const log = await requests();
     const llmHits = log.filter(
@@ -244,7 +244,7 @@ test.describe('Harness - Composio tool-call prompt flow', () => {
     await setMockBehavior('llmStreamChunkDelayMs', '10');
 
     await sendMessage(page, 'check my email inbox please');
-    await expect(page.getByText(CANARY)).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByText(CANARY).first()).toBeVisible({ timeout: 60_000 });
     await expect(page.getByText(/unable to fetch your emails/i)).toBeVisible();
   });
 
@@ -286,7 +286,9 @@ test.describe('Harness - Composio tool-call prompt flow', () => {
     await setMockBehavior('llmStreamChunkDelayMs', '10');
 
     await sendMessage(page, 'create a linear issue titled Fix authentication timeout');
-    await expect(page.getByText(CANARY)).toBeVisible({ timeout: 60_000 });
-    await expect(page.getByText(/I have created the Linear issue/i)).toBeVisible();
+    await expect(page.getByText(CANARY).first()).toBeVisible({ timeout: 60_000 });
+    // `.first()` — the confirmation text also appears in the tool-result echo
+    // pane, so an unscoped match trips Playwright strict mode (2 elements).
+    await expect(page.getByText(/I have created the Linear issue/i).first()).toBeVisible();
   });
 });

@@ -159,6 +159,7 @@ async fn dispatcher_rejects_missing_and_stale_non_claimable_cards() {
         acceptance_criteria: vec![],
         evidence: vec![],
         notes: None,
+        session_thread_id: None,
         blocker: None,
         source_metadata: None,
         order: 0,
@@ -175,7 +176,7 @@ async fn dispatcher_rejects_missing_and_stale_non_claimable_cards() {
     let stale_err = dispatch_card(location, stale)
         .await
         .expect_err("stale done card should not be claimable");
-    assert!(stale_err.contains("not claimable"));
+    assert!(stale_err.contains("claim rejected"));
     assert!(stale_err.contains("done"));
 }
 

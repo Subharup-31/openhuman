@@ -3,10 +3,22 @@
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 compile_error!("src-tauri host supports desktop (Windows/macOS/Linux) only. Mobile lives in app/src-tauri-mobile.");
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod artifact_commands;
 mod cdp;
+// macOS/Linux only: depends on the `nix` crate (a `cfg(unix)` dependency) and
+// resolves a platform cache path that is only defined for those targets. On
+// Windows it must not be compiled — see issue: Windows release build failed
+// with E0433 (`nix` unresolved) + E0425 (`cache_path` undefined).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod cef_preflight;
 mod cef_profile;
+// Windows-only pre-CEF wait for a dying prior instance to release the cache
+// lock (Sentry TAURI-RUST-F). Compiled under `test` too so the pure decision
+// logic is unit-tested on any host; the Win32 glue is windows-only.
+#[cfg(any(target_os = "windows", test))]
+mod cef_singleton_wait;
+mod claude_code;
 mod companion_commands;
 mod core_process;
 mod core_rpc;
@@ -34,13 +46,18 @@ mod meet_call;
 mod meet_scanner;
 mod meet_video;
 mod native_notifications;
+#[cfg(target_os = "macos")]
+mod notch_window;
 mod notification_settings;
 mod process_kill;
 mod process_recovery;
+mod ptt_hotkeys;
+mod ptt_overlay;
 #[cfg(target_os = "windows")]
 mod reset_reboot_schedule;
 mod screen_capture;
 mod slack_scanner;
+mod stderr_panic_hook;
 mod telegram_scanner;
 mod webview_accounts;
 mod webview_apis;
@@ -284,6 +301,24 @@ async fn recover_port_conflict(
     let outcome = state.inner().recover_port_conflict().await;
     log::debug!(
         "[core] recover_port_conflict: result success={} message={}",
+        outcome.success,
+        outcome.message
+    );
+    Ok(outcome)
+}
+
+/// Terminate the foreign process holding the core RPC port, after the user
+/// consented to the specific pid surfaced by `recover_port_conflict`.
+#[tauri::command]
+async fn force_quit_port_owner(
+    pid: u32,
+    state: tauri::State<'_, core_process::CoreProcessHandle>,
+) -> Result<core_process::RecoveryOutcome, String> {
+    log::info!("[core] force_quit_port_owner: command invoked for pid {pid}");
+    let _guard = state.inner().restart_lock().await;
+    let outcome = state.inner().force_quit_port_owner(pid).await;
+    log::debug!(
+        "[core] force_quit_port_owner: result success={} message={}",
         outcome.success,
         outcome.message
     );
@@ -744,6 +779,18 @@ async fn register_dictation_hotkey(
         expanded_shortcuts.join(", ")
     );
 
+    // Reject overlap with the currently-registered PTT hotkey.
+    let ptt_current = {
+        let state = app.state::<ptt_hotkeys::PttHotkeyState>();
+        let guard = state.shortcut.lock().unwrap();
+        guard.clone()
+    };
+    if let Some(conflict) = ptt_hotkeys::first_conflict_with(&expanded_shortcuts, &ptt_current) {
+        return Err(format!(
+            "dictation shortcut '{conflict}' conflicts with the push-to-talk hotkey"
+        ));
+    }
+
     let register_shortcut = |shortcut_variant: &str| -> Result<(), String> {
         let app_clone = app.clone();
         app.global_shortcut()
@@ -838,6 +885,180 @@ async fn unregister_dictation_hotkey(app: AppHandle<AppRuntime>) -> Result<(), S
     Ok(())
 }
 
+/// Register (or re-register) the global push-to-talk hotkey. Emits
+/// `ptt://start { session_id }` on press and `ptt://stop { session_id }`
+/// on release.
+#[tauri::command]
+async fn register_ptt_hotkey(app: AppHandle<AppRuntime>, shortcut: String) -> Result<(), String> {
+    log::info!("[ptt] register_ptt_hotkey: shortcut={shortcut}");
+
+    let expanded = ptt_hotkeys::expand_ptt_shortcuts(&shortcut).map_err(|e| e.to_string())?;
+
+    // Reject overlap with the currently-registered dictation hotkey.
+    let dictation_current = {
+        let state = app.state::<dictation_hotkeys::DictationHotkeyState>();
+        let guard = state.0.lock().unwrap();
+        guard.clone()
+    };
+    if let Some(conflict) = ptt_hotkeys::first_conflict_with(&expanded, &dictation_current) {
+        return Err(ptt_hotkeys::PttError::ConflictsWithDictation(conflict).to_string());
+    }
+
+    let old_shortcuts = {
+        let state = app.state::<ptt_hotkeys::PttHotkeyState>();
+        let guard = state.shortcut.lock().unwrap();
+        guard.clone()
+    };
+
+    // Lazy-instantiate the overlay window so it's ready before the first press.
+    if let Err(e) = ptt_overlay::ensure_window(&app) {
+        log::warn!("[ptt] overlay window create failed (continuing): {e}");
+    }
+
+    let register_shortcut = |variant: &str| -> Result<(), String> {
+        let app_pressed = app.clone();
+        let app_released = app.clone();
+        let variant_owned = variant.to_string();
+        app.global_shortcut()
+            .on_shortcut(variant, move |app_inner, _sc, event| {
+                let state = app_inner.state::<ptt_hotkeys::PttHotkeyState>();
+                match event.state {
+                    ShortcutState::Pressed => {
+                        // Drop OS key-repeat events; only the first Pressed of a hold opens a session.
+                        if state
+                            .is_held
+                            .compare_exchange(
+                                false,
+                                true,
+                                std::sync::atomic::Ordering::AcqRel,
+                                std::sync::atomic::Ordering::Acquire,
+                            )
+                            .is_err()
+                        {
+                            log::trace!(
+                                "[ptt] press dropped (already held) shortcut={variant_owned}"
+                            );
+                            return;
+                        }
+                        let session_id = state
+                            .session_counter
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
+                        log::debug!(
+                            "[ptt] pressed shortcut={variant_owned} session_id={session_id}"
+                        );
+                        if let Err(e) = app_pressed.emit(
+                            "ptt://start",
+                            serde_json::json!({
+                                "session_id": session_id,
+                            }),
+                        ) {
+                            log::warn!("[ptt] emit start failed: {e}");
+                        }
+                    }
+                    ShortcutState::Released => {
+                        if !state
+                            .is_held
+                            .swap(false, std::sync::atomic::Ordering::AcqRel)
+                        {
+                            // No corresponding Pressed in our state — stale event, drop.
+                            log::trace!(
+                                "[ptt] release dropped (not held) shortcut={variant_owned}"
+                            );
+                            return;
+                        }
+                        let session_id = state
+                            .session_counter
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        log::debug!(
+                            "[ptt] released shortcut={variant_owned} session_id={session_id}"
+                        );
+                        if let Err(e) = app_released.emit(
+                            "ptt://stop",
+                            serde_json::json!({
+                                "session_id": session_id,
+                            }),
+                        ) {
+                            log::warn!("[ptt] emit stop failed: {e}");
+                        }
+                    }
+                }
+            })
+            .map_err(|e| format!("Failed to register ptt shortcut '{variant}': {e}"))
+    };
+
+    // Unregister previous PTT variants.
+    let mut unregistered: Vec<String> = Vec::new();
+    for old in &old_shortcuts {
+        if let Err(e) = app.global_shortcut().unregister(old.as_str()) {
+            // Rollback already-unregistered ones.
+            for r in &unregistered {
+                if let Err(re) = register_shortcut(r) {
+                    log::warn!("[ptt] rollback failed for '{r}': {re}");
+                }
+            }
+            return Err(format!(
+                "Failed to unregister previous ptt shortcut '{old}': {e}"
+            ));
+        }
+        unregistered.push(old.clone());
+    }
+
+    // Register the new variants. Rollback on first failure.
+    let mut newly_registered: Vec<String> = Vec::new();
+    for v in &expanded {
+        if let Err(e) = register_shortcut(v) {
+            for r in &newly_registered {
+                if let Err(re) = app.global_shortcut().unregister(r.as_str()) {
+                    log::warn!("[ptt] rollback failed for '{r}': {re}");
+                }
+            }
+            for old in &old_shortcuts {
+                if let Err(re) = register_shortcut(old) {
+                    log::warn!("[ptt] rollback failed for '{old}': {re}");
+                }
+            }
+            return Err(e);
+        }
+        newly_registered.push(v.clone());
+    }
+
+    {
+        let state = app.state::<ptt_hotkeys::PttHotkeyState>();
+        let mut guard = state.shortcut.lock().unwrap();
+        *guard = expanded.clone();
+    }
+
+    log::info!("[ptt] registered: {}", expanded.join(", "));
+    Ok(())
+}
+
+/// Unregister the global PTT hotkey (if any).
+#[tauri::command]
+async fn unregister_ptt_hotkey(app: AppHandle<AppRuntime>) -> Result<(), String> {
+    log::info!("[ptt] unregister_ptt_hotkey: called");
+    let state = app.state::<ptt_hotkeys::PttHotkeyState>();
+    let old = {
+        let guard = state.shortcut.lock().unwrap();
+        guard.clone()
+    };
+    let mut still_registered: Vec<String> = Vec::new();
+    for s in &old {
+        if let Err(e) = app.global_shortcut().unregister(s.as_str()) {
+            log::warn!("[ptt] unregister '{s}' failed: {e}");
+            still_registered.push(s.clone());
+        }
+    }
+    // Only retain variants that genuinely failed to unregister; the rest are gone.
+    {
+        let mut guard = state.shortcut.lock().unwrap();
+        *guard = still_registered;
+    }
+    // Destroy the overlay window so resources are released.
+    ptt_overlay::destroy_window(&app);
+    Ok(())
+}
+
 fn is_daemon_mode() -> bool {
     std::env::args().any(|arg| arg == "daemon" || arg == "--daemon")
 }
@@ -913,6 +1134,61 @@ fn mascot_native_window_is_open() -> bool {
 #[cfg(not(target_os = "macos"))]
 fn mascot_native_window_is_open() -> bool {
     false
+}
+
+/// Dispatch a notch-panel mutation onto the app main thread.
+///
+/// The notch is a native NSPanel + WKWebView; AppKit requires it to be built
+/// and torn down on the main thread (and its `thread_local` storage lives
+/// there). Tauri runs these IPC command handlers on a worker thread, so we hop
+/// to the main thread via `run_on_main_thread`. Fire-and-forget: notch
+/// visibility is cosmetic (the frontend swallows errors), so we log the result
+/// on the main thread rather than blocking the command to propagate it back.
+#[cfg(target_os = "macos")]
+fn dispatch_notch_on_main(
+    app: AppHandle<AppRuntime>,
+    op: impl FnOnce(&AppHandle<AppRuntime>) + Send + 'static,
+) -> Result<(), String> {
+    app.clone()
+        .run_on_main_thread(move || op(&app))
+        .map_err(|e| format!("run_on_main_thread dispatch failed: {e}"))
+}
+
+/// Show the notch activity indicator. macOS only — transparent NSPanel + WKWebView
+/// anchored to the top-centre of the primary screen. Displays live voice and
+/// agent status (listening, thinking, executing) in a pill that emerges from
+/// the physical notch on supported MacBook Pros.
+#[tauri::command]
+fn notch_window_show(app: AppHandle<AppRuntime>) -> Result<(), String> {
+    log::info!("[notch-window] show requested");
+    #[cfg(target_os = "macos")]
+    {
+        return dispatch_notch_on_main(app, |app| {
+            if let Err(e) = notch_window::show(app) {
+                log::warn!("[notch-window] show failed: {e}");
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Ok(()) // No-op on non-macOS
+    }
+}
+
+/// Hide the notch activity indicator.
+#[tauri::command]
+fn notch_window_hide(app: AppHandle<AppRuntime>) -> Result<(), String> {
+    log::info!("[notch-window] hide requested");
+    #[cfg(target_os = "macos")]
+    {
+        return dispatch_notch_on_main(app, |_app| notch_window::hide());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Ok(())
+    }
 }
 
 /// Hide or show the OS top-level main-window frame on Windows by enumerating
@@ -1736,6 +2012,46 @@ fn append_platform_cef_gpu_workarounds(
     }
 }
 
+/// Whether a CEF command-line flag is `--time-ticks-at-unix-epoch` (in any
+/// dash/casing form, with or without an inline `=<value>` suffix). See
+/// [`strip_time_ticks_at_unix_epoch`] for why we care.
+fn is_time_ticks_at_unix_epoch_flag(flag: &str) -> bool {
+    let name = flag.trim_start_matches('-');
+    // Chromium switches can carry their value inline (`--flag=value`); compare
+    // only the switch name so the inline form can't slip past the guard.
+    let name = name.split_once('=').map_or(name, |(n, _)| n);
+    name.eq_ignore_ascii_case("time-ticks-at-unix-epoch")
+}
+
+/// Issue #3554: `--time-ticks-at-unix-epoch` carries the monotonic-clock
+/// origin (in microseconds) that CEF child processes — renderer / GPU /
+/// utility — use to map Chromium's `TimeTicks` onto wall-clock time. Chromium
+/// derives this value itself when it spawns each child, and it must stay
+/// consistent with the host clock.
+///
+/// OpenHuman must never inject this switch into the CEF command line: a stale
+/// or negative value (e.g. the `-1780937467390432` reported in #3554) pins the
+/// renderer's internal clock ~56 years before the Unix epoch, which surfaces
+/// as a wrong "Current Date & Time" in the app. The CEF command line is
+/// assembled from several sources (the static list here plus any
+/// `RuntimeInitAttribute::CommandLineArgs` contributed elsewhere), so strip the
+/// flag from the final list as a guard and let Chromium compute the origin
+/// locally for each process.
+fn strip_time_ticks_at_unix_epoch(args: &mut Vec<CefCommandLineArg>) {
+    args.retain(|(flag, value)| {
+        if is_time_ticks_at_unix_epoch_flag(flag) {
+            log::warn!(
+                "[cef-startup] dropping OpenHuman-supplied --time-ticks-at-unix-epoch{} so \
+                 Chromium computes the clock origin locally (issue #3554)",
+                value.map(|v| format!("={v}")).unwrap_or_default()
+            );
+            false
+        } else {
+            true
+        }
+    });
+}
+
 /// Linux only: replace Xlib's default error handler with a logging no-op.
 ///
 /// Why: on Wayland sessions (GNOME/KDE/Hyprland) running CEF via XWayland,
@@ -1804,6 +2120,18 @@ fn install_silent_x_error_handler() {
 fn install_silent_x_error_handler() {}
 
 pub fn run() {
+    // Neutralise a broken inherited stderr *pipe* BEFORE any `eprintln!` can
+    // fire. On Windows, when the GUI process inherits an stderr pipe whose
+    // parent end later closes, the next stdlib stderr write fails with a
+    // broken-pipe errno and `std::io::stdio::print_to` raises
+    // `panic!("failed printing to stderr: …")` on the main thread, aborting the
+    // app over an external condition (Sentry TAURI-RUST-F). Redirecting that
+    // pipe to NUL makes the write succeed (discarded) instead of panicking. A
+    // panic hook cannot fix this — it runs during unwinding and cannot stop the
+    // abort — so the cure is at the write path. No-op on non-Windows / when
+    // stderr is a console or file. See `stderr_panic_hook`.
+    stderr_panic_hook::neutralize_broken_parent_stderr();
+
     // Must run before any GTK/CEF code that could trigger X calls — otherwise
     // Xlib's default handler calls exit(1) on the first BadWindow and we never
     // reach this line. See helper doc above for the full reasoning.
@@ -1821,21 +2149,27 @@ pub fn run() {
     // burns through the same 2 MB. In `crahs.log` (2026-05-17, build
     // 0.53.49) that tower plus the serde-monomorphised `Config` Visitor
     // frames pushed past the guard page and aborted with
-    // `SIGBUS / KERN_PROTECTION_FAILURE`. The structural fix
-    // (`spawn_blocking` for the TOML parse + cache in
-    // `src/openhuman/config/{schema/load.rs, ops.rs}`) moves the
-    // largest contributor off the worker; bumping the worker stack
-    // itself gives the rest of the tower comfortable headroom so future
-    // additions don't immediately re-tip the same scale. 8 MiB matches
-    // the OS-default pthread main-thread stack on macOS, so we can
-    // assume "as much room as the main thread" everywhere.
+    // `SIGBUS / KERN_PROTECTION_FAILURE`.
+    //
+    // The structural fix (`spawn_blocking` for the TOML parse + cache in
+    // `src/openhuman/config/{schema/load.rs, ops.rs}`) moves the largest
+    // contributor off the worker. An initial 8 MiB bump shipped here was
+    // enough for that single tower, but sub-agent delegation (issue #3159
+    // / PR #3155) re-tipped the scale: the standalone `openhuman-core`
+    // CLI server still aborted with `Abort trap: 6 / fatal runtime error:
+    // stack overflow` once an orchestrator delegated. PR #3155 raised the
+    // standalone server to 16 MiB; the desktop Tauri host is the *same*
+    // tower running on a *different* runtime and needs the same headroom.
+    // Share the constant with the rest of `src/core/*` via
+    // [`openhuman_core::core::runtime::AGENT_WORKER_STACK_BYTES`] so all
+    // multi-thread runtimes that may host an agent turn stay in sync.
     //
     // Must happen before any `tauri::async_runtime::*` call, otherwise
     // `set(...)` panics with "runtime already initialized".
     {
         let custom_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .thread_stack_size(8 * 1024 * 1024)
+            .thread_stack_size(openhuman_core::core::runtime::AGENT_WORKER_STACK_BYTES)
             .build()
             .expect("build custom tokio runtime for tauri async surface");
         let handle = custom_runtime.handle().clone();
@@ -1918,6 +2252,31 @@ pub fn run() {
             {
                 return None;
             }
+            // Defense-in-depth: drop managed-backend `errorCode` events (#870)
+            // the backend owns (F2/F4). The shell links the core in-process,
+            // so a managed inference error captured here must be filtered
+            // identically to the core binary's main.rs chain. The malformed
+            // `BAD_REQUEST` carve-out (F8) is excluded by the underlying
+            // decision, so a client-built bad payload still pages.
+            if openhuman_core::core::observability::is_backend_error_code_event(&event) {
+                log::debug!(
+                    "[sentry-error-code-filter] dropping backend-owned errorCode event_id={:?}",
+                    event.event_id
+                );
+                return None;
+            }
+            // Defense-in-depth: drop transient streaming transport blips
+            // (domain=llm_provider, failure=transport) — flaky-network
+            // timeouts/resets recovered by retry/fallback (F7). Mirrors the
+            // core binary's main.rs filter.
+            if openhuman_core::core::observability::is_transient_provider_transport_failure(&event)
+            {
+                log::debug!(
+                    "[sentry-transport-filter] dropping transient provider transport event_id={:?}",
+                    event.event_id
+                );
+                return None;
+            }
             // Drop 401 "Session expired. Please log in again." bodies and
             // pre-flight "no session token stored" guards — mirrors the
             // core binary's before_send chain. Since #1061 the Tauri shell
@@ -1935,22 +2294,50 @@ pub fn run() {
                 );
                 return None;
             }
+            // Drop provider insufficient-credits 402s — the user's own BYO
+            // account (e.g. OpenRouter) is out of balance, a billing state
+            // OpenHuman has no lever over once the request already caps
+            // max_tokens. The core binary's main.rs before_send already
+            // filters these; since #1061 the core runs in-process inside this
+            // shell, so the cron `agent_job` retries-exhausted report (and any
+            // other compatible-provider path) lands in THIS Sentry client and
+            // must be filtered identically. Closes the #3617 drift that wired
+            // the filter only into the standalone-CLI chain (TAURI-RUST-514 /
+            // -C62).
+            if openhuman_core::core::observability::is_insufficient_credits_event(&event) {
+                // Metadata-only log shape — `event.message` carries the raw
+                // provider 402 body which CLAUDE.md forbids from local logs.
+                log::debug!(
+                    "[sentry-insufficient-credits-filter] dropping insufficient-credits 402 event_id={:?}",
+                    event.event_id
+                );
+                return None;
+            }
             // Strip server_name (hostname) to avoid leaking machine identity.
             event.server_name = None;
             // Attach the cached account uid so Sentry can count unique users
             // affected by an issue. We only carry `id` — never email, name,
             // or IP — so this stays consistent with `send_default_pii: false`.
             // Since #1061 the core runs in-process inside this shell, so this
-            // is the surface that tags ~all desktop events. Mirrors the
-            // standalone `openhuman-core` binary's filter in `src/main.rs`.
-            // Empty/missing on early-startup events (cache populates after
-            // the first `auth_get_me` RPC); that's expected.
-            event.user = openhuman_core::openhuman::app_state::peek_cached_current_user_identity()
-                .and_then(|identity| identity.id)
-                .map(|id| sentry::User {
-                    id: Some(id),
-                    ..Default::default()
-                });
+            // is the surface that tags ~all desktop events.
+            //
+            // Issue #3135: the primary source for `event.user` is now the
+            // Sentry scope, bound proactively at session boundaries
+            // (credentials::store_session / clear_session) and at server boot
+            // (run_server_inner). The `app_state_snapshot` cache is kept as a
+            // fallback for legacy cache-warming paths, but we only consult it
+            // when the scope hasn't already bound a user — otherwise we'd
+            // silently clobber the scope binding when the cache is empty
+            // (the original userCount=0 root cause).
+            if event.user.is_none() {
+                event.user =
+                    openhuman_core::openhuman::app_state::peek_cached_current_user_identity()
+                        .and_then(|identity| identity.id)
+                        .map(|id| sentry::User {
+                            id: Some(id),
+                            ..Default::default()
+                        });
+            }
             Some(event)
         })),
         sample_rate: 1.0,
@@ -1967,6 +2354,15 @@ pub fn run() {
             scope.set_tag("os_version", ver);
         }
     });
+
+    // Install the panic hook *after* `sentry::init` so `take_hook()` captures
+    // Sentry's panic integration as its chain target. The hook ALWAYS chains to
+    // the previous hook for every panic — it never swallows, so no crash is ever
+    // hidden from Sentry. The actual broken-pipe-on-stderr abort is prevented at
+    // the write path by `neutralize_broken_parent_stderr()` (called at the top of
+    // `run()`); this hook only adds a diagnostic breadcrumb for that family. See
+    // `stderr_panic_hook` for the full rationale (Sentry TAURI-RUST-F).
+    stderr_panic_hook::install();
 
     // Optional smoke trigger for verifying the Sentry pipeline end-to-end.
     // Run with `OPENHUMAN_TAURI_SENTRY_TEST=panic` to fire a panic, or
@@ -2126,6 +2522,18 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     process_recovery::reap_stale_openhuman_processes();
 
+    // ── Windows pre-CEF cache-lock wait (Sentry TAURI-RUST-F) ─────────────
+    // The Win32 mutex above stops a *concurrent* second launch, but on a
+    // *sequential* relaunch (auto-update, fast quit+reopen, restart) the prior
+    // instance can still hold the CEF cache lock for a short teardown window
+    // after releasing the mutex. Calling `cef::initialize()` into that live
+    // lock returns 0 and the vendored runtime asserts `== 1` → panic. Wait
+    // (bounded) for the prior instance to exit before proceeding; this never
+    // suppresses a crash — it prevents `cef::initialize()` from running
+    // against a locked cache. Analogous to the macOS reap above.
+    #[cfg(target_os = "windows")]
+    cef_singleton_wait::wait_for_cache_release();
+
     // ── Linux pre-CEF deep-link forwarding guard (issue #2359) ────────────
     // On Linux, a secondary instance with an openhuman:// URL in argv exits
     // at the CEF preflight check before Builder::setup() runs, silently
@@ -2143,16 +2551,18 @@ pub fn run() {
         deep_link_ipc::bind_and_listen()
     };
 
-    // CEF cache-lock preflight: if another OpenHuman instance holds the CEF
-    // user-data-dir SingletonLock, `cef_initialize` returns 0 and the vendored
-    // runtime panics (`left: 0, right: 1`). Catch the collision here and exit
-    // cleanly. Stale locks (PID dead) are removed so crashed processes don't
-    // block subsequent launches. macOS: issue #864. Linux: OPENHUMAN-TAURI-K1.
+    // CEF cache-lock preflight (macOS + Linux): if another OpenHuman instance
+    // holds the CEF user-data-dir SingletonLock, `cef_initialize` returns 0 and
+    // the vendored runtime used to panic (`left: 0, right: 1`). The common
+    // cause is a *sequential relaunch race* where the prior instance is still
+    // tearing down, so rather than exit on the first collision we wait
+    // (bounded, exponential backoff — the macOS/Linux analogue of the Windows
+    // pre-CEF wait) for the lock to clear, then proceed. If it is still held
+    // after the budget we exit cleanly (code 0). Stale locks (PID dead) are
+    // removed so crashed processes don't block launches. macOS: issue #864.
+    // Linux: OPENHUMAN-TAURI-K1. Sentry: TAURI-RUST-F.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if let Err(e) = cef_preflight::check_default_cache() {
-        eprintln!("\n[openhuman] {e}\n");
-        std::process::exit(1);
-    }
+    cef_preflight::wait_for_cache_release();
 
     let builder = {
         // Bypass macOS Keychain. Without this, every embedded service that
@@ -2163,21 +2573,11 @@ pub fn run() {
         // mock; `password-store=basic` is the equivalent for the password
         // manager. Both are no-ops on Windows/Linux, so safe to always set.
         //
-        // In debug builds we additionally expose the Chrome DevTools
-        // Protocol on localhost:19222 so every CEF webview can be
-        // inspected from a regular browser (right-click "Inspect" does
-        // not propagate to CEF child webviews on macOS). Release builds
-        // intentionally do NOT open the CDP port — it would let any
-        // process on the machine drive the embedded WhatsApp/Slack/etc.
-        // webviews.
-        //
-        // The port was 9222 (Chromium's default) but ollama's
-        // OpenAI-compatible server squats on 127.0.0.1:9222 in some
-        // installs, which silently broke CDP attach (our client hit
-        // ollama, the WS handshake failed, child webviews stayed at
-        // about:blank → black screen). Picked 19222 to dodge that
-        // collision; if you change it here also update
-        // `cdp::CDP_PORT` and `whatsapp_scanner::CDP_PORT`.
+        // CDP attach goes through the in-process channel only — see
+        // `app/src-tauri/src/cdp/in_process.rs`. The legacy
+        // `--remote-debugging-port` flag is no longer passed: every
+        // scanner attaches via `Webview::send_dev_tools_message` and
+        // there is no remaining loopback DevTools listener.
         //
         // NOTE: flags must be prefixed with `--`. The runtime's
         // `on_before_command_line_processing` dispatch (in
@@ -2282,15 +2682,10 @@ pub fn run() {
             args.push(("--use-fake-ui-for-media-stream", None));
             args.push(("--use-file-for-fake-video-capture", Some(path)));
         }
-        // Always expose the CDP port, not just in debug. The webview-accounts
-        // CDP session opener navigates each embedded provider webview from its
-        // `about:blank#openhuman-acct-...` placeholder to the real provider URL
-        // via `Page.navigate`. Without this port available in release builds,
-        // the CDP client can't attach (`browser_ws_url()` 404s on /json/version),
-        // the navigation never fires, and the embedded webview stays on
-        // `about:blank` (blank panel for Telegram / WhatsApp / Slack / Discord).
-        // Same port the `cdp::CDP_HOST`/`cdp::CDP_PORT` constants expect.
-        args.push(("--remote-debugging-port", Some("19222")));
+        // CDP attach runs entirely through the in-process channel; the
+        // `--remote-debugging-port` flag is intentionally NOT passed so
+        // no loopback DevTools listener is bound for the lifetime of
+        // the embedded browser.
         let force_gpu_env = std::env::var("OPENHUMAN_FORCE_GPU").ok();
         append_platform_cef_gpu_workarounds(
             &mut args,
@@ -2298,6 +2693,10 @@ pub fn run() {
             std::env::consts::ARCH,
             force_gpu_env.as_deref(),
         );
+        // #3554: never forward a `--time-ticks-at-unix-epoch` switch to CEF —
+        // a corrupt/negative value drives the renderer's clock decades off and
+        // shows a wrong "Current Date & Time". Let Chromium compute it.
+        strip_time_ticks_at_unix_epoch(&mut args);
         tauri::Builder::<tauri::Cef>::new().command_line_args::<&str, &str>(args)
     };
 
@@ -2389,10 +2788,12 @@ pub fn run() {
         .manage(dictation_hotkeys::DictationHotkeyState(
             std::sync::Mutex::new(Vec::new()),
         ))
+        .manage(ptt_hotkeys::PttHotkeyState::new())
         .manage(companion_commands::CompanionHotkeyState(
             std::sync::Mutex::new(Vec::new()),
         ))
         .manage(webview_accounts::WebviewAccountsState::default())
+        .manage(cdp::CdpRegistry::default())
         .manage(notification_settings::NotificationSettingsState::new())
         .manage(PendingAppUpdateState::default());
     let builder = builder.manage(std::sync::Arc::new(imessage_scanner::ScannerRegistry::new()));
@@ -2410,6 +2811,12 @@ pub fn run() {
     let builder = builder.manage(meet_video::frame_bus::MeetVideoFrameBusState::new());
     builder
         .setup(move |app| {
+            // Stash the typed CEF `AppHandle` for the in-process CDP
+            // transport. Lets `cdp::install_for_account` reach the
+            // concrete `Webview<Cef>` (which `send_dev_tools_message`
+            // requires) from generic `<R: Runtime>` call sites.
+            cdp::set_cef_app_handle(app.handle().clone());
+
             #[cfg(windows)]
             {
                 // `register_all` writes HKCU\Software\Classes\openhuman so the
@@ -2761,6 +3168,60 @@ pub fn run() {
             //       let _ = window.show();
             //   }
 
+            // Notch activity indicator: transparent pill at the top-centre of
+            // the primary screen. Shows live voice / agent state. macOS only
+            // (physical notch or menu-bar HUD on older hardware).
+            //
+            // It is NOT auto-shown here: the notch is the always-on listening
+            // HUD, so its visibility is owned by the frontend, which calls
+            // `notch_window_show` / `notch_window_hide` (via `syncNotchVisibility`)
+            // to mirror `voice_server.always_on_enabled` — once on boot and
+            // whenever the Settings toggle flips. Showing it unconditionally
+            // here would flash the pill on every launch even with always-on
+            // listening disabled (the default).
+
+            // Synthetic-input main-thread executor. enigo's macOS keyboard-layout
+            // lookup (TSMGetInputSourceProperty) MUST run on the app main thread
+            // or it traps (`_dispatch_assert_queue_fail`/EXC_BREAKPOINT) and
+            // crashes the CEF host (Change 1.15, confirmed via crash report). The
+            // keyboard/mouse tools run on tokio workers, so they dispatch their
+            // enigo ops here via the native registry; we run each on the real
+            // main thread through `run_on_main_thread`.
+            {
+                use openhuman_core::core::event_bus::register_native_global;
+                use openhuman_core::openhuman::tools::{
+                    MainThreadInputOp, INPUT_ON_MAIN_THREAD_METHOD,
+                };
+                let input_app = app.handle().clone();
+                register_native_global::<MainThreadInputOp, Result<String, String>, _, _>(
+                    INPUT_ON_MAIN_THREAD_METHOD,
+                    move |req| {
+                        let input_app = input_app.clone();
+                        async move {
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            let run = req.run;
+                            input_app
+                                .run_on_main_thread(move || {
+                                    // Catch an enigo FFI panic so it can't unwind
+                                    // across the app main thread (which would be
+                                    // UB / abort). Convert it to a clean Err.
+                                    let result = std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(run),
+                                    )
+                                    .unwrap_or_else(|_| {
+                                        Err("synthetic input panicked on the main thread".to_string())
+                                    });
+                                    let _ = tx.send(result);
+                                })
+                                .map_err(|e| format!("run_on_main_thread dispatch failed: {e}"))?;
+                            rx.await
+                                .map_err(|_| "main-thread input op was cancelled".to_string())
+                        }
+                    },
+                );
+                log::info!("[computer] registered main-thread synthetic-input executor");
+            }
+
             // Tray icon setup moved to RunEvent::Ready (see below) — GTK is only
             // initialized after the event loop starts, so we must delay tray creation
             // until the Ready event fires. Creating the tray here would panic on
@@ -3064,8 +3525,18 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             core_rpc_url,
             core_rpc_token,
+            // Host-side HTTP relay so the renderer can reach a self-hosted
+            // runtime on a LAN IP that the secure `tauri://localhost` webview
+            // cannot fetch directly (cleartext mixed content). See #3865.
+            core_rpc::relay_http_rpc,
             overlay_parent_rpc_url,
             process_diagnostics_list_owned,
+            // `mod artifact_commands;` is `#[cfg(any(target_os = "macos", target_os = "linux"))]`
+            // (Downloads-dir + `tokio::fs::copy` flow is non-Windows-only today).
+            // The handler entry MUST carry the same gate or Windows builds fail
+            // with "function not found in scope" (CR #3328947313 on PR #3026).
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            artifact_commands::download_artifact_to_downloads,
             check_core_update,
             apply_core_update,
             check_app_update,
@@ -3074,6 +3545,7 @@ pub fn run() {
             install_app_update,
             restart_core_process,
             recover_port_conflict,
+            force_quit_port_owner,
             start_core_process,
             local_data_reset::reset_local_data,
             app_quit,
@@ -3082,6 +3554,9 @@ pub fn run() {
             schedule_cef_profile_purge,
             register_dictation_hotkey,
             unregister_dictation_hotkey,
+            register_ptt_hotkey,
+            unregister_ptt_hotkey,
+            ptt_overlay::show_ptt_overlay,
             webview_accounts::webview_account_open,
             webview_accounts::webview_account_prewarm,
             webview_accounts::webview_account_close,
@@ -3108,6 +3583,8 @@ pub fn run() {
             native_notifications::show_native_notification,
             mascot_window_show,
             mascot_window_hide,
+            notch_window_show,
+            notch_window_hide,
             file_logging::reveal_logs_folder,
             file_logging::logs_folder_path,
             workspace_paths::open_workspace_path,
@@ -3122,7 +3599,8 @@ pub fn run() {
             mcp_commands::mcp_resolve_binary_path,
             mcp_commands::mcp_open_client_config,
             loopback_oauth::start_loopback_oauth_listener,
-            loopback_oauth::stop_loopback_oauth_listener
+            loopback_oauth::stop_loopback_oauth_listener,
+            claude_code::claude_code_login_launch
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

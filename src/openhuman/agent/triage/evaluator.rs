@@ -490,6 +490,21 @@ async fn try_arm(
         visible_tool_names: None,
         extra_tools: Vec::new(),
         on_progress: None,
+        // Triage processes untrusted inbound channel text. Label it as
+        // ExternalChannel so the approval gate treats any external_effect
+        // tool call originating from this turn as remote-attacker input
+        // (the triage agent doesn't usually invoke such tools — it
+        // classifies and routes — but label correctly for defense in depth).
+        origin: crate::openhuman::agent::turn_origin::AgentTurnOrigin::ExternalChannel {
+            channel: envelope.source.slug().to_string(),
+            // Triage runs over an upstream envelope (composio / webhook /
+            // cron / external caller) that doesn't carry a per-user sender
+            // at this layer. Leave it unset and let the gate apply the
+            // strict per-channel TTL-deny default.
+            sender: None,
+            reply_target: envelope.display_label.clone(),
+            message_id: envelope.external_id.clone(),
+        },
     };
 
     let response = match request_native_global::<AgentTurnRequest, AgentTurnResponse>(
@@ -613,7 +628,7 @@ fn classify_error(message: String) -> ArmError {
 ///   `agent.run_turn`).
 /// - `src/openhuman/agent/harness/session/runtime.rs` — same strings in the
 ///   tool-call loop, kept identical so this classifier covers both.
-/// - `src/openhuman/local_ai/ops.rs` — user-facing variants with the
+/// - `src/openhuman/inference/local/ops.rs` — user-facing variants with the
 ///   `"Please rephrase clearly."` suffix; we match the leading phrase so
 ///   either form classifies.
 ///
@@ -720,7 +735,7 @@ fn extract_inline_prompt(def: &AgentDefinition) -> Option<String> {
                 model_name: "",
                 agent_id: &def.id,
                 tools: &empty_tools,
-                skills: &[],
+                workflows: &[],
                 dispatcher_instructions: "",
                 learned: LearnedContextData::default(),
                 visible_tool_names: &empty_visible,
@@ -734,7 +749,6 @@ fn extract_inline_prompt(def: &AgentDefinition) -> Option<String> {
                 personality_soul_md: None,
                 personality_memory_md: None,
                 personality_roster: vec![],
-                workflows: &[],
             };
             match build(&ctx) {
                 Ok(body) if !body.is_empty() => Some(body),

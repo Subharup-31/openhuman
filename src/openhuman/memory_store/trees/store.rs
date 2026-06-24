@@ -69,6 +69,72 @@ pub(crate) fn insert_tree_conn(conn: &Connection, tree: &Tree) -> Result<()> {
     Ok(())
 }
 
+/// Hard-delete one tree and every dependent row, within an existing tx.
+///
+/// Cascade order mirrors [`crate::openhuman::memory_store::chunks::store`]'s
+/// global/topic purge: summary sidecars (`summary_embeddings` /
+/// `summary_reembed_skipped`, keyed by `summary_id`) first, then
+/// `entity_index` + `buffers` (keyed by `tree_id`), then the `summaries`,
+/// then the tree row. Used by the chunk-delete path when a source's last
+/// chunk is removed, so the now-contentless summary tree (and its unsealed
+/// buffer) doesn't outlive the data it summarised. Returns the number of
+/// summary rows removed.
+pub(crate) fn delete_tree_cascade_tx(
+    tx: &Transaction<'_>,
+    tree_id: &str,
+) -> Result<TreeCascadeDeletion> {
+    // Collect the on-disk content-file paths BEFORE deleting the summary rows
+    // — sealed summaries stage their body to `content_path` under the memory
+    // tree content root (see `bucket_seal::seal_one_level` → `stage_summary`).
+    // The caller removes these files after the tx commits (mirroring
+    // `remove_chunk_content_files`), so a `clear_memory` delete doesn't leave
+    // the summarised text orphaned on disk.
+    let content_paths: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT content_path FROM mem_tree_summaries \
+              WHERE tree_id = ?1 AND content_path IS NOT NULL AND content_path <> ''",
+        )?;
+        let rows = stmt.query_map(params![tree_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect summary content paths for tree cascade delete")?
+    };
+
+    tx.execute(
+        "DELETE FROM mem_tree_summary_embeddings WHERE summary_id IN \
+         (SELECT id FROM mem_tree_summaries WHERE tree_id = ?1)",
+        params![tree_id],
+    )?;
+    tx.execute(
+        "DELETE FROM mem_tree_summary_reembed_skipped WHERE summary_id IN \
+         (SELECT id FROM mem_tree_summaries WHERE tree_id = ?1)",
+        params![tree_id],
+    )?;
+    tx.execute(
+        "DELETE FROM mem_tree_entity_index WHERE tree_id = ?1",
+        params![tree_id],
+    )?;
+    let removed_summaries = tx.execute(
+        "DELETE FROM mem_tree_summaries WHERE tree_id = ?1",
+        params![tree_id],
+    )?;
+    tx.execute(
+        "DELETE FROM mem_tree_buffers WHERE tree_id = ?1",
+        params![tree_id],
+    )?;
+    tx.execute("DELETE FROM mem_tree_trees WHERE id = ?1", params![tree_id])?;
+    Ok(TreeCascadeDeletion {
+        removed_summaries,
+        content_paths,
+    })
+}
+
+/// Outcome of [`delete_tree_cascade_tx`]: how many summary rows were removed
+/// and the on-disk content-file paths the caller must delete post-commit.
+pub(crate) struct TreeCascadeDeletion {
+    pub removed_summaries: usize,
+    pub content_paths: Vec<String>,
+}
+
 /// Fetch a tree by `(kind, scope)`. Returns `None` if no such tree exists.
 pub fn get_tree_by_scope(config: &Config, kind: TreeKind, scope: &str) -> Result<Option<Tree>> {
     with_connection(config, |conn| get_tree_by_scope_conn(conn, kind, scope))
@@ -292,8 +358,9 @@ pub(crate) fn insert_summary_tx(
             entities_json, topics_json,
             time_range_start_ms, time_range_end_ms,
             score, sealed_at_ms, deleted, embedding,
-            content_path, content_sha256
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            content_path, content_sha256,
+            doc_id, version_ms
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             node.id,
             node.tree_id,
@@ -313,6 +380,8 @@ pub(crate) fn insert_summary_tx(
             embedding_blob,
             content_path,
             content_sha256,
+            node.doc_id,
+            node.version_ms,
         ],
     )
     .with_context(|| format!("Failed to insert summary id={}", node.id))?;
@@ -628,7 +697,8 @@ pub fn get_summary(config: &Config, id: &str) -> Result<Option<SummaryNode>> {
                     child_ids_json, content, token_count,
                     entities_json, topics_json,
                     time_range_start_ms, time_range_end_ms,
-                    score, sealed_at_ms, deleted, embedding
+                    score, sealed_at_ms, deleted, embedding,
+                    doc_id, version_ms
                FROM mem_tree_summaries WHERE id = ?1",
         )?;
         let row = stmt
@@ -678,7 +748,8 @@ pub fn get_summaries_batch(
                         child_ids_json, content, token_count,
                         entities_json, topics_json,
                         time_range_start_ms, time_range_end_ms,
-                        score, sealed_at_ms, deleted, embedding
+                        score, sealed_at_ms, deleted, embedding,
+                        doc_id, version_ms
                    FROM mem_tree_summaries
                   WHERE id IN ({placeholders})"
             );
@@ -710,7 +781,8 @@ pub fn list_summaries_at_level(
                     child_ids_json, content, token_count,
                     entities_json, topics_json,
                     time_range_start_ms, time_range_end_ms,
-                    score, sealed_at_ms, deleted, embedding
+                    score, sealed_at_ms, deleted, embedding,
+                    doc_id, version_ms
                FROM mem_tree_summaries
               WHERE tree_id = ?1 AND level = ?2 AND deleted = 0
               ORDER BY sealed_at_ms ASC",
@@ -719,6 +791,54 @@ pub fn list_summaries_at_level(
             .query_map(params![tree_id, level], row_to_summary)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("Failed to collect summaries")?;
+        Ok(rows)
+    })
+}
+
+/// List every non-deleted summary in a tree whose time-range envelope is
+/// **fully contained** in `[since_ms, until_ms]` (inclusive), across all
+/// levels. This is the "eligible summary" set for the windowed minimum-cover
+/// (the morning-brief 24h tool): a node is eligible only when *all* its
+/// descendant leaves fall inside the window, which — because seal sets
+/// `time_range_start = MIN(children)` and `time_range_end = MAX(children)`
+/// (`bucket_seal::seal_one_level`) — is exactly
+/// `time_range_start_ms >= since_ms AND time_range_end_ms <= until_ms`.
+///
+/// Ordered by `level ASC, time_range_start_ms ASC` so callers can build the
+/// per-tree frontier and order chronologically without a re-sort. `content`
+/// here is the ≤500-char preview; callers that need the full body hydrate via
+/// `content::read::read_summary_body`.
+pub fn list_summaries_in_window(
+    config: &Config,
+    tree_id: &str,
+    since_ms: i64,
+    until_ms: i64,
+) -> Result<Vec<SummaryNode>> {
+    log::debug!(
+        "[tree::store] list_summaries_in_window tree_id={tree_id} since_ms={since_ms} until_ms={until_ms}"
+    );
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, tree_id, tree_kind, level, parent_id,
+                    child_ids_json, content, token_count,
+                    entities_json, topics_json,
+                    time_range_start_ms, time_range_end_ms,
+                    score, sealed_at_ms, deleted, embedding,
+                    doc_id, version_ms
+               FROM mem_tree_summaries
+              WHERE tree_id = ?1 AND deleted = 0
+                AND time_range_start_ms >= ?2
+                AND time_range_end_ms   <= ?3
+              ORDER BY level ASC, time_range_start_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![tree_id, since_ms, until_ms], row_to_summary)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to collect in-window summaries")?;
+        log::debug!(
+            "[tree::store] list_summaries_in_window tree_id={tree_id} matched={}",
+            rows.len()
+        );
         Ok(rows)
     })
 }
@@ -755,6 +875,8 @@ fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<SummaryNode> {
     let sealed_ms: i64 = row.get(13)?;
     let deleted: i64 = row.get(14)?;
     let embedding_blob: Option<Vec<u8>> = row.get(15)?;
+    let doc_id: Option<String> = row.get(16)?;
+    let version_ms: Option<i64> = row.get(17)?;
 
     let tree_kind = TreeKind::parse(&tree_kind_s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, e.into())
@@ -797,6 +919,8 @@ fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<SummaryNode> {
         sealed_at: ms_to_utc(sealed_ms)?,
         deleted: deleted != 0,
         embedding,
+        doc_id,
+        version_ms,
     })
 }
 

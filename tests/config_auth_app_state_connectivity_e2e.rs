@@ -154,12 +154,9 @@ async fn serve_mock_backend() -> (
     let app = Router::new()
         .route("/auth/me", get(mock_auth_me))
         .route("/api/auth/me", get(mock_auth_me))
+        .route("/auth/login-token/consume", post(mock_consume_login_token))
         .route(
-            "/telegram/login-tokens/{token}/consume",
-            post(mock_consume_login_token),
-        )
-        .route(
-            "/api/telegram/login-tokens/{token}/consume",
+            "/api/auth/login-token/consume",
             post(mock_consume_login_token),
         )
         .route(
@@ -370,11 +367,17 @@ async fn static_auth_me(
     }))
 }
 
-async fn mock_consume_login_token(AxumPath(token): AxumPath<String>) -> Json<Value> {
+async fn mock_consume_login_token(Json(body): Json<Value>) -> Json<Value> {
+    // Token now arrives in the JSON body (`{ token }`), not the URL path, and the
+    // response field is `jwt` (matches backend `routes/auth.ts`).
+    let token = body
+        .get("token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     Json(json!({
         "success": true,
         "data": {
-            "jwtToken": format!("jwt-from-{token}")
+            "jwt": format!("jwt-from-{token}")
         }
     }))
 }
@@ -669,8 +672,10 @@ fn config_schema_helpers_cover_provider_voice_agent_and_channel_defaults() {
     migrate_legacy_fields(&mut minimax_legacy);
     assert_eq!(minimax_legacy.slug, "minimax");
     assert_eq!(minimax_legacy.label, "MiniMax");
-    assert_eq!(minimax_legacy.endpoint, "https://api.minimax.io/anthropic");
-    assert_eq!(minimax_legacy.auth_style, AuthStyle::Anthropic);
+    // MiniMax uses its OpenAI-compatible /v1 surface + Bearer (TAURI-RUST-8X3);
+    // the legacy `type=minimax` migration fills from the corrected catalog.
+    assert_eq!(minimax_legacy.endpoint, "https://api.minimax.io/v1");
+    assert_eq!(minimax_legacy.auth_style, AuthStyle::Bearer);
     assert_eq!(AuthStyle::OpenhumanJwt.as_str(), "openhuman_jwt");
     assert_eq!(AuthStyle::Anthropic.as_str(), "anthropic");
     assert_eq!(AuthStyle::None.as_str(), "none");
@@ -2104,6 +2109,7 @@ async fn config_save_and_load_encrypts_channel_secret_fields() {
     config.search.querit.api_key = Some("querit-secret".into());
     config.channels_config.telegram = Some(TelegramConfig {
         bot_token: "telegram-secret".into(),
+        chat_id: None,
         allowed_users: vec!["alice".into()],
         stream_mode: Default::default(),
         draft_update_interval_ms: 1000,
@@ -2783,6 +2789,8 @@ async fn worker_a_controller_schemas_are_fully_exposed() {
             vec![
                 "openhuman.config_agent_server_status",
                 "openhuman.config_get",
+                "openhuman.config_get_activity_level_settings",
+                "openhuman.config_get_agent_paths",
                 "openhuman.config_get_agent_settings",
                 "openhuman.config_get_analytics_settings",
                 "openhuman.config_get_autonomy_settings",
@@ -2792,14 +2800,18 @@ async fn worker_a_controller_schemas_are_fully_exposed() {
                 "openhuman.config_get_data_paths",
                 "openhuman.config_get_dictation_settings",
                 "openhuman.config_get_meet_settings",
+                "openhuman.config_get_memory_sync_settings",
                 "openhuman.config_get_onboarding_completed",
                 "openhuman.config_get_runtime_flags",
+                "openhuman.config_get_sandbox_settings",
                 "openhuman.config_get_search_settings",
                 "openhuman.config_get_voice_server_settings",
                 "openhuman.config_reset_local_data",
                 "openhuman.config_resolve_api_url",
                 "openhuman.config_set_browser_allow_all",
                 "openhuman.config_set_onboarding_completed",
+                "openhuman.config_update_activity_level_settings",
+                "openhuman.config_update_agent_paths",
                 "openhuman.config_update_agent_settings",
                 "openhuman.config_update_analytics_settings",
                 "openhuman.config_update_autonomy_settings",
@@ -2809,8 +2821,10 @@ async fn worker_a_controller_schemas_are_fully_exposed() {
                 "openhuman.config_update_local_ai_settings",
                 "openhuman.config_update_meet_settings",
                 "openhuman.config_update_memory_settings",
+                "openhuman.config_update_memory_sync_settings",
                 "openhuman.config_update_model_settings",
                 "openhuman.config_update_runtime_settings",
+                "openhuman.config_update_sandbox_settings",
                 "openhuman.config_update_screen_intelligence_settings",
                 "openhuman.config_update_search_settings",
                 "openhuman.config_update_voice_server_settings",
@@ -2846,6 +2860,26 @@ async fn worker_a_controller_schemas_are_fully_exposed() {
             ],
         ),
         ("connectivity", vec!["openhuman.connectivity_diag"]),
+        (
+            "memory_sources",
+            vec![
+                "openhuman.memory_sources_add",
+                "openhuman.memory_sources_apply_all_in",
+                "openhuman.memory_sources_estimate_sync_cost",
+                "openhuman.memory_sources_get",
+                "openhuman.memory_sources_list",
+                "openhuman.memory_sources_list_items",
+                "openhuman.memory_sources_monthly_cost_summary",
+                "openhuman.memory_sources_read_item",
+                "openhuman.memory_sources_reconcile",
+                "openhuman.memory_sources_remove",
+                "openhuman.memory_sources_status_list",
+                "openhuman.memory_sources_supported_toolkits",
+                "openhuman.memory_sources_sync",
+                "openhuman.memory_sources_sync_audit_log",
+                "openhuman.memory_sources_update",
+            ],
+        ),
     ] {
         assert_eq!(
             schema_method_names(&schema, namespace),
@@ -5444,32 +5478,27 @@ fn credentials_profile_store_recovers_dropped_entries_empty_files_and_datetime_e
         .to_string(),
     )
     .expect("write missing oauth secret fixture");
-    // An OAuth profile missing its access_token must not poison the whole
-    // store: it is dropped just like a bad-kind entry (see #3125), so the load
-    // succeeds with that single profile purged rather than returning an error.
-    let recovered_missing_secret = AuthProfilesStore::new(&missing_oauth_secret_dir, false)
+    let missing_secret = AuthProfilesStore::new(&missing_oauth_secret_dir, false)
         .load()
-        .expect("oauth profile missing access_token should be dropped, not fail the whole load");
-    assert!(
-        !recovered_missing_secret
-            .profiles
-            .contains_key("github:missing-access"),
-        "oauth profile missing access_token should be dropped on load: {recovered_missing_secret:#?}"
-    );
-    assert!(
-        !recovered_missing_secret.active_profiles.contains_key("github"),
-        "active profile pointing at a dropped profile should be purged: {recovered_missing_secret:#?}"
-    );
+        .expect("oauth profile missing access token should be dropped");
+    assert!(missing_secret.profiles.is_empty());
+    assert!(missing_secret.active_profiles.is_empty());
     let rewritten_missing_secret: Value = serde_json::from_str(
         &std::fs::read_to_string(missing_oauth_secret_dir.join("auth-profiles.json"))
-            .expect("read rewritten missing-oauth-secret store"),
+            .expect("read rewritten missing oauth secret profile store"),
     )
-    .expect("rewritten missing-oauth-secret store should be json");
+    .expect("rewritten missing oauth secret store should be json");
     assert!(
         rewritten_missing_secret
             .pointer("/profiles/github:missing-access")
             .is_none(),
-        "dropped oauth profile should be purged from persisted store: {rewritten_missing_secret}"
+        "missing oauth secret profile should be purged from persisted store: {rewritten_missing_secret}"
+    );
+    assert!(
+        rewritten_missing_secret
+            .pointer("/active_profiles/github")
+            .is_none(),
+        "active pointer to missing oauth secret profile should be purged: {rewritten_missing_secret}"
     );
 
     let public_api_dir = tmp.path().join("public-api-errors");

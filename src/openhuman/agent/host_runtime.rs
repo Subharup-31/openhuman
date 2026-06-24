@@ -23,17 +23,24 @@ pub trait RuntimeAdapter: Send + Sync {
     ) -> anyhow::Result<tokio::process::Command>;
 }
 
-pub struct NativeRuntime;
-
-impl Default for NativeRuntime {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Default)]
+pub struct NativeRuntime {
+    /// When true, shell-family child processes are spawned with the Windows
+    /// `CREATE_NO_WINDOW` flag so no console window flashes. Sourced from
+    /// `[shell] hide_window` (#3727/#3728). No effect on macOS/Linux.
+    hide_window: bool,
 }
 
 impl NativeRuntime {
+    /// A native runtime with default behaviour (no window suppression).
     pub const fn new() -> Self {
-        Self
+        Self { hide_window: false }
+    }
+
+    /// A native runtime that suppresses the Windows console window for spawned
+    /// shell child processes when `hide_window` is true.
+    pub const fn with_hide_window(hide_window: bool) -> Self {
+        Self { hide_window }
     }
 }
 
@@ -93,9 +100,41 @@ impl RuntimeAdapter for NativeRuntime {
             c.arg("-lc").arg(command);
             c
         };
+        // Validate the CWD up front so a missing/bad action_dir produces an
+        // actionable message naming the path, instead of an opaque OS error 267
+        // (ERROR_DIRECTORY) from CreateProcessW on Windows / a raw ENOENT on
+        // Unix when the process is spawned. Covers all three shell-family tools
+        // (shell / node_exec / npm_exec) since they all route through here.
+        // (#3353, Fix 2)
+        crate::openhuman::config::ensure_usable_cwd(workspace_dir)?;
         cmd.current_dir(workspace_dir);
+        // Optionally suppress the Windows console window for this child process
+        // (`[shell] hide_window`). No-op when disabled and on non-Windows hosts.
+        maybe_hide_window(&mut cmd, self.hide_window);
         Ok(cmd)
     }
+}
+
+/// Suppress the Windows console window for a shell child process when `hide` is
+/// set, by applying the `CREATE_NO_WINDOW` creation flag (`0x08000000`). No-op
+/// when `hide` is false, and on non-Windows hosts the flag does not exist so this
+/// does nothing regardless. Delegates to the shared [`apply_no_window`] helper so
+/// there is a single source of truth for the flag (#3727/#3728).
+fn maybe_hide_window(cmd: &mut tokio::process::Command, hide: bool) {
+    tracing::trace!(
+        hide_window = hide,
+        windows = cfg!(windows),
+        "[agent][runtime] hide_window evaluated for shell child process"
+    );
+    if !hide {
+        return;
+    }
+    crate::openhuman::inference::local::process_util::apply_no_window(cmd);
+    #[cfg(windows)]
+    tracing::debug!(
+        creation_flags = "0x08000000",
+        "[agent][runtime] applied CREATE_NO_WINDOW to shell child process"
+    );
 }
 
 /// Locate a `bash` binary once (cached — this is hit on every shell call) for
@@ -188,9 +227,15 @@ impl RuntimeAdapter for DockerRuntime {
     }
 }
 
-pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
+/// Build the runtime adapter for the configured `kind`. `hide_window` comes
+/// from `[shell] hide_window` and only affects the native runtime on Windows
+/// (the docker runtime spawns the `docker` client, out of scope here).
+pub fn create_runtime(
+    config: &RuntimeConfig,
+    hide_window: bool,
+) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
     match config.kind.as_str() {
-        "native" => Ok(Box::new(NativeRuntime::new())),
+        "native" => Ok(Box::new(NativeRuntime::with_hide_window(hide_window))),
         "docker" => Ok(Box::new(DockerRuntime::new(config.docker.clone()))),
         other => anyhow::bail!("Unsupported runtime kind: {other}"),
     }
@@ -278,24 +323,65 @@ mod tests {
 
     #[test]
     fn create_runtime_supports_native_and_docker_and_rejects_unknown() {
-        let native = create_runtime(&RuntimeConfig::default()).unwrap();
+        let native = create_runtime(&RuntimeConfig::default(), false).unwrap();
         assert_eq!(native.name(), "native");
 
-        let docker = create_runtime(&RuntimeConfig {
-            kind: "docker".into(),
-            docker: DockerRuntimeConfig::default(),
-            ..RuntimeConfig::default()
-        })
+        let docker = create_runtime(
+            &RuntimeConfig {
+                kind: "docker".into(),
+                docker: DockerRuntimeConfig::default(),
+                ..RuntimeConfig::default()
+            },
+            false,
+        )
         .unwrap();
         assert_eq!(docker.name(), "docker");
 
-        let err = create_runtime(&RuntimeConfig {
-            kind: "vm".into(),
-            ..RuntimeConfig::default()
-        })
+        let err = create_runtime(
+            &RuntimeConfig {
+                kind: "vm".into(),
+                ..RuntimeConfig::default()
+            },
+            false,
+        )
         .err()
         .unwrap();
         assert!(err.to_string().contains("Unsupported runtime kind: vm"));
+    }
+
+    /// `[shell] hide_window` plumbs through `create_runtime` into the native
+    /// adapter, and a hide-window native runtime still builds a usable shell
+    /// command on every platform (the `CREATE_NO_WINDOW` flag is Windows-only
+    /// and applied without disturbing the command on macOS/Linux).
+    #[test]
+    fn native_runtime_with_hide_window_still_builds_shell_command() {
+        let native = create_runtime(&RuntimeConfig::default(), true).unwrap();
+        assert_eq!(native.name(), "native");
+
+        let runtime = NativeRuntime::with_hide_window(true);
+        let command = runtime
+            .build_shell_command("echo hi", Path::new("/tmp"))
+            .expect("hide_window should not break command construction");
+        assert_eq!(command.as_std().get_current_dir(), Some(Path::new("/tmp")));
+
+        // The program/args are identical with and without the flag — hiding the
+        // window must not alter what is executed.
+        let plain = NativeRuntime::with_hide_window(false)
+            .build_shell_command("echo hi", Path::new("/tmp"))
+            .unwrap();
+        assert_eq!(command.as_std().get_program(), plain.as_std().get_program());
+    }
+
+    /// `maybe_hide_window` is a no-op when disabled (and on non-Windows hosts
+    /// even when enabled), and must never panic.
+    #[test]
+    fn maybe_hide_window_is_safe_no_op() {
+        let mut disabled = tokio::process::Command::new("echo");
+        maybe_hide_window(&mut disabled, false);
+        let mut enabled = tokio::process::Command::new("echo");
+        maybe_hide_window(&mut enabled, true);
+        assert_eq!(disabled.as_std().get_program(), "echo");
+        assert_eq!(enabled.as_std().get_program(), "echo");
     }
 
     /// Regression: a failed stage in a pipeline must surface as a non-zero exit
@@ -323,5 +409,47 @@ mod tests {
         // A clean pipeline still succeeds.
         let mut ok = rt.build_shell_command("true | true", &dir).unwrap();
         assert!(ok.status().await.unwrap().success());
+    }
+
+    /// #3353: a CWD that can't be made usable (here: a path *under an existing
+    /// file*, which `create_dir_all` cannot create) must yield a descriptive,
+    /// path-naming error from `build_shell_command` instead of an opaque OS
+    /// error 267 (ERROR_DIRECTORY) at spawn time.
+    #[test]
+    fn native_shell_command_rejects_uncreatable_cwd_with_clear_error() {
+        let rt = NativeRuntime::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_file = tmp.path().join("a-file");
+        std::fs::write(&parent_file, b"x").unwrap();
+        let bad_cwd = parent_file.join("child"); // parent is a file → uncreatable
+
+        let err = rt
+            .build_shell_command("echo hi", &bad_cwd)
+            .expect_err("an uncreatable CWD must be rejected up front");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not be created"),
+            "expected an actionable message, got: {msg}"
+        );
+        assert!(
+            msg.contains(&bad_cwd.to_string_lossy().to_string()),
+            "error should name the offending path: {msg}"
+        );
+    }
+
+    /// A valid-but-missing CWD is defensively created (covers a dir deleted
+    /// after launch), so the command builds successfully and runs there.
+    #[test]
+    fn native_shell_command_creates_missing_cwd() {
+        let rt = NativeRuntime::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nested").join("workdir");
+        assert!(!missing.exists());
+
+        let command = rt
+            .build_shell_command("echo hi", &missing)
+            .expect("missing CWD should be auto-created");
+        assert!(missing.is_dir(), "CWD should have been created");
+        assert_eq!(command.as_std().get_current_dir(), Some(missing.as_path()));
     }
 }

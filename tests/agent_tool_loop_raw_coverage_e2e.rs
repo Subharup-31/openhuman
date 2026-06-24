@@ -235,6 +235,7 @@ impl Memory for NoopMemory {
             timestamp: "2026-05-29T00:00:00Z".to_string(),
             session_id: session_id.map(str::to_string),
             score: Some(1.0),
+            taint: Default::default(),
         });
         Ok(())
     }
@@ -329,6 +330,7 @@ fn native_tool_response(name: &str, arguments: serde_json::Value) -> ChatRespons
             id: format!("call-{name}"),
             name: name.to_string(),
             arguments: arguments.to_string(),
+            extra_content: None,
         }],
         usage: Some(UsageInfo {
             input_tokens: 13,
@@ -379,6 +381,7 @@ async fn run_bus_turn(
             visible_tool_names,
             extra_tools: Vec::new(),
             on_progress: None,
+            origin: openhuman_core::openhuman::agent::turn_origin::AgentTurnOrigin::Cli,
         },
     )
     .await

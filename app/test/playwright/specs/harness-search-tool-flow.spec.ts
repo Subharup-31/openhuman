@@ -110,7 +110,7 @@ async function waitForSocketConnected(page: Page): Promise<void> {
 async function sendMessage(page: Page, prompt: string): Promise<void> {
   await waitForSocketConnected(page);
   await dismissWalkthroughIfPresent(page);
-  await page.getByPlaceholder('Type a message...').fill(prompt);
+  await page.getByPlaceholder('How can I help you today?').fill(prompt);
   await dismissWalkthroughIfPresent(page);
   await expect(page.getByTestId('send-message-button')).toBeEnabled();
   await page.getByTestId('send-message-button').click();
@@ -154,7 +154,7 @@ test.describe('Harness - Search tool-flow', () => {
     await setMockBehavior('llmStreamChunkDelayMs', '10');
 
     await sendMessage(page, 'what did we discuss about project Atlas');
-    await expect(page.getByText(CANARY)).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByText(CANARY).first()).toBeVisible({ timeout: 60_000 });
     await expect(page.getByText(/Based on my memory search/i)).toBeVisible();
 
     const log = await requests();
@@ -186,7 +186,7 @@ test.describe('Harness - Search tool-flow', () => {
     await setMockBehavior('llmStreamChunkDelayMs', '10');
 
     await sendMessage(page, 'search for Rust async best practices');
-    await expect(page.getByText(CANARY)).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByText(CANARY).first()).toBeVisible({ timeout: 60_000 });
     await expect(
       page.getByText(/Here are the top results for Rust async best practices/i)
     ).toBeVisible();
@@ -219,8 +219,8 @@ test.describe('Harness - Search tool-flow', () => {
     await setMockBehavior('llmStreamChunkDelayMs', '10');
 
     await sendMessage(page, 'read the README');
-    await expect(page.getByText(CANARY)).toBeVisible({ timeout: 60_000 });
-    await expect(page.getByText(/OpenHuman is an AI assistant/i)).toBeVisible();
+    await expect(page.getByText(CANARY).first()).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByText(/OpenHuman is an AI assistant/i).first()).toBeVisible();
 
     const log = await requests();
     const llmHits = log.filter(

@@ -59,6 +59,14 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// Provider-specific passthrough metadata for this call, captured from the
+    /// response and echoed back verbatim on the next assistant turn. Carries
+    /// Google Gemini's required `extra_content.google.thought_signature` so
+    /// multi-turn tool calling round-trips without a 400 (TAURI-RUST-4PK).
+    /// `None`/omitted for every provider that doesn't emit it, so non-Gemini
+    /// history stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 /// Token usage information returned by the provider after an inference call.
@@ -150,6 +158,20 @@ pub struct ChatRequest<'a> {
     /// implementation ignore the sender and return only the aggregated
     /// response.
     pub stream: Option<&'a tokio::sync::mpsc::Sender<ProviderDelta>>,
+    /// Optional upper bound on output tokens to request from the provider
+    /// (`max_tokens` on the OpenAI-compatible wire).
+    ///
+    /// Left `None` for open-ended generation (orchestrator, agent turns)
+    /// where the model should use its full budget. Set to a small concrete
+    /// value by callers whose output is bounded by construction — notably
+    /// memory extraction, whose response is a tiny structured-JSON object.
+    /// Beyond capping wasted generation, this stops credit-metered providers
+    /// (e.g. OpenRouter) from reserving the model's *entire* output window
+    /// during their pre-flight balance check: an unset `max_tokens` makes
+    /// OpenRouter price the request against the full 64k+ window and 402 a
+    /// low-balance BYO user who could easily afford the few thousand tokens
+    /// an extraction actually needs (TAURI-RUST-C62).
+    pub max_tokens: Option<u32>,
 }
 
 /// A tool result to feed back to the LLM.
@@ -295,6 +317,40 @@ pub struct ProviderCapabilities {
     pub vision: bool,
 }
 
+/// Prompt / KV-cache behaviour a provider supports.
+///
+/// Sibling to [`ProviderCapabilities`], surfaced via
+/// [`Provider::prompt_cache_capabilities`] so the agent and cost layers can
+/// pick a stable cache-key strategy and calibrate cached-token telemetry per
+/// provider. Every field defaults to `false` (conservative): an unknown or
+/// custom OpenAI-compatible provider is assumed to support no caching, so we
+/// never infer cache behaviour — or send cache-only request fields — that the
+/// upstream may not honour (#3939).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PromptCacheCapabilities {
+    /// Provider transparently caches identical request prefixes server-side
+    /// with no client action — e.g. OpenAI / DeepSeek / Anthropic implicit
+    /// caching. A byte-stable prompt prefix then earns cache hits for free, so
+    /// preserving the prefix is worthwhile for this provider.
+    pub automatic_prefix_cache: bool,
+    /// Provider accepts explicit cache-control / cache-boundary markers in the
+    /// request body (e.g. Anthropic `cache_control`). OpenAI-compatible chat
+    /// APIs do not, so this stays `false` for them — we must not send such
+    /// fields to a provider that would reject or ignore them.
+    pub explicit_cache_control: bool,
+    /// Provider returns cached-input-token counts in its usage block
+    /// (`prompt_tokens_details.cached_tokens` or
+    /// `openhuman.usage.cached_input_tokens`), so [`UsageInfo::cached_input_tokens`]
+    /// is populated and cached-prefix cost accounting is exact rather than
+    /// estimated.
+    pub usage_reports_cached_input: bool,
+    /// Provider supports grouping calls by a stable logical key (thread /
+    /// session) for cache locality — today only the OpenHuman backend, via its
+    /// `thread_id` extension. Third-party providers rely on prefix identity
+    /// instead and must not receive OpenHuman-only grouping fields.
+    pub cache_key_grouping: bool,
+}
+
 /// Provider-specific tool payload formats.
 ///
 /// Different LLM providers require different formats for tool definitions.
@@ -342,6 +398,19 @@ pub trait Provider: Send + Sync {
     /// Providers should override this to declare their actual capabilities.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
+    }
+
+    /// Declare the provider's prompt / KV-cache behaviour.
+    ///
+    /// Default is the conservative all-`false` [`PromptCacheCapabilities`]:
+    /// callers must not assume any caching for a provider that hasn't opted in.
+    /// Providers that cache prefixes server-side, report cached input tokens,
+    /// or support thread/session grouping override this to advertise it so the
+    /// agent + cost layers get accurate cache telemetry and a stable cache-key
+    /// strategy without leaking OpenHuman internals to providers that don't
+    /// need them (#3939).
+    fn prompt_cache_capabilities(&self) -> PromptCacheCapabilities {
+        PromptCacheCapabilities::default()
     }
 
     /// Convert tool specifications to provider-native format.
@@ -402,12 +471,30 @@ pub trait Provider: Send + Sync {
     }
 
     /// Structured chat API for agent loop callers.
+    ///
+    /// **`max_tokens` caveat:** the default implementation delegates to
+    /// [`Self::chat_with_history`], whose signature carries no output-token
+    /// budget, so a `request.max_tokens` set by the caller is **not** honored
+    /// on this path. Providers that need to enforce an output cap (e.g. the
+    /// OpenAI-compatible provider, which threads it onto the wire for
+    /// credit-metered backends — TAURI-RUST-C62) override `chat()` directly.
+    /// The drop is logged below rather than silently swallowed; it is not a
+    /// hard error because no production caller both sets `max_tokens` and
+    /// routes through a default-`chat()` provider (agent turns pass `None`;
+    /// memory extraction uses the compatible provider).
     async fn chat(
         &self,
         request: ChatRequest<'_>,
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
+        if let Some(cap) = request.max_tokens {
+            log::debug!(
+                "[provider] default chat() for model={model} ignores max_tokens={cap} — \
+                 this provider does not override chat() and chat_with_history() carries no \
+                 output budget; the cap will not reach the wire"
+            );
+        }
         let log_prompts = should_log_prompts();
         // If tools are provided but provider doesn't support native tools,
         // inject tool instructions into system prompt as fallback.
@@ -481,6 +568,68 @@ pub trait Provider: Send + Sync {
     /// Whether provider supports multimodal vision input.
     fn supports_vision(&self) -> bool {
         self.capabilities().vision
+    }
+
+    /// Effective context window (in tokens) for `model`, used for
+    /// pre-dispatch history trimming.
+    ///
+    /// Defaults to the static model table
+    /// ([`crate::openhuman::inference::context_window_for_model`]), which
+    /// reflects a model's *trained maximum* context. Local providers
+    /// override this to report the model's **runtime-loaded** window — e.g.
+    /// LM Studio lets the user load a model with a smaller `n_ctx` than its
+    /// trained maximum, and budgeting against the max overflows the loaded
+    /// window so the request is rejected (issue #3550 / Sentry
+    /// TAURI-RUST-6V0). `None` means "unknown — skip pre-dispatch trimming".
+    async fn effective_context_window(&self, model: &str) -> Option<u64> {
+        crate::openhuman::inference::context_window_for_model(model)
+    }
+
+    /// Whether this provider talks to a **local** runtime (LM Studio, Ollama,
+    /// llama.cpp, vLLM, …) rather than a cloud API. Local runtimes enforce the
+    /// model's *runtime-loaded* `n_ctx` and can be loaded with a window smaller
+    /// than the assistant's un-evictable system prefix — the
+    /// `n_keep >= n_ctx` overflow (#3550 / TAURI-RUST-6V0). The agent engine
+    /// uses this to gate its pre-dispatch un-evictable-prefix guard, which
+    /// surfaces an actionable "reload with a larger context length" error only
+    /// for local providers (cloud windows are large enough that the guard would
+    /// only ever fire on a genuine overflow the user can't remedy by reloading).
+    /// Defaults to `false`.
+    fn is_local_provider(&self) -> bool {
+        false
+    }
+
+    /// Like [`Provider::is_local_provider`] but resolved for the specific
+    /// `model` about to be dispatched. A router whose *default* provider is
+    /// cloud may still route a given model to a local provider; the engine's
+    /// pre-dispatch un-evictable-prefix guard keys off this so the actionable
+    /// "reload with a larger context length" error fires for that routed local
+    /// model instead of letting the opaque local `400 (n_keep >= n_ctx)` reach
+    /// the user (#3550 / TAURI-RUST-6V0; Codex/CodeRabbit review on PR #3771).
+    ///
+    /// Defaults to the model-blind [`Provider::is_local_provider`]; only a
+    /// routing wrapper needs to override it.
+    fn is_local_provider_for_model(&self, _model: &str) -> bool {
+        self.is_local_provider()
+    }
+
+    /// The model's **authoritative runtime-loaded** context window, when the
+    /// local runtime actually reports it (e.g. LM Studio's native
+    /// `/api/v0/models` `loaded_context_length`). Returns `None` whenever the
+    /// window is unknown or merely *guessed* — a cloud provider, a local
+    /// runtime that exposes no loaded window (llama.cpp / vLLM), or a
+    /// profile-default / conservative-floor fallback.
+    ///
+    /// Distinct from [`Provider::effective_context_window`], which always
+    /// yields a value for local providers (falling back to a guess) so
+    /// pre-dispatch *trimming* still engages. Trimming may safely run against a
+    /// guess (over-trim is harmless), but the hard pre-dispatch abort must only
+    /// fire on an authoritative window — aborting with "reload with a larger
+    /// context length" against a guessed 4096 floor would wrongly reject a
+    /// request that the real (e.g. 32k) loaded window would have accepted
+    /// (Codex P1 review on PR #3771). Defaults to `None`.
+    async fn loaded_context_window(&self, _model: &str) -> Option<u64> {
+        None
     }
 
     /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).

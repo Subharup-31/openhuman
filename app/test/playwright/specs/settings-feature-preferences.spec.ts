@@ -52,28 +52,61 @@ async function getMascotVoiceId(page: Page): Promise<string | null> {
   });
 }
 
+async function getPersistedMascotColor(page: Page): Promise<string | null> {
+  return page.evaluate(() => {
+    const userId = localStorage.getItem('OPENHUMAN_ACTIVE_USER_ID');
+    if (!userId) return null;
+
+    const raw = localStorage.getItem(`${userId}:persist:mascot`);
+    if (!raw) return null;
+
+    try {
+      const parsed = JSON.parse(raw) as { color?: unknown };
+      if (typeof parsed.color !== 'string') return null;
+      const color = JSON.parse(parsed.color) as unknown;
+      return typeof color === 'string' ? color : null;
+    } catch {
+      return null;
+    }
+  });
+}
+
 async function getAriaChecked(page: Page, label: string): Promise<string | null> {
   const value = await page.getByRole('switch', { name: label }).getAttribute('aria-checked');
   return value;
 }
 
+interface ToolsSnapshot {
+  result?: { localState?: { onboardingTasks?: { enabledTools?: string[] | null } | null } | null };
+  localState?: { onboardingTasks?: { enabledTools?: string[] | null } | null } | null;
+}
+
+function readEnabledTools(snapshot: ToolsSnapshot): string[] {
+  const body = snapshot.result ?? snapshot;
+  return body.localState?.onboardingTasks?.enabledTools ?? [];
+}
+
 test.describe('Settings - Feature Preferences', () => {
   test('renders the features settings section route', async ({ page }) => {
+    // The old "Features" hub page is retired and redirects to
+    // /settings/screen-intelligence; its destinations are sidebar entries now.
     await openAuthenticatedRoute(page, 'pw-settings-features-route', '/settings/features');
 
-    await expect(page.getByText('Features', { exact: true })).toBeVisible();
+    await expect
+      .poll(async () => page.evaluate(() => window.location.hash))
+      .toContain('/settings/screen-intelligence');
     await expect(page.getByTestId('settings-nav-screen-intelligence')).toBeVisible();
-    await expect(page.getByTestId('settings-nav-messaging')).toBeVisible();
-    await expect(page.getByTestId('settings-nav-notifications')).toBeVisible();
     await expect(page.getByTestId('settings-nav-tools')).toBeVisible();
+    await expect(page.getByTestId('settings-nav-companion')).toBeVisible();
   });
 
   test('persists the default messaging channel through redux state', async ({ page }) => {
-    await openAuthenticatedRoute(page, 'pw-settings-default-channel', '/skills');
+    // Phase 2: default messaging channel moved to /connections (Messaging tab)
+    await openAuthenticatedRoute(page, 'pw-settings-default-channel', '/connections?tab=messaging');
 
-    const channelsTab = page.getByRole('tab', { name: 'Channels', exact: true });
-    if (await channelsTab.isVisible().catch(() => false)) {
-      await channelsTab.click();
+    const messagingTab = page.getByTestId('two-pane-nav-channels');
+    if (await messagingTab.isVisible().catch(() => false)) {
+      await messagingTab.click();
     }
 
     await expect(page.getByText('Default Messaging Channel').last()).toBeVisible();
@@ -87,34 +120,46 @@ test.describe('Settings - Feature Preferences', () => {
   });
 
   test('persists tools preferences to the core app-state snapshot', async ({ page }) => {
-    const before = await callCoreRpc<{
-      result?: {
-        localState?: { onboardingTasks?: { enabledTools?: string[] | null } | null } | null;
-      };
-    }>('openhuman.app_state_snapshot', {});
-    const enabledBefore = before.result?.localState?.onboardingTasks?.enabledTools ?? [];
-
     await openAuthenticatedRoute(page, 'pw-settings-tools', '/settings/tools');
 
-    await expect(page.getByText('Tools', { exact: true })).toBeVisible();
-    await page
-      .locator('button')
-      .filter({ has: page.getByText('Shell Commands', { exact: true }) })
-      .click();
+    await callCoreRpc('openhuman.app_state_update_local_state', {
+      onboardingTasks: {
+        accessibilityPermissionGranted: false,
+        localModelConsentGiven: false,
+        localModelDownloadStarted: false,
+        enabledTools: ['shell'],
+        connectedSources: [],
+        updatedAtMs: Date.now(),
+      },
+    });
+
+    const before = await callCoreRpc<ToolsSnapshot>('openhuman.app_state_snapshot', {});
+    const enabledBefore = readEnabledTools(before);
+
+    await reloadAndWait(page);
+
+    // The two-pane sidebar also renders a "Tools" nav label, so scope to first.
+    await expect(page.getByText('Tools', { exact: true }).first()).toBeVisible();
+    // Tool rows are now SettingsRow + SettingsSwitch (role="switch", aria-label =
+    // the tool's display name), not a single text-bearing button.
+    const shellToggle = page.getByRole('switch', { name: 'Shell Commands', exact: true });
+    await expect(shellToggle).toHaveAttribute('aria-checked', 'true');
+    await shellToggle.click();
+    await expect(shellToggle).toHaveAttribute('aria-checked', 'false');
+
     await page.getByRole('button', { name: 'Save Changes', exact: true }).click();
     await expect(page.getByText('Preferences saved')).toBeVisible();
 
     await expect
       .poll(async () => {
-        const after = await callCoreRpc<{
-          result?: {
-            localState?: { onboardingTasks?: { enabledTools?: string[] | null } | null } | null;
-          };
-        }>('openhuman.app_state_snapshot', {});
-        const enabledAfter = after.result?.localState?.onboardingTasks?.enabledTools ?? [];
+        const after = await callCoreRpc<ToolsSnapshot>('openhuman.app_state_snapshot', {});
+        const enabledAfter = readEnabledTools(after);
         return JSON.stringify(enabledAfter) !== JSON.stringify(enabledBefore);
       })
       .toBe(true);
+
+    const after = await callCoreRpc<ToolsSnapshot>('openhuman.app_state_snapshot', {});
+    expect(readEnabledTools(after)).not.toContain('shell');
   });
 
   test('persists notifications DND and category preferences', async ({ page }) => {
@@ -155,6 +200,7 @@ test.describe('Settings - Feature Preferences', () => {
     await expect(page.getByRole('heading', { name: 'Color', exact: true })).toBeVisible();
     await page.getByTestId('mascot-color-burgundy').click();
     await expect(page.getByTestId('mascot-color-burgundy')).toHaveAttribute('aria-checked', 'true');
+    await expect.poll(() => getPersistedMascotColor(page)).toBe('burgundy');
 
     await reloadAndWait(page);
     await expect(page.getByTestId('mascot-color-burgundy')).toHaveAttribute('aria-checked', 'true');

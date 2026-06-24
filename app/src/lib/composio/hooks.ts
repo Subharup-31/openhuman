@@ -3,17 +3,27 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { isLocalSessionToken } from '../../utils/localSession';
 import { openhumanComposioGetMode } from '../../utils/tauriCommands';
 import { getCoreStateSnapshot } from '../coreState/store';
-import { listAgentReadyToolkits, listConnections, listToolkits } from './composioApi';
+import { getToolkitCatalog, invalidateToolkitCatalogCache } from './catalogCache';
+import { listAgentReadyToolkits, listConnections } from './composioApi';
 import { canonicalizeComposioToolkitSlug } from './toolkitSlug';
-import type { ComposioConnection } from './types';
+import type { ComposioConnection, ComposioToolkitCatalogEntry } from './types';
 
 // ── useComposioIntegrations ───────────────────────────────────────
 
 export interface UseComposioIntegrationsResult {
   /** Toolkit slugs enabled on the backend allowlist. */
   toolkits: string[];
-  /** Connections keyed by lowercased toolkit slug. */
+  /**
+   * Live Composio catalog entries (dynamic name/logo/description/
+   * categories) keyed by canonical lowercased slug. Empty when the
+   * core/backend predates the dynamic catalog — consumers then fall
+   * back to the local `toolkitMeta` derivation.
+   */
+  catalogByToolkit: Map<string, ComposioToolkitCatalogEntry>;
+  /** Best (highest-status) connection keyed by lowercased toolkit slug. */
   connectionByToolkit: Map<string, ComposioConnection>;
+  /** All connections keyed by lowercased toolkit slug, sorted by status (ACTIVE first, then by createdAt). */
+  connectionsByToolkit: Map<string, ComposioConnection[]>;
   /** Whether the initial fetch is still in flight. */
   loading: boolean;
   /** Last error message from either fetch, if any. */
@@ -38,6 +48,7 @@ export interface UseComposioIntegrationsResult {
 export function useComposioIntegrations(pollIntervalMs = 5_000): UseComposioIntegrationsResult {
   const isLocalSession = isLocalSessionToken(getCoreStateSnapshot().snapshot.sessionToken);
   const [toolkits, setToolkits] = useState<string[]>([]);
+  const [catalog, setCatalog] = useState<ComposioToolkitCatalogEntry[]>([]);
   const [connections, setConnections] = useState<ComposioConnection[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -78,6 +89,7 @@ export function useComposioIntegrations(pollIntervalMs = 5_000): UseComposioInte
     if (!enabled) {
       if (mountedRef.current) {
         setToolkits([]);
+        setCatalog([]);
         setConnections([]);
         setError(null);
         setLoading(false);
@@ -88,13 +100,14 @@ export function useComposioIntegrations(pollIntervalMs = 5_000): UseComposioInte
     let nextError: string | null = null;
     try {
       const [toolkitsResult, connectionsResult] = await Promise.allSettled([
-        listToolkits(),
+        getToolkitCatalog(),
         listConnections(),
       ]);
       if (!mountedRef.current) return;
 
       if (toolkitsResult.status === 'fulfilled') {
         setToolkits(toolkitsResult.value.toolkits ?? []);
+        setCatalog(toolkitsResult.value.catalog ?? []);
       } else {
         const message =
           toolkitsResult.reason instanceof Error
@@ -153,6 +166,10 @@ export function useComposioIntegrations(pollIntervalMs = 5_000): UseComposioInte
   useEffect(() => {
     const onConfigChanged = () => {
       console.debug('[composio-cache] window:composio:config-changed → refresh()');
+      // The Composio client identity changed (backend ↔ direct / BYO key),
+      // so the cached catalog belongs to the previous tenant. Drop it before
+      // refetching, mirroring the core-side ComposioConfigChanged eviction.
+      invalidateToolkitCatalogCache();
       if (isLocalSession) {
         void resolveFetchEnabled().then(enabled => {
           if (enabled) {
@@ -161,6 +178,7 @@ export function useComposioIntegrations(pollIntervalMs = 5_000): UseComposioInte
           }
           if (mountedRef.current) {
             setToolkits([]);
+            setCatalog([]);
             setConnections([]);
             setError(null);
             setLoading(false);
@@ -174,16 +192,24 @@ export function useComposioIntegrations(pollIntervalMs = 5_000): UseComposioInte
     return () => window.removeEventListener('composio:config-changed', onConfigChanged);
   }, [isLocalSession, refresh, resolveFetchEnabled]);
 
+  const score = (status: string): number => {
+    const s = status.toUpperCase();
+    if (s === 'ACTIVE' || s === 'CONNECTED') return 3;
+    if (s === 'PENDING' || s === 'INITIATED' || s === 'INITIALIZING') return 2;
+    if (s === 'FAILED' || s === 'ERROR' || s === 'EXPIRED') return 1;
+    return 0;
+  };
+
+  const catalogByToolkit = useMemo(() => {
+    const map = new Map<string, ComposioToolkitCatalogEntry>();
+    for (const entry of catalog) {
+      map.set(canonicalizeComposioToolkitSlug(entry.slug), entry);
+    }
+    return map;
+  }, [catalog]);
+
   const connectionByToolkit = useMemo(() => {
     const map = new Map<string, ComposioConnection>();
-    // Preference order: ACTIVE/CONNECTED > PENDING > anything else.
-    const score = (status: string): number => {
-      const s = status.toUpperCase();
-      if (s === 'ACTIVE' || s === 'CONNECTED') return 3;
-      if (s === 'PENDING' || s === 'INITIATED' || s === 'INITIALIZING') return 2;
-      if (s === 'FAILED' || s === 'ERROR' || s === 'EXPIRED') return 1;
-      return 0;
-    };
     for (const conn of connections) {
       const key = canonicalizeComposioToolkitSlug(conn.toolkit);
       const existing = map.get(key);
@@ -194,7 +220,34 @@ export function useComposioIntegrations(pollIntervalMs = 5_000): UseComposioInte
     return map;
   }, [connections]);
 
-  return { toolkits, connectionByToolkit, loading, error, refresh };
+  const connectionsByToolkit = useMemo(() => {
+    const map = new Map<string, ComposioConnection[]>();
+    for (const conn of connections) {
+      const key = canonicalizeComposioToolkitSlug(conn.toolkit);
+      const existing = map.get(key) ?? [];
+      existing.push(conn);
+      map.set(key, existing);
+    }
+    for (const [key, conns] of map) {
+      conns.sort((a, b) => {
+        const diff = score(b.status) - score(a.status);
+        if (diff !== 0) return diff;
+        return (a.createdAt ?? '').localeCompare(b.createdAt ?? '');
+      });
+      map.set(key, conns);
+    }
+    return map;
+  }, [connections]);
+
+  return {
+    toolkits,
+    catalogByToolkit,
+    connectionByToolkit,
+    connectionsByToolkit,
+    loading,
+    error,
+    refresh,
+  };
 }
 
 // ── useAgentReadyComposioToolkits ─────────────────────────────────

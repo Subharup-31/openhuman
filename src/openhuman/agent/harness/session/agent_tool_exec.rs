@@ -14,6 +14,9 @@ use crate::core::event_bus::{publish_global, DomainEvent};
 use crate::openhuman::agent::dispatcher::{ParsedToolCall, ToolExecutionResult};
 use crate::openhuman::agent::harness::engine::ProgressReporter;
 use crate::openhuman::agent::harness::payload_summarizer::PayloadSummarizer;
+use crate::openhuman::agent::harness::tool_result_artifacts::{
+    apply_per_result_persistence, ToolResultArtifactStore,
+};
 use crate::openhuman::agent::hooks::{self, ToolCallRecord};
 use crate::openhuman::agent::tool_policy::{
     ToolCallContext, ToolPolicy, ToolPolicyDecision, ToolPolicyRequest,
@@ -35,6 +38,10 @@ pub(super) struct AgentToolExecCtx<'a> {
     pub agent_definition_id: &'a str,
     pub prefer_markdown: bool,
     pub budget_bytes: usize,
+    /// Whether Stage 1a (native content-aware compaction) runs before the
+    /// byte budget. Sourced from `ContextManager::compaction_enabled`.
+    pub compaction_enabled: bool,
+    pub artifact_store: Option<&'a ToolResultArtifactStore>,
 }
 
 /// Execute one parsed tool call end-to-end with the Agent's semantics, emitting
@@ -222,11 +229,35 @@ pub(super) async fn run_agent_tool_call(
         (format!("Unknown tool: {}", call.name), false)
     };
 
-    // Per-result byte budget — the only cache-safe reduction stage (the
-    // truncated body has never been sent to the backend).
-    let (result, budget_outcome) =
-        crate::openhuman::context::apply_tool_result_budget(raw_result, ctx.budget_bytes);
-    if budget_outcome.truncated {
+    // Stage 1a — content-aware compaction. Runs before the byte budget on the
+    // fresh tool output (never sent to the backend yet, so it's cache-safe like
+    // the budget below). Routes by tool name; only ever shrinks, otherwise
+    // passes the original through. See `agent::harness::compaction`.
+    let raw_result = crate::openhuman::agent::harness::compaction::compact_tool_output(
+        raw_result,
+        &call.name,
+        ctx.compaction_enabled,
+    );
+
+    // Per-result byte budget — the only cache-safe reduction stage (the full
+    // body has never been sent to the backend). Oversized outputs are persisted
+    // into the action workspace when possible, with truncation as fallback.
+    let (result, budget_outcome) = apply_per_result_persistence(
+        raw_result,
+        ctx.artifact_store,
+        &call.name,
+        Some(&call_id),
+        ctx.budget_bytes,
+    )
+    .await;
+    if budget_outcome.persisted {
+        log::info!(
+            "[agent_loop] tool_result_artifact applied name={} original_bytes={} final_bytes={}",
+            call.name,
+            budget_outcome.original_bytes,
+            budget_outcome.final_bytes,
+        );
+    } else if budget_outcome.original_bytes != budget_outcome.final_bytes {
         log::info!(
             "[agent_loop] tool_result_budget applied name={} original_bytes={} final_bytes={} dropped_bytes={}",
             call.name,
@@ -248,7 +279,7 @@ pub(super) async fn run_agent_tool_call(
             &call_id,
             &call.name,
             success,
-            result.chars().count(),
+            &result,
             elapsed_ms,
             (iteration + 1) as u32,
         )

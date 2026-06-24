@@ -133,6 +133,18 @@ impl Tool for SpawnSubagentTool {
                 "dedicated_thread": {
                     "type": "boolean",
                     "description": "Legacy compatibility flag. Delegations now always create a persistent worker thread when parent context is available, so this flag no longer gates thread creation."
+                },
+                "blocking": {
+                    "type": "boolean",
+                    "description": "Explicitly run the sub-agent inline and return its final output. Defaults to false; reusable async delegation is the default."
+                },
+                "task_key": {
+                    "type": "string",
+                    "description": "Optional deterministic identity key for reusable async delegation. Defaults to a normalized prompt/title."
+                },
+                "fresh": {
+                    "type": "boolean",
+                    "description": "When true, bypass reusable subagent matching and create a fresh durable worker."
                 }
             }
         })
@@ -185,6 +197,10 @@ impl Tool for SpawnSubagentTool {
             .get("dedicated_thread")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let blocking = args
+            .get("blocking")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // ── Validation ─────────────────────────────────────────────────
         if agent_id.is_empty() {
@@ -217,6 +233,26 @@ impl Tool for SpawnSubagentTool {
                 )));
             }
         };
+
+        if let Some(parent_ctx) = current_parent() {
+            if !parent_ctx.allowed_subagent_ids.contains(&definition.id) {
+                log::warn!(
+                    "[spawn_subagent] blocked subagent outside parent allowlist parent_agent={} requested_agent={} allowed={:?}",
+                    parent_ctx.agent_definition_id,
+                    definition.id,
+                    parent_ctx.allowed_subagent_ids
+                );
+                return Ok(ToolResult::error(format!(
+                    "spawn_subagent: agent '{}' is not in parent agent '{}' subagents.allowlist",
+                    definition.id, parent_ctx.agent_definition_id
+                )));
+            }
+            log::debug!(
+                "[spawn_subagent] subagent allowlist check passed parent_agent={} requested_agent={}",
+                parent_ctx.agent_definition_id,
+                definition.id
+            );
+        }
 
         // ── integrations_agent toolkit gate ──────────────────────────────────
         // integrations_agent is a platform-parameterised specialist. Every
@@ -376,6 +412,31 @@ impl Tool for SpawnSubagentTool {
             }
         }
 
+        if !blocking {
+            let mut async_args = args;
+            if let Some(obj) = async_args.as_object_mut() {
+                obj.insert(
+                    "agent_id".to_string(),
+                    serde_json::Value::String(definition.id.clone()),
+                );
+                if obj.get("task_title").is_none() {
+                    let title =
+                        crate::openhuman::agent_orchestration::subagent_sessions::task_title_from_prompt(
+                            &prompt,
+                        );
+                    obj.insert("task_title".to_string(), serde_json::Value::String(title));
+                }
+            }
+            tracing::info!(
+                target: "spawn_subagent",
+                agent_id = %definition.id,
+                "[spawn_subagent] routing to reusable async sub-agent by default"
+            );
+            return super::spawn_async_subagent::SpawnAsyncSubagentTool::new()
+                .execute(async_args)
+                .await;
+        }
+
         // ── Publish SubagentSpawned event ──────────────────────────────
         let parent_session = current_parent()
             .map(|p| p.session_id.clone())
@@ -438,6 +499,8 @@ impl Tool for SpawnSubagentTool {
             worker_thread_id: worker_thread_id.clone(),
             initial_history: None,
             checkpoint_dir: None,
+            worktree_action_dir: None,
+            run_queue: None,
         };
 
         let progress_sink = current_parent().and_then(|p| p.on_progress.clone());
@@ -503,6 +566,9 @@ impl Tool for SpawnSubagentTool {
                                     elapsed_ms: outcome.elapsed.as_millis() as u64,
                                     iterations: outcome.iterations as u32,
                                     output_chars: outcome.output.chars().count(),
+                                    worktree_path: None,
+                                    changed_files: Vec::new(),
+                                    dirty_status: None,
                                 })
                                 .await;
                         }
@@ -621,7 +687,7 @@ fn persist_worker_thread(
             title,
             created_at: now.clone(),
             parent_thread_id: None,
-            labels: Some(vec!["worker".to_string()]),
+            labels: Some(vec!["tasks".to_string()]),
             personality_id: None,
         },
     )
@@ -792,6 +858,7 @@ mod tests {
             iterations: 3,
             mode: SubagentMode::Typed,
             status: SubagentRunStatus::Completed,
+            final_history: Vec::new(),
         }
     }
 
@@ -861,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_worker_thread_creates_thread_with_worker_label_and_messages() {
+    fn persist_worker_thread_creates_thread_with_tasks_label_and_messages() {
         let temp = TempDir::new().expect("tempdir");
         let outcome = sample_outcome("the answer is 42");
         let thread_id = persist_worker_thread(
@@ -879,7 +946,7 @@ mod tests {
             .iter()
             .find(|t| t.id == thread_id)
             .expect("worker thread present");
-        assert!(worker.labels.contains(&"worker".to_string()));
+        assert!(worker.labels.contains(&"tasks".to_string()));
         assert!(worker.title.starts_with("draft a long research plan"));
 
         let messages =
@@ -995,6 +1062,32 @@ mod tests {
         assert!(result
             .output()
             .contains("unknown agent_id 'totally_made_up'"));
+    }
+
+    #[tokio::test]
+    async fn legacy_archetype_alias_is_forwarded_to_async_default_path() {
+        let _ = AgentDefinitionRegistry::init_global_builtins();
+        let tool = SpawnSubagentTool;
+        let result = tool
+            .execute(json!({
+                "archetype": "researcher",
+                "prompt": "research the reusable async default path",
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(
+            result
+                .output()
+                .contains("spawn_async_subagent called outside of an agent turn"),
+            "{}",
+            result.output()
+        );
+        assert!(
+            !result.output().contains("agent_id is required"),
+            "{}",
+            result.output()
+        );
     }
 
     #[tokio::test]

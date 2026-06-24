@@ -197,6 +197,9 @@ fn source_entry(id: &str, kind: SourceKind) -> MemorySourceEntry {
         max_issues: None,
         max_prs: None,
         selector: None,
+        max_tokens_per_sync: None,
+        max_cost_per_sync_usd: None,
+        sync_depth_days: None,
     }
 }
 
@@ -441,6 +444,17 @@ async fn round20_memory_sources_readers_and_sync_cover_error_edges_without_netwo
     std::fs::create_dir_all(&bin).expect("bin dir");
     let script = bin.join("gh");
     write_fake_gh_round20(&script);
+    let git_stub = bin.join("git");
+    std::fs::write(&git_stub, "#!/usr/bin/env bash\nexit 1\n").expect("write fake git");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&git_stub)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&git_stub, perms).expect("chmod fake git");
+    }
     let old_path = std::env::var("PATH").unwrap_or_default();
     let _path = EnvGuard::set("PATH", format!("{}:{old_path}", bin.display()));
 
@@ -537,10 +551,8 @@ async fn round20_memory_documents_files_and_envelopes_cover_success_and_failure_
     .expect("list data");
     assert_eq!(listed.files, vec!["round20.md"]);
 
-    let namespace = format!(
-        "round20-{}",
-        &uuid::Uuid::new_v4().as_simple().to_string()[..12]
-    );
+    // Use a deterministic namespace — random UUIDs can trigger PII detection.
+    let namespace = "round20-cov-test-ns".to_string();
     let put = doc_put(PutDocParams {
         namespace: namespace.clone(),
         key: "launch-note".to_string(),

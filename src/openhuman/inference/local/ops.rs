@@ -89,6 +89,7 @@ pub async fn agent_chat(
     message: &str,
     model_override: Option<String>,
     temperature: Option<f64>,
+    thread_id: Option<String>,
 ) -> Result<RpcOutcome<String>, String> {
     enforce_user_prompt_or_reject(message, "local_ai.ops.agent_chat")?;
 
@@ -102,7 +103,24 @@ pub async fn agent_chat(
         config.default_temperature = temp;
     }
     let mut agent = Agent::from_config(config).map_err(|e| e.to_string())?;
-    let response = agent.run_single(message).await.map_err(|e| e.to_string())?;
+    // Direct `agent_chat` RPC — invoked by trusted clients (desktop UI,
+    // operator CLI). Label as CLI so the approval gate doesn't fail
+    // closed on an unlabelled call site.
+    let run = crate::openhuman::agent::turn_origin::with_origin(
+        crate::openhuman::agent::turn_origin::AgentTurnOrigin::Cli,
+        agent.run_single(message),
+    );
+    let response = match thread_id.as_deref() {
+        Some(id) if !id.trim().is_empty() => {
+            log::debug!("[inference] agent_chat routing with thread_id={id}");
+            crate::openhuman::inference::provider::thread_context::with_thread_id(id, run).await
+        }
+        _ => {
+            log::debug!("[inference] agent_chat routing without thread_id");
+            run.await
+        }
+    }
+    .map_err(|e| e.to_string())?;
     Ok(RpcOutcome::single_log(response, "agent chat completed"))
 }
 
@@ -112,6 +130,7 @@ pub async fn agent_chat_simple(
     message: &str,
     model_override: Option<String>,
     temperature: Option<f64>,
+    thread_id: Option<String>,
 ) -> Result<RpcOutcome<String>, String> {
     enforce_user_prompt_or_reject(message, "local_ai.ops.agent_chat_simple")?;
 
@@ -147,15 +166,23 @@ pub async fn agent_chat_simple(
     )
     .map_err(|e| e.to_string())?;
 
-    let response = provider
-        .chat_with_system(
-            None,
-            message,
-            default_model.as_str(),
-            effective.default_temperature,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let run = provider.chat_with_system(
+        None,
+        message,
+        default_model.as_str(),
+        effective.default_temperature,
+    );
+    let response = match thread_id.as_deref() {
+        Some(id) if !id.trim().is_empty() => {
+            log::debug!("[inference] agent_chat_simple routing with thread_id={id}");
+            crate::openhuman::inference::provider::thread_context::with_thread_id(id, run).await
+        }
+        _ => {
+            log::debug!("[inference] agent_chat_simple routing without thread_id");
+            run.await
+        }
+    }
+    .map_err(|e| e.to_string())?;
 
     Ok(RpcOutcome::single_log(
         response,

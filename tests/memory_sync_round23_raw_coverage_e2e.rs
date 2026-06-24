@@ -164,6 +164,9 @@ async fn configured_context(
         config: Arc::new(config.clone()),
         toolkit: toolkit.to_string(),
         connection_id: Some(connection_id.to_string()),
+        usage: Default::default(),
+        max_items: None,
+        sync_depth_days: None,
     };
     (config, ctx, server)
 }

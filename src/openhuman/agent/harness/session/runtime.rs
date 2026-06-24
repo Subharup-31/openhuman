@@ -88,6 +88,11 @@ impl Agent {
         Arc::clone(&self.tool_specs)
     }
 
+    #[cfg(test)]
+    pub(crate) fn visible_tool_names_for_test(&self) -> &std::collections::HashSet<String> {
+        &self.visible_tool_names
+    }
+
     /// Borrow the agent's memory backing store as an `Arc`.
     pub fn memory_arc(&self) -> Arc<dyn Memory> {
         Arc::clone(&self.memory)
@@ -109,9 +114,9 @@ impl Agent {
         self.temperature
     }
 
-    /// The agent's loaded skills, if any.
-    pub fn skills(&self) -> &[crate::openhuman::skills::Skill] {
-        &self.skills
+    /// The agent's loaded workflows, if any.
+    pub fn workflows(&self) -> &[crate::openhuman::workflows::Workflow] {
+        &self.workflows
     }
 
     /// Active Composio integrations fetched at session start.
@@ -213,6 +218,14 @@ impl Agent {
         tx: Option<tokio::sync::mpsc::Sender<crate::openhuman::agent::progress::AgentProgress>>,
     ) {
         self.on_progress = tx;
+    }
+
+    /// Attach an active-run queue for mid-turn steering.
+    pub fn set_run_queue(
+        &mut self,
+        rq: Option<std::sync::Arc<crate::openhuman::agent::harness::run_queue::RunQueue>>,
+    ) {
+        self.run_queue = rq;
     }
 
     /// Restrict which tools the main agent can see and call for this
@@ -448,6 +461,8 @@ impl Agent {
                     .unwrap_or_else(|| format!("parsed-{}-{}", iteration + 1, idx + 1)),
                 name: call.name.clone(),
                 arguments: call.arguments.to_string(),
+                // Prompt-based tool calls carry no provider extra_content.
+                extra_content: None,
             })
             .collect()
     }

@@ -312,6 +312,7 @@ async fn composio_connected_integrations_public_helpers_handle_empty_auth_and_id
         tools: Vec::new(),
         gated_tools: Vec::new(),
         connected: true,
+        connections: Vec::new(),
         non_active_status: None,
     };
     let second = ConnectedIntegration {
@@ -320,6 +321,7 @@ async fn composio_connected_integrations_public_helpers_handle_empty_auth_and_id
         tools: Vec::new(),
         gated_tools: Vec::new(),
         connected: true,
+        connections: Vec::new(),
         non_active_status: None,
     };
     let disconnected = ConnectedIntegration {
@@ -328,6 +330,7 @@ async fn composio_connected_integrations_public_helpers_handle_empty_auth_and_id
         tools: Vec::new(),
         gated_tools: Vec::new(),
         connected: false,
+        connections: Vec::new(),
         non_active_status: Some("EXPIRED".into()),
     };
     assert_eq!(
@@ -342,6 +345,7 @@ async fn composio_connected_integrations_public_helpers_handle_empty_auth_and_id
             tools: Vec::new(),
             gated_tools: Vec::new(),
             connected: true,
+            connections: Vec::new(),
             non_active_status: None,
         }])
     );
@@ -428,7 +432,7 @@ fn composio_action_tool_metadata_is_stable_without_network_execution() {
     assert_eq!(tool.name(), "GMAIL_SEND_EMAIL");
     assert_eq!(tool.description(), "Send an email");
     assert_eq!(tool.permission_level(), PermissionLevel::Write);
-    assert_eq!(tool.category(), ToolCategory::Skill);
+    assert_eq!(tool.category(), ToolCategory::Workflow);
     assert_eq!(
         tool.parameters_schema().pointer("/properties/to/type"),
         Some(&json!("string"))
@@ -692,7 +696,7 @@ async fn composio_backend_client_local_validation_rejects_bad_inputs_before_http
         Some("entity-1"),
         Arc::new(SecurityPolicy::default()),
     ));
-    let blank_direct_execute = direct_execute(&direct_tool, " ", None, "entity-1")
+    let blank_direct_execute = direct_execute(&direct_tool, " ", None, "entity-1", None)
         .await
         .expect_err("blank direct tool should fail before HTTP");
     assert!(blank_direct_execute.to_string().contains("tool slug"));
@@ -883,7 +887,7 @@ fn composio_controller_schema_catalog_covers_all_declared_functions() {
         ("authorize", 2, "connectUrl"),
         ("delete_connection", 2, "deleted"),
         ("list_tools", 2, "tools"),
-        ("execute", 2, "result"),
+        ("execute", 3, "result"),
         ("list_github_repos", 1, "result"),
         ("create_trigger", 3, "result"),
         ("get_user_profile", 1, "profile"),
@@ -1055,7 +1059,7 @@ async fn composio_agent_tools_cover_metadata_missing_params_and_scope_helpers() 
     let list_toolkits = ComposioListToolkitsTool::new(config.clone());
     assert_eq!(list_toolkits.name(), "composio_list_toolkits");
     assert_eq!(list_toolkits.permission_level(), PermissionLevel::ReadOnly);
-    assert_eq!(list_toolkits.category(), ToolCategory::Skill);
+    assert_eq!(list_toolkits.category(), ToolCategory::Workflow);
     assert_eq!(
         list_toolkits
             .parameters_schema()
@@ -1069,7 +1073,7 @@ async fn composio_agent_tools_cover_metadata_missing_params_and_scope_helpers() 
         list_connections.permission_level(),
         PermissionLevel::ReadOnly
     );
-    assert_eq!(list_connections.category(), ToolCategory::Skill);
+    assert_eq!(list_connections.category(), ToolCategory::Workflow);
 
     let authorize = ComposioAuthorizeTool::new(config.clone());
     assert_eq!(authorize.name(), "composio_authorize");
@@ -1097,7 +1101,7 @@ async fn composio_agent_tools_cover_metadata_missing_params_and_scope_helpers() 
     let execute = ComposioExecuteTool::new(config.clone());
     assert_eq!(execute.name(), "composio_execute");
     assert_eq!(execute.permission_level(), PermissionLevel::Write);
-    assert_eq!(execute.category(), ToolCategory::Skill);
+    assert_eq!(execute.category(), ToolCategory::Workflow);
     let execute_missing = execute.execute(json!({})).await.expect("missing tool");
     assert!(execute_missing.is_error);
     assert!(serde_json::to_string(&execute_missing)
@@ -1303,6 +1307,9 @@ fn composio_types_roundtrip_connection_tool_trigger_and_history_shapes() {
         toolkit: "notion".into(),
         status: "FAILED".into(),
         created_at: None,
+        account_email: None,
+        workspace: None,
+        username: None,
     };
     assert!(serde_json::to_value(default_connection)
         .unwrap()
@@ -1924,7 +1931,7 @@ async fn composio_direct_tool_public_surface_handles_local_metadata_and_errors()
 
     assert_eq!(tool.name(), "composio");
     assert!(tool.description().contains("1000+ apps"));
-    assert_eq!(tool.category(), ToolCategory::Skill);
+    assert_eq!(tool.category(), ToolCategory::Workflow);
     assert!(tool.external_effect());
     assert!(!tool.external_effect_with_args(&json!({ "action": "list" })));
     assert!(!tool.external_effect_with_args(&json!({ "action": "connect" })));

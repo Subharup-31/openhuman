@@ -14,6 +14,8 @@ use regex::Regex;
 /// information is redacted before being sent to the server. After setup, it
 /// delegates execution to the core library based on CLI arguments.
 fn main() {
+    restore_default_sigpipe();
+
     // Load `.env` before `sentry::init` so a DSN defined only in the dotenv
     // file is visible to the Sentry client at startup. `dotenvy::dotenv()` is
     // a no-op for variables already present in the process environment, and
@@ -59,6 +61,29 @@ fn main() {
             if openhuman_core::core::observability::is_transient_provider_http_failure(&event) {
                 return None;
             }
+            if openhuman_core::core::observability::is_all_transient_provider_exhaustion_event(
+                &event,
+            ) {
+                return None;
+            }
+            // Defense-in-depth: drop managed-backend `errorCode` events (#870)
+            // the backend owns (F2/F4) — primary suppression lives in
+            // `api_error` / the streaming gates and the `web_channel`
+            // re-report classifier. The malformed `BAD_REQUEST` carve-out
+            // (F8) is excluded by the underlying decision, so a client-built
+            // bad payload still pages.
+            if openhuman_core::core::observability::is_backend_error_code_event(&event) {
+                return None;
+            }
+            // Defense-in-depth: drop transient streaming transport blips
+            // (domain=llm_provider, failure=transport) — flaky-network
+            // timeouts/resets recovered by retry/fallback (F7). The primary
+            // gate lives at the `stream_chat` / `stream_chat_history` emit
+            // sites.
+            if openhuman_core::core::observability::is_transient_provider_transport_failure(&event)
+            {
+                return None;
+            }
             // Defense-in-depth for budget-exhausted 400s. Emit sites demote the
             // known backend responses before they hit Sentry; this catches any
             // future non_2xx/status=400 event that carries the same tight body
@@ -66,19 +91,12 @@ fn main() {
             if openhuman_core::core::observability::is_budget_event(&event) {
                 return None;
             }
-            // CORE-RUST-EK (~827 events): drop all HTTP 401 responses from the
-            // embeddings call path (domain=embeddings, failure=non_2xx,
-            // status=401). The primary suppression for the OpenHuman-backend
-            // "Invalid token" shape lives in `expected_error_kind` /
-            // `is_session_expired_message`. This is defense-in-depth that also
-            // catches third-party provider 401s (e.g. OpenAI `invalid_api_key`
-            // body) that don't carry the OpenHuman envelope and therefore fall
-            // through the string-based classifier to Sentry.
-            if openhuman_core::core::observability::is_embeddings_api_key_401_event(&event) {
-                log::debug!(
-                    "[sentry-embeddings-401-filter] dropping embeddings api-key 401 event_id={:?}",
-                    event.event_id
-                );
+            // Defense-in-depth for insufficient-credits 402s. The native_chat
+            // emit site demotes them, but the compatible provider reports the
+            // same out-of-balance 402 from chat_with_system / chat_with_history
+            // / the streaming gates / api_error too; this is the single net
+            // that catches every path (TAURI-RUST-C62).
+            if openhuman_core::core::observability::is_insufficient_credits_event(&event) {
                 return None;
             }
             // Defense-in-depth: drop max-tool-iterations cap events that
@@ -98,43 +116,6 @@ fn main() {
             {
                 return None;
             }
-            // Defense-in-depth: upstream rate-limit events that slipped past
-            // the call-site suppressors in `ops::api_error` (primary guard)
-            // and `report_error_or_expected` (secondary guard via
-            // `expected_error_kind`). Catches the three major shapes:
-            //   · `rate_limit_error` type in the JSON body (OPENHUMAN-TAURI-2E,
-            //     OPENHUMAN-TAURI-RQ — ~2 223 events combined)
-            //   · `"upstream rate limit exceeded"` in a 500 body (TAURI-6Y —
-            //     ~19 849 events)
-            //   · `"429 rate limit exceeded"` in a 500 body (TAURI-S — ~6 984
-            //     events)
-            // The primary per-attempt suppression lives in
-            // `openhuman::inference::provider::ops::api_error` (skips
-            // `report_error` entirely for rate-limit bodies) and in
-            // `embeddings::openai::embed` (uses `report_error_or_expected` with
-            // the canonical `"Embedding API error ({status}): …"` format so
-            // `is_transient_upstream_http_message` catches it). This filter is
-            // the last line of defense for any future call site that adds a new
-            // report path without routing through one of those two guards.
-            {
-                let direct = event.message.as_deref();
-                let from_logentry = event.logentry.as_ref().map(|l| l.message.as_str());
-                let from_exception = event.exception.last().and_then(|e| e.value.as_deref());
-                let is_rate_limited = [direct, from_logentry, from_exception]
-                    .into_iter()
-                    .flatten()
-                    .map(str::to_ascii_lowercase)
-                    .any(|lower| {
-                        openhuman_core::core::observability::is_upstream_rate_limit_message(&lower)
-                    });
-                if is_rate_limited {
-                    log::debug!(
-                        "[sentry-rate-limit-filter] dropping upstream rate-limit event_id={:?}",
-                        event.event_id
-                    );
-                    return None;
-                }
-            }
             // Defense-in-depth: 404 on PATCH/DELETE to a channel-message path
             // is an expected state (provider-side delete or backend GC). Primary
             // suppression lives in `authed_json`; this catches any future call
@@ -152,6 +133,21 @@ fn main() {
             // filter catches any future call site that re-emits the same
             // shape — keeping OPENHUMAN-TAURI-25 / -1Q / -27 / -1G off
             // Sentry permanently (~185 events/day combined).
+            // Defense-in-depth: drop opaque "GET /auth/me" events from the
+            // `openhuman.auth_get_me` RPC. The primary fix in
+            // `credentials::ops::auth_get_me` walks the full anyhow context
+            // chain so `is_transient_message_failure` can demote transient
+            // transport failures at the rpc dispatcher. This catches any
+            // future regression where a sibling call site collapses the
+            // chain via `e.to_string()` and reproduces TAURI-RUST-10
+            // (~409 events / 17 users).
+            if openhuman_core::core::observability::is_auth_get_me_opaque_transport_event(&event) {
+                log::debug!(
+                    "[sentry-auth-get-me-opaque-filter] dropping opaque transport event_id={:?}",
+                    event.event_id
+                );
+                return None;
+            }
             if openhuman_core::core::observability::is_session_expired_event(&event) {
                 // Metadata-only log shape — `event.message` carries the raw
                 // backend response body (often a JSON envelope with the
@@ -170,14 +166,25 @@ fn main() {
             // Attach the cached account uid so Sentry can count unique users
             // affected by an issue. We only carry `id` — never email, name,
             // or IP — so this stays consistent with `send_default_pii: false`.
-            // Empty/missing on early-startup events (cache populates after
-            // the first `auth_get_me` RPC); that's expected.
-            event.user = openhuman_core::openhuman::app_state::peek_cached_current_user_identity()
-                .and_then(|identity| identity.id)
-                .map(|id| sentry::User {
-                    id: Some(id),
-                    ..Default::default()
-                });
+            //
+            // Issue #3135: the primary source for `event.user` is now the
+            // Sentry scope, bound proactively at session boundaries
+            // (credentials::store_session / clear_session) and at server boot
+            // (run_server_inner). The `app_state_snapshot` cache is kept as a
+            // fallback so any pre-boot / pre-login event that still rides
+            // the legacy path retains its previous attribution behaviour —
+            // but we only consult it when the scope hasn't already bound a
+            // user, otherwise we'd silently clobber the scope binding when
+            // the cache is empty (root cause of the original userCount=0).
+            if event.user.is_none() {
+                event.user =
+                    openhuman_core::openhuman::app_state::peek_cached_current_user_identity()
+                        .and_then(|identity| identity.id)
+                        .map(|id| sentry::User {
+                            id: Some(id),
+                            ..Default::default()
+                        });
+            }
             // Scrub secrets from exception values and top-level message.
             for exc in &mut event.exception.values {
                 if let Some(ref value) = exc.value {
@@ -202,6 +209,19 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // Rust ignores SIGPIPE at startup. That makes writes to a closed pipe
+    // return EPIPE, which the print macros turn into a panic. CLI tools should
+    // instead terminate quietly when a downstream reader such as `head` exits.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
 
 // ---------------------------------------------------------------------------
 // Release / environment resolution for Sentry

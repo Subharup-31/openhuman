@@ -29,34 +29,15 @@ fn is_unknown_provider_user_config(err: &str) -> bool {
     err.contains("no cloud provider with id or slug")
 }
 
-/// Returns `true` when the error from a provider chat attempt is a known,
-/// expected user-state or provider-state condition that already has its own
-/// Sentry report (or is deterministically expected and has no remediation
-/// path):
-///
-/// - **401 Unauthorized** — API key revoked / wrong key. Already reported by
-///   the provider layer's `api_error` path. An ops-level duplicate adds noise
-///   with no additional context.
-/// - **429 Too Many Requests / rate-limit** — Quota exhaustion. Already
-///   covered by the `is_upstream_rate_limit_message` classifier in
-///   `expected_error_kind`; the reliable-provider layer retries with
-///   backoff before propagating.
-/// - **Model not found** — User selected a model that doesn't exist for
-///   their key. The provider layer already classifies this as a config
-///   rejection (TAURI-RUST-68, ~1309 events).
-///
-/// The matcher is intentionally broad so the ops-level wrapper stays out
-/// of the Sentry funnel for all provider-state failures — the underlying
-/// call site (`compatible.rs` / `report_error_or_expected`) is already
-/// responsible for the authoritative report. Unclassified failures (5xx,
-/// unexpected payloads, network errors) are NOT matched and still escalate.
-fn is_expected_chat_failure(err: &str) -> bool {
-    crate::core::observability::expected_error_kind(err).is_some()
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct InferenceTestProviderModelResult {
     pub reply: String,
+}
+
+fn expected_test_provider_model_error_kind(
+    err: &str,
+) -> Option<crate::core::observability::ExpectedErrorKind> {
+    crate::core::observability::expected_error_kind(err)
 }
 
 pub async fn inference_status(config: &Config) -> Result<RpcOutcome<LocalAiStatus>, String> {
@@ -205,19 +186,21 @@ pub async fn inference_test_provider_model(
             "{LOG_PREFIX} test_provider_model:ok"
         ),
         Err(err) => {
-            if is_expected_chat_failure(err) {
-                // Provider-state / user-config failure (401, 429, model not
-                // found, API key missing, etc.). The underlying provider
-                // layer already emitted its own Sentry event or classified
-                // this as expected. An ops-level duplicate adds noise.
-                // Targets TAURI-RUST-68 (~1,309 events).
+            if let Some(kind) = expected_test_provider_model_error_kind(err) {
                 warn!(
+                    workload,
                     provider,
+                    expected_error_kind = ?kind,
                     error = %err,
-                    "{LOG_PREFIX} test_provider_model:expected-error (no Sentry)"
+                    "{LOG_PREFIX} test_provider_model:expected_error"
                 );
             } else {
-                error!(error = %err, "{LOG_PREFIX} test_provider_model:error");
+                error!(
+                    workload,
+                    provider,
+                    error = %err,
+                    "{LOG_PREFIX} test_provider_model:error"
+                );
             }
         }
     }
@@ -311,6 +294,32 @@ pub async fn inference_list_models(provider_id: &str) -> Result<RpcOutcome<Value
                     provider_id,
                     error = %err,
                     "{LOG_PREFIX} list_models:unknown-provider (user-config)"
+                );
+            } else if let Some(kind) = crate::core::observability::expected_error_kind(err) {
+                // Classify at the TYPED SOURCE — run the raw provider error
+                // through the central classifier BEFORE the
+                // `[inference::ops] list_models:error: …` prefix is applied,
+                // then `warn!` so the Sentry tracing layer records at most a
+                // breadcrumb instead of a hard error event.
+                //
+                // TAURI-RUST-8X3: a user pointed a custom OpenAI-compatible
+                // provider at a base URL with no `/models` route, so the
+                // probe returns `provider returned 404: 404 page not found`.
+                // That is a preventable user-state condition (wrong base URL;
+                // the dropdown already surfaces an actionable hint inline) —
+                // not a code bug. The 404 arm of
+                // `is_provider_user_state_message` matched the *raw* error
+                // string fine, but the previous `error!` path captured the
+                // PREFIXED log line, so the demotion never reached Sentry's
+                // classifier. Classifying the raw `err` here removes that
+                // dependency on the log-string shape entirely; any
+                // `ExpectedErrorKind` the central classifier recognizes is
+                // demoted at the source.
+                warn!(
+                    provider_id,
+                    error = %err,
+                    expected_kind = ?kind,
+                    "{LOG_PREFIX} list_models:expected (user-config): {err}"
                 );
             } else {
                 // Real error — embed `{err}` in the format string so
@@ -481,7 +490,17 @@ pub async fn inference_openai_oauth_import_codex_cli(
             .map(|payload| RpcOutcome::single_log(payload, "openai oauth imported from codex cli"));
     match &result {
         Ok(_) => debug!("{LOG_PREFIX} openai_oauth_import_codex_cli:ok"),
-        Err(err) => error!(error = %err, "{LOG_PREFIX} openai_oauth_import_codex_cli:error"),
+        // Most failures here are expected user-state (no `~/.codex/auth.json`,
+        // user never ran `codex login`, stale/empty file) — the UI already
+        // surfaces the actionable error, so route through the observability
+        // classifier to keep that flood out of Sentry (TAURI-RUST-83A) while a
+        // genuine keyring/persist defect still falls through to a real event.
+        Err(err) => crate::core::observability::report_error_or_expected(
+            err,
+            "inference",
+            "openai_oauth_import_codex_cli",
+            &[],
+        ),
     }
     result
 }

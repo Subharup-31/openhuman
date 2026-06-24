@@ -1,6 +1,7 @@
 import { configureStore } from '@reduxjs/toolkit';
 import { createLogger } from 'redux-logger';
 import {
+  createTransform,
   FLUSH,
   PAUSE,
   PERSIST,
@@ -14,21 +15,29 @@ import {
 import { E2E_RESTART_APP_AS_RELOAD, IS_DEV } from '../utils/config';
 import accountsReducer from './accountsSlice';
 import agentProfileReducer from './agentProfileSlice';
+import {
+  type ArtifactsByThread,
+  filterArtifactsForPersist,
+  rehydrateArtifactsFromPersist,
+} from './artifactsPersistFilter';
+import backendMeetReducer from './backendMeetSlice';
 import channelConnectionsReducer from './channelConnectionsSlice';
 import chatRuntimeReducer from './chatRuntimeSlice';
 import companionReducer from './companionSlice';
 import connectivityReducer from './connectivitySlice';
 import coreModeReducer from './coreModeSlice';
+import layoutReducer from './layoutSlice';
 import localeReducer from './localeSlice';
 import mascotReducer from './mascotSlice';
 import notificationReducer from './notificationSlice';
 import personaReducer from './personaSlice';
 import providerSurfacesReducer from './providerSurfaceSlice';
+import { pttReducer } from './pttSlice';
 import socketReducer from './socketSlice';
 import themeReducer from './themeSlice';
 import threadReducer from './threadSlice';
+import userErrorsReducer from './userErrorsSlice';
 import { userScopedStorage } from './userScopedStorage';
-import workflowsReducer from './workflowsSlice';
 
 // Persisted slices write through `userScopedStorage` so each user's blob
 // lives at `${userId}:persist:<key>` instead of a single per-device blob
@@ -88,7 +97,14 @@ const persistedLocaleReducer = persistReducer(localePersistConfig, localeReducer
 const themePersistConfig = {
   key: 'theme',
   storage: localStorageAdapter,
-  whitelist: ['mode', 'tabBarLabels'],
+  whitelist: [
+    'mode',
+    'tabBarLabels',
+    'fontSize',
+    'agentMessageViewMode',
+    'developerMode',
+    'hideAgentInsights',
+  ],
 };
 const persistedThemeReducer = persistReducer(themePersistConfig, themeReducer);
 
@@ -108,7 +124,7 @@ const persistedChannelConnectionsReducer = persistReducer(
 // Issue #2044 — `activeAccountId` is deliberately NOT persisted. It is a
 // per-session UX selection: persisting it caused provider webviews to
 // auto-surface on dev hot reload / app restart without an explicit user
-// click, because `Accounts.tsx` immediately mounts `WebviewHost` for the
+// click, because the desktop shell immediately mounts `WebviewHost` for the
 // active account and `WebviewHost` calls `openWebviewAccount` on mount.
 // `lastActiveAccountId` is still persisted so the off-screen MRU prewarm
 // can warm the same account in the background — that webview stays
@@ -134,6 +150,11 @@ const persistedNotificationReducer = persistReducer(notificationPersistConfig, n
 const threadPersistConfig = { key: 'thread', storage, whitelist: ['selectedThreadId'] };
 const persistedThreadReducer = persistReducer(threadPersistConfig, threadReducer);
 
+// Two-pane layout geometry (sidebar visibility + dragged widths), keyed by
+// panel id. Persisted per user so the chat sidebar layout survives reloads.
+const layoutPersistConfig = { key: 'layout', storage, whitelist: ['panels'] };
+const persistedLayoutReducer = persistReducer(layoutPersistConfig, layoutReducer);
+
 // Persist only previously persisted mascot appearance fields plus the custom
 // GIF override added by this feature; leave existing non-persisted mascot
 // fields as runtime state to avoid changing refresh behavior.
@@ -150,12 +171,51 @@ const persistedMascotReducer = persistReducer(mascotPersistConfig, mascotReducer
 const personaPersistConfig = { key: 'persona', storage, whitelist: ['displayName', 'description'] };
 const persistedPersonaReducer = persistReducer(personaPersistConfig, personaReducer);
 
+// PTT (Push-to-Talk): persist the hotkey binding and session preferences.
+// `isHeld` is a runtime-only flag — deliberately excluded from the whitelist so
+// a crash or force-quit can never leave the app stuck in the "held" state.
+// The boot hook (T11) also explicitly resets it to false on mount.
+const pttPersistConfig = {
+  key: 'ptt',
+  storage,
+  whitelist: ['shortcut', 'speakReplies', 'showOverlay'],
+};
+const persistedPttReducer = persistReducer(pttPersistConfig, pttReducer);
+
+// chatRuntime is mostly ephemeral (streaming buffers, tool timelines,
+// inference status) — those MUST NOT survive a restart or the UI tries
+// to resume a turn whose live driver has gone. The single exception is
+// `artifactsByThread`: agent-generated files (#3024) survive across
+// restarts so the user can return to a thread and still find a deck
+// they made earlier. Only `status === 'ready'` snapshots are written;
+// in_progress / failed states stay session-scoped via the transform
+// below (a half-written PPT shouldn't reappear as "Generating…" on
+// cold boot).
+// Pure filter/rehydrate logic lives in `artifactsPersistFilter.ts` so it
+// can be exercised by unit tests without instantiating redux-persist's
+// transform machinery (which expects a running store).
+const artifactsReadyOnlyTransform = createTransform<ArtifactsByThread, ArtifactsByThread>(
+  filterArtifactsForPersist,
+  rehydrateArtifactsFromPersist,
+  { whitelist: ['artifactsByThread'] }
+);
+
+const chatRuntimePersistConfig = {
+  key: 'chatRuntime',
+  storage,
+  whitelist: ['artifactsByThread'],
+  transforms: [artifactsReadyOnlyTransform],
+};
+const persistedChatRuntimeReducer = persistReducer(chatRuntimePersistConfig, chatRuntimeReducer);
+
 export const store = configureStore({
   reducer: {
+    backendMeet: backendMeetReducer,
     socket: socketReducer,
     connectivity: connectivityReducer,
     thread: persistedThreadReducer,
-    chatRuntime: chatRuntimeReducer,
+    layout: persistedLayoutReducer,
+    chatRuntime: persistedChatRuntimeReducer,
     companion: companionReducer,
     agentProfiles: agentProfileReducer,
     channelConnections: persistedChannelConnectionsReducer,
@@ -167,7 +227,11 @@ export const store = configureStore({
     mascot: persistedMascotReducer,
     persona: persistedPersonaReducer,
     theme: persistedThemeReducer,
-    workflows: workflowsReducer,
+    ptt: persistedPttReducer,
+    // In-memory only (not persisted): survives route changes / background-job
+    // completion, resets on restart + user switch. Durable storage is a #3931
+    // follow-up.
+    userErrors: userErrorsReducer,
   },
   middleware: getDefaultMiddleware => {
     const middleware = getDefaultMiddleware({

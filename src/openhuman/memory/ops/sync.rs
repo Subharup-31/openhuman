@@ -72,6 +72,7 @@ pub async fn memory_sync_channel(
         None,
         Some(&params.channel_id),
         Some("channel-targeted sync requested".to_string()),
+        None, // channel-level sync — not a memory-source row
     );
     let channel_id_for_spawn = params.channel_id.clone();
     tokio::spawn(async move {
@@ -105,6 +106,7 @@ pub async fn memory_sync_all() -> Result<RpcOutcome<SyncAllResult>, String> {
         None,
         None,
         Some("global sync requested".to_string()),
+        None, // global sync — not a memory-source row
     );
     tokio::spawn(async move {
         if let Err(e) = spawn_manual_sync(None).await {
@@ -144,6 +146,7 @@ async fn spawn_manual_sync(requested_connection: Option<String>) -> Result<(), S
                 None,
                 Some(requested),
                 Some("no active provider-backed sync target matched request".to_string()),
+                None, // channel-level sync — not a memory-source row
             );
             return Err(format!(
                 "memory sync: no active provider-backed target matched `{requested}`"
@@ -159,6 +162,7 @@ async fn spawn_manual_sync(requested_connection: Option<String>) -> Result<(), S
                 Some(&target.toolkit),
                 Some(&target.connection_id),
                 Some("provider sync started".to_string()),
+                None, // provider-level composio sync — not a memory-source row
             );
 
             match composio::run_connection_sync(
@@ -168,7 +172,12 @@ async fn spawn_manual_sync(requested_connection: Option<String>) -> Result<(), S
             )
             .await
             {
-                Ok(outcome) => {
+                // `run_connection_sync` returns `(SyncOutcome, ComposioUsage)`
+                // post-#3111; this caller only surfaces the outcome for UI
+                // stage events, so the usage tally is intentionally ignored
+                // here (the sync-audit caller in `memory_sources::sync` is the
+                // one that records it).
+                Ok((outcome, _usage)) => {
                     emit_sync_stage(
                         MemorySyncTrigger::Manual,
                         MemorySyncStage::Completed,
@@ -178,15 +187,17 @@ async fn spawn_manual_sync(requested_connection: Option<String>) -> Result<(), S
                             "provider sync completed items_ingested={}",
                             outcome.items_ingested
                         )),
+                        None, // provider-level composio sync — not a memory-source row
                     );
                 }
-                Err(error) => {
+                Err((error, _usage)) => {
                     emit_sync_stage(
                         MemorySyncTrigger::Manual,
                         MemorySyncStage::Failed,
                         Some(&target.toolkit),
                         Some(&target.connection_id),
                         Some(error.clone()),
+                        None, // provider-level composio sync — not a memory-source row
                     );
                     tracing::warn!(
                         toolkit = %target.toolkit,

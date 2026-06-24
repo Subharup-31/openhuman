@@ -56,6 +56,23 @@ pub struct SubagentRunOptions {
     /// sub-agent pauses for user input. Defaults to
     /// `{workspace_dir}/.openhuman/subagent_checkpoints/`.
     pub checkpoint_dir: Option<PathBuf>,
+
+    /// Per-worker `action_dir` override for git-worktree isolation.
+    ///
+    /// When `Some`, the runner installs this path as the
+    /// `current_action_dir_override` task-local around the inner tool-call
+    /// loop, so acting tools (shell, git) operate inside the worker's
+    /// isolated worktree checkout instead of the shared `Config.action_dir`.
+    /// When `None` (the default), behaviour is unchanged — tools fall through
+    /// to `security.action_dir`.
+    pub worktree_action_dir: Option<PathBuf>,
+
+    /// Steering channel for a running (typically async) sub-agent. When set,
+    /// the inner `run_turn_engine` drains steer/collect messages from this
+    /// queue at iteration boundaries — exactly like the main agent loop — so
+    /// the parent can `steer_subagent` mid-flight. `None` keeps today's
+    /// non-steerable behaviour.
+    pub run_queue: Option<std::sync::Arc<crate::openhuman::agent::harness::run_queue::RunQueue>>,
 }
 
 /// Terminal status of a sub-agent run.
@@ -90,6 +107,10 @@ pub struct SubagentRunOutcome {
     pub mode: SubagentMode,
     /// Whether the run completed or paused for user input.
     pub status: SubagentRunStatus,
+    /// Final in-memory history after the run loop exits. Durable sub-agent
+    /// sessions persist this so an idle worker can resume without rebuilding
+    /// its context from only the parent transcript.
+    pub final_history: Vec<ChatMessage>,
 }
 
 /// Which prompt-construction path the runner took for a sub-agent.
@@ -124,7 +145,7 @@ pub struct SubagentCheckpointData {
     pub options: Option<Vec<String>>,
     /// Composio toolkit override, if the paused run was scoped to one.
     pub toolkit_override: Option<String>,
-    /// Skill filter override, if the paused run was scoped to one.
+    /// Workflow filter override, if the paused run was scoped to one.
     pub skill_filter_override: Option<String>,
     /// Model override, if one was set for this run.
     pub model_override: Option<String>,

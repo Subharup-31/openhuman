@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 
 import { useT } from '../../../lib/i18n/I18nContext';
 import { callCoreRpc } from '../../../services/coreRpcClient';
-import SettingsHeader from '../components/SettingsHeader';
-import { useSettingsNavigation } from '../hooks/useSettingsNavigation';
+import { SettingsStatusLine } from '../controls';
+import SettingsPanel from '../layout/SettingsPanel';
 
 type ToolPolicyDiagnostics = {
   total_tools: number;
@@ -44,7 +44,6 @@ type ToolPolicyDiagnostics = {
 
 const ToolPolicyDiagnosticsPanel = () => {
   const { t } = useT();
-  const { navigateBack, breadcrumbs } = useSettingsNavigation();
 
   const [status, setStatus] = useState<
     | { kind: 'loading' }
@@ -57,7 +56,7 @@ const ToolPolicyDiagnosticsPanel = () => {
     (async () => {
       try {
         const diagnostics = await callCoreRpc<ToolPolicyDiagnostics>({
-          method: 'tool_registry.diagnostics',
+          method: 'openhuman.tool_registry_diagnostics',
           params: {},
           timeoutMs: 10_000,
         });
@@ -76,20 +75,18 @@ const ToolPolicyDiagnosticsPanel = () => {
   const body = useMemo(() => {
     if (status.kind === 'loading') {
       return (
-        <div className="px-4 py-3 text-sm text-sage-700 dark:text-sage-200">
+        <div className="px-4 py-3 text-sm text-neutral-500 dark:text-neutral-400">
           {t('devOptions.toolPolicyDiagnostics.loading')}
         </div>
       );
     }
     if (status.kind === 'error') {
       return (
-        <div className="px-4 py-3 rounded-lg border border-coral-300 dark:border-coral-500/40 bg-coral-50 dark:bg-coral-500/10">
-          <div className="text-sm font-semibold text-coral-900 dark:text-coral-200">
+        <div className="px-4 py-3">
+          <div className="text-sm font-semibold text-neutral-800 dark:text-neutral-100 mb-1">
             {t('devOptions.toolPolicyDiagnostics.unavailable')}
           </div>
-          <div className="text-xs text-coral-800 dark:text-coral-200 mt-1 font-mono break-words">
-            {status.message}
-          </div>
+          <SettingsStatusLine saving={false} error={status.message} savingLabel="" />
         </div>
       );
     }
@@ -260,15 +257,7 @@ const ToolPolicyDiagnosticsPanel = () => {
   }, [status, t]);
 
   return (
-    <div className="z-10 relative">
-      <SettingsHeader
-        title={t('devOptions.diagnostics')}
-        showBackButton={true}
-        onBack={navigateBack}
-        breadcrumbs={breadcrumbs}
-      />
-      {body}
-    </div>
+    <SettingsPanel description={t('devOptions.toolPolicyDiagnosticsDesc')}>{body}</SettingsPanel>
   );
 };
 

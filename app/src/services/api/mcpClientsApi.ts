@@ -56,6 +56,11 @@ interface DisconnectResult {
   status: 'disconnected';
 }
 
+interface SetEnabledResult {
+  server_id: string;
+  enabled: boolean;
+}
+
 interface StatusResult {
   servers: ConnStatus[];
 }
@@ -114,6 +119,44 @@ export const mcpClientsApi = {
     });
     log('registry_get returned server=%s', result.server?.qualified_name);
     return result.server;
+  },
+
+  /**
+   * Probe how an installed server authenticates so the connect modal can show
+   * the right control: `none` (open), `token` (static bearer/API key), or
+   * `oauth` (browser sign-in). Registry metadata is unreliable, so this is the
+   * source of truth.
+   */
+  detectAuth: async (
+    server_id: string
+  ): Promise<{
+    kind: 'none' | 'token' | 'oauth';
+    authorization_endpoint?: string;
+    grant_types: string[];
+  }> => {
+    log('detect_auth server_id=%s', server_id);
+    const result = await callCoreRpc<{
+      kind: 'none' | 'token' | 'oauth';
+      authorization_endpoint?: string;
+      grant_types: string[];
+    }>({ method: 'openhuman.mcp_clients_detect_auth', params: { server_id } });
+    log('detect_auth -> %s', result.kind);
+    return result;
+  },
+
+  /**
+   * Begin browser OAuth (discover + dynamic client registration + PKCE) and
+   * return the live authorize URL to open in a browser. The core's
+   * `/oauth/mcp/callback` route completes the exchange and reconnects.
+   */
+  oauthBegin: async (server_id: string): Promise<string> => {
+    log('oauth_begin server_id=%s', server_id);
+    const result = await callCoreRpc<{ authorize_url: string }>({
+      method: 'openhuman.mcp_clients_oauth_begin',
+      params: { server_id },
+    });
+    log('oauth_begin returned authorize_url');
+    return result.authorize_url;
   },
 
   /** List all locally installed MCP servers. */
@@ -234,6 +277,17 @@ export const mcpClientsApi = {
     return result;
   },
 
+  /** Enable or disable a server. Returns the new enabled state. */
+  setEnabled: async (server_id: string, enabled: boolean): Promise<SetEnabledResult> => {
+    log('set_enabled server_id=%s enabled=%s', server_id, enabled);
+    const result = await callCoreRpc<SetEnabledResult>({
+      method: 'openhuman.mcp_clients_set_enabled',
+      params: { server_id, enabled },
+    });
+    log('set_enabled server_id=%s enabled=%s', result.server_id, result.enabled);
+    return result;
+  },
+
   /** Get status for all managed MCP servers. */
   status: async (): Promise<ConnStatus[]> => {
     log('status');
@@ -273,6 +327,10 @@ export const mcpClientsApi = {
     const result = await callCoreRpc<ConfigAssistResult>({
       method: 'openhuman.mcp_clients_config_assist',
       params,
+      // config_assist now runs a full agent turn (web search + fetch to read
+      // the provider's docs), which legitimately takes far longer than the 30s
+      // default RPC budget. Give it a generous 5-minute ceiling.
+      timeoutMs: 300_000,
     });
     log(
       'config_assist reply length=%d suggested_env=%s',

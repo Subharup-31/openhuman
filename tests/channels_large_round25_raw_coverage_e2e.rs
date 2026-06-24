@@ -113,12 +113,20 @@ async fn web_channel_validation_cancellation_and_error_events_are_observable() {
         json!({"client_id": "client-1", "thread_id": "thread-1"})
     );
 
-    assert!(
-        web::start_chat(" ", "thread", "hello", None, None, None, None)
-            .await
-            .unwrap_err()
-            .contains("client_id is required")
-    );
+    assert!(web::start_chat(
+        " ",
+        "thread",
+        "hello",
+        None,
+        None,
+        None,
+        None,
+        None,
+        web::ChatRequestMetadata::default()
+    )
+    .await
+    .unwrap_err()
+    .contains("client_id is required"));
     assert!(web::cancel_chat("client", " ")
         .await
         .unwrap_err()
@@ -137,6 +145,8 @@ async fn web_channel_validation_cancellation_and_error_events_are_observable() {
         Some(0.2),
         None,
         Some("en-US".to_string()),
+        None,
+        web::ChatRequestMetadata::default(),
     )
     .await
     .expect("start forced-error chat");
